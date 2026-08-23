@@ -21,6 +21,8 @@ struct get_rows_context {
     uint32_t total_tasks;
     uint32_t chunks_per_row;
     uint32_t chunk_size;
+    uint32_t src_elem_size;
+    uint32_t dst_elem_size;
     struct fastdiv_values get_rows_div_ne10;
     struct fastdiv_values get_rows_div_ne10_ne11;
     struct fastdiv_values get_rows_div_chunks_per_row;
@@ -89,7 +91,7 @@ static void get_rows_thread_f32_f32_dma(unsigned int nth, unsigned int ith, void
         const uintptr_t src0_ptr = octx->src[0]->data + i01*nb01 + i11*nb02 + i12*nb03;
         const uintptr_t dst_ptr  = octx->dst->data    + i10*nb1  + i11*nb2  + i12*nb3;
 
-        while (!dma_queue_push(dma_queue, dma_make_ptr((void *)dst_ptr, (const void *)src0_ptr), nb1, nb01, ne00 * sizeof(float), 1)) {
+        while (!dma_queue_push(dma_queue, dma_make_ptr((void *)dst_ptr, (const void *)src0_ptr), nb1, nb01, ne00 * grctx->src_elem_size, 1)) {
             dma_queue_pop(dma_queue);
         }
     }
@@ -148,14 +150,64 @@ static void get_rows_thread_f32_f32_hvx(unsigned int nth, unsigned int ith, void
          ne00, ne01, ne02, ne03, ir0, ir1, ne10, ne11, ne12, ne13, ne0, ne1, ne2, ne3, (unsigned) qt);
 }
 
+// Converting / same-type row gathers. ggml_get_rows historically returned F32 only,
+// so a F16 KV cache had to be widened on gather and narrowed again by a separate CPY.
+// Supporting a F16 destination lets that pair collapse into one op -- and when source
+// and destination match it degenerates to a raw byte copy, which the DMA path can serve.
+#define GET_ROWS_HVX_WORKER(name, src_esz, dst_esz, copy_fn)                                       \
+static void name(unsigned int nth, unsigned int ith, void *data) {                                 \
+    struct get_rows_context * grctx = (struct get_rows_context *)data;                             \
+    struct htp_ops_context * octx = grctx->octx;                                                   \
+    get_rows_preamble;                                                                             \
+    (void) nth;                                                                                    \
+    const uint32_t dr  = grctx->tasks_per_thread;                                                  \
+    const uint32_t ir0 = dr * ith;                                                                 \
+    if (ir0 >= grctx->total_tasks) {                                                               \
+        return;                                                                                    \
+    }                                                                                              \
+    const uint32_t ir1 = MIN(ir0 + dr, grctx->total_tasks);                                        \
+    const bool is_i32 = (octx->src[1]->type == HTP_TYPE_I32);                                      \
+    const uint32_t chunks_per_row = grctx->chunks_per_row;                                         \
+    const uint32_t chunk_size     = grctx->chunk_size;                                             \
+    for (uint32_t i = ir0; i < ir1; ++i) {                                                         \
+        const uint32_t row_idx   = fastdiv(i, &grctx->get_rows_div_chunks_per_row);                \
+        const uint32_t chunk_idx = i - row_idx * chunks_per_row;                                   \
+        const uint32_t i12 = fastdiv(row_idx, &grctx->get_rows_div_ne10_ne11);                     \
+        const uint32_t rem = row_idx - i12 * ne11 * ne10;                                          \
+        const uint32_t i11 = fastdiv(rem, &grctx->get_rows_div_ne10);                              \
+        const uint32_t i10 = rem - i11 * ne10;                                                     \
+        const uintptr_t src1_addr = octx->src[1]->data + i10*nb10 + i11*nb11 + i12*nb12;           \
+        uint32_t i01 = is_i32 ? *(int32_t *)src1_addr : *(int64_t *)src1_addr;                     \
+        if (i01 >= ne01) {                                                                         \
+            continue;                                                                              \
+        }                                                                                          \
+        const uint32_t offset = chunk_idx * chunk_size;                                            \
+        if (offset < ne00) {                                                                       \
+            const uint32_t copy_size = MIN(chunk_size, ne00 - offset);                             \
+            const uintptr_t src0_ptr = octx->src[0]->data + i01*nb01 + i11*nb02 + i12*nb03         \
+                                       + offset * (src_esz);                                       \
+            const uintptr_t dst_ptr  = octx->dst->data    + i10*nb1  + i11*nb2  + i12*nb3          \
+                                       + offset * (dst_esz);                                       \
+            copy_fn((uint8_t *)dst_ptr, (const uint8_t *)src0_ptr, copy_size);                     \
+        }                                                                                          \
+    }                                                                                              \
+}
+
+GET_ROWS_HVX_WORKER(get_rows_thread_f16_f32_hvx, sizeof(__fp16), sizeof(float),   hvx_copy_f32_f16_uu)
+GET_ROWS_HVX_WORKER(get_rows_thread_f32_f16_hvx, sizeof(float),  sizeof(__fp16),  hvx_copy_f16_f32_uu)
+GET_ROWS_HVX_WORKER(get_rows_thread_f16_f16_hvx, sizeof(__fp16), sizeof(__fp16),  hvx_copy_f16_uu)
+
 int op_get_rows(struct htp_ops_context * octx) {
     get_rows_preamble;
 
-    if (octx->src[0]->type != HTP_TYPE_F32) {
+    const bool src0_is_f16 = (octx->src[0]->type == HTP_TYPE_F16);
+    const bool dst_is_f16  = (octx->dst->type    == HTP_TYPE_F16);
+
+    if (octx->src[0]->type != HTP_TYPE_F32 && !src0_is_f16) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
-    if (octx->dst->type != HTP_TYPE_F32) {
+    if (octx->dst->type != HTP_TYPE_F32 && !dst_is_f16) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
@@ -170,13 +222,20 @@ int op_get_rows(struct htp_ops_context * octx) {
     const uint32_t nb00 = octx->src[0]->nb[0];
     const uint32_t nb0  = octx->dst->nb[0];
 
-    const bool can_use_dma = (nb00 == sizeof(float)) && (nb0 == sizeof(float));
+    const uint32_t src_esz = src0_is_f16 ? sizeof(__fp16) : sizeof(float);
+    const uint32_t dst_esz = dst_is_f16  ? sizeof(__fp16) : sizeof(float);
+
+    // The DMA path is a raw byte copy, so it can serve only a non-converting gather.
+    const bool same_type   = (src0_is_f16 == dst_is_f16);
+    const bool can_use_dma = same_type && (nb00 == src_esz) && (nb0 == dst_esz);
     const bool use_dma = can_use_dma && (ne00 >= 2048);
 
     struct get_rows_context grctx;
     grctx.octx = octx;
     grctx.get_rows_div_ne10      = init_fastdiv_values(octx->src[1]->ne[0]);
     grctx.get_rows_div_ne10_ne11 = init_fastdiv_values(octx->src[1]->ne[0] * octx->src[1]->ne[1]);
+    grctx.src_elem_size          = src_esz;
+    grctx.dst_elem_size          = dst_esz;
 
     if (use_dma) {
         grctx.chunks_per_row = 1;
@@ -212,7 +271,11 @@ int op_get_rows(struct htp_ops_context * octx) {
         const uint32_t n_threads = MIN(total_tasks, octx->n_threads);
         grctx.tasks_per_thread = (total_tasks + n_threads - 1) / n_threads;
 
-        worker_pool_run_func(octx->ctx->worker_pool, get_rows_thread_f32_f32_hvx, &grctx, n_threads);
+        work_queue_func_t fn = same_type ? (src0_is_f16 ? get_rows_thread_f16_f16_hvx
+                                                          : get_rows_thread_f32_f32_hvx)
+                                          : (src0_is_f16 ? get_rows_thread_f16_f32_hvx
+                                                          : get_rows_thread_f32_f16_hvx);
+        worker_pool_run_func(octx->ctx->worker_pool, fn, &grctx, n_threads);
     }
     return HTP_STATUS_OK;
 }

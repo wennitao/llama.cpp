@@ -7191,6 +7191,524 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// Block-sparse flash attention via a KV block-index list (hexagon HTP).
+//
+// The op is a normal FLASH_ATTN_EXT carrying an extra src[5]: an I32 list of KV
+// block indices, with the block size in op_params[4]. A backend that honors it
+// visits only the listed blocks; a backend that ignores it (e.g. CPU) computes
+// dense attention over all of K/V.
+//
+// To keep both answers identical -- so the CPU result is a valid reference --
+// the mask is built as -INF everywhere outside the selected blocks. Dense
+// attention then contributes nothing for the skipped blocks, which is exactly
+// what the sparse kernel does by not loading them at all. Any indexing mistake
+// in the kernel (wrong block, wrong mask column, wrong tail row count) breaks
+// that agreement and shows up as an NMSE failure.
+//
+// n_sel == kv/bs selects every block, in shuffled order: attention is invariant
+// to KV ordering when the mask is permuted along with it, so that case must
+// also reproduce dense attention exactly while still exercising non-identity
+// indices.
+// DENSE flash attention with a per-head mask (mask->ne[2] > 1). Upstream's
+// test_flash_attn_ext hardcodes mask->ne[2] == 1, so the non-broadcast mask path
+// -- fa_push_mask_dma_gqa on the hexagon backend -- is exercised by nothing. No
+// sparsity here on purpose: it attributes any failure to the mask path alone.
+struct test_flash_attn_ext_permask : public test_case {
+    const int64_t hs;
+    const int64_t nh;
+    const int64_t nr;
+    const int64_t kv;
+    const int64_t nb;
+
+    std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_EXT_PERMASK"; }
+
+    std::string vars() override { return VARS_TO_STR5(hs, nh, nr, kv, nb); }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    uint64_t op_flops(ggml_tensor *) override { return 2 * nh*nr * nb * (hs + hs) * kv; }
+
+    test_flash_attn_ext_permask(int64_t hs = 128, int64_t nh = 2, int64_t nr = 1,
+                                int64_t kv = 1024, int64_t nb = 64)
+        : hs(hs), nh(nh), nr(nr), kv(kv), nb(nb) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*nr, 1);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh, 1);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh, 1);
+        ggml_set_name(v, "v");
+        // One mask per query head -- the shape upstream never builds.
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, nh*nr, 1);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+struct test_flash_attn_ext_sparse : public test_case {
+    const int64_t hs;      // head size (DK == DV)
+    const int64_t nh;      // number of KV heads
+    const int64_t nr;      // GQA factor
+    const int64_t kv;      // kv size
+    const int64_t nb;      // number of query tokens
+    const int64_t bs;      // sparse block size (multiple of 64)
+    const int64_t n_sel;   // blocks selected per (kv head, sequence)
+    const bool    mask;    // build the -INF selection mask
+    // When per_head() holds, the mask is per-head either way; per_head_sel decides
+    // whether the SELECTION is also per-head. Setting it false isolates the
+    // non-broadcast mask path from the per-head sel_nb2 stride.
+    const bool    per_head_sel;
+
+    std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_EXT_SPARSE"; }
+
+    std::string vars() override {
+        return VARS_TO_STR9(hs, nh, nr, kv, nb, bs, n_sel, mask, per_head_sel);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        // Only the selected blocks are computed.
+        return 2 * nh*nr * nb * (hs + hs) * (n_sel * bs);
+    }
+
+    test_flash_attn_ext_sparse(int64_t hs = 128, int64_t nh = 4, int64_t nr = 4, int64_t kv = 1024,
+                               int64_t nb = 64, int64_t bs = 64, int64_t n_sel = 4, bool mask = true, bool per_head_sel = true)
+        : hs(hs), nh(nh), nr(nr), kv(kv), nb(nb), bs(bs), n_sel(n_sel), mask(mask),
+          per_head_sel(per_head_sel) {}
+
+    int64_t n_blocks() const { return (kv + bs - 1) / bs; }
+
+    // Per-head selection needs a per-head mask, and a per-KV-head mask is only
+    // expressible without GQA: the mask head is chosen as (query head %
+    // mask->ne[2]), which equals the KV head only when there is one query head
+    // per KV head. With GQA the selection is shared by all heads instead.
+    bool per_head() const { return nr == 1; }
+    int64_t n_mask_heads() const { return per_head() ? nh : 1; }
+    int64_t n_sel_heads()  const { return (per_head() && per_head_sel) ? nh : 1; }
+
+    // Deterministic per-(head, block-slot) selection, so the mask built in
+    // initialize_tensors and the index list always agree.
+    int64_t sel_block(int64_t ih_in, int64_t islot) const {
+        const int64_t ih = per_head_sel ? ih_in : 0;
+        const int64_t nblk = n_blocks();
+        if (n_sel == nblk) {
+            // Full but shuffled: a fixed coprime stride permutes the blocks.
+            return (islot * 7 + ih * 3) % nblk;
+        }
+        // Spread the selected blocks over the KV range, offset per head.
+        return (islot * nblk / n_sel + ih) % nblk;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*nr, 1);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh, 1);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh, 1);
+        ggml_set_name(v, "v");
+
+        // The mask carries the -INF pattern, so it follows the selection layout.
+        // Perf rows run maskless: src[5] alone drives the selection, and a full-KV
+        // mask would charge this arm DMA traffic the gather arm never pays. Without
+        // the mask the CPU reference computes dense attention, so maskless cases are
+        // perf-only -- eval keeps the mask so correctness is still checked.
+        ggml_tensor * m = nullptr;
+        if (mask) {
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, n_mask_heads(), 1);
+            ggml_set_name(m, "m");
+        }
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+
+        // The block-index list rides in the first free src slot.
+        ggml_tensor * sel = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_sel, 1, n_sel_heads(), 1);
+        ggml_set_name(sel, "sel");
+        out->src[5] = sel;
+        out->op_params[4] = (int32_t) bs;
+
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "sel") == 0) {
+                std::vector<int32_t> idx(n_sel * n_sel_heads());
+                for (int64_t ih = 0; ih < n_sel_heads(); ih++) {
+                    for (int64_t is = 0; is < n_sel; is++) {
+                        idx[ih*n_sel + is] = (int32_t) sel_block(ih, is);
+                    }
+                }
+                ggml_backend_tensor_set(t, idx.data(), 0, idx.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "m") == 0) {
+                // -INF outside the selected blocks; finite noise inside.
+                const int64_t ne0 = t->ne[0];
+                const int64_t ne1 = t->ne[1];
+                std::vector<ggml_fp16_t> data(ne0*ne1*n_mask_heads());
+
+                std::mt19937 gen(1234);
+                std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+
+                for (int64_t ih = 0; ih < n_mask_heads(); ih++) {
+                    std::vector<bool> keep(ne0, false);
+                    for (int64_t is = 0; is < n_sel; is++) {
+                        const int64_t blk = sel_block(ih, is);
+                        for (int64_t j = blk*bs; j < std::min(blk*bs + bs, kv); j++) {
+                            keep[j] = true;
+                        }
+                    }
+                    for (int64_t i1 = 0; i1 < ne1; i1++) {
+                        for (int64_t i0 = 0; i0 < ne0; i0++) {
+                            const float val = keep[i0] ? dis(gen) : -INFINITY;
+                            data[ih*ne1*ne0 + i1*ne0 + i0] = ggml_fp32_to_fp16(val);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// Arm B', the REAL gather: the selected rows are named by an I32 index tensor read
+// at run time, so the kernel cannot exploit any regularity in the selection the way
+// the strided-view arm below can. This is what a top-k selector actually produces.
+//
+// It forces an F32 KV cache. ggml_get_rows returns F32 unconditionally, and the
+// hexagon backend additionally requires an F32 *source* -- while flash attention
+// requires F16 K/V. So the only on-HTP spelling is: F32 KV -> GET_ROWS -> CPY to
+// F16 -> FA. The F32 source doubles the bytes the gather reads; test_gather_rows
+// below measures the gather leg alone so that tax can be separated from the result.
+struct test_flash_attn_ext_gather_rows : public test_case {
+    const int64_t hs;
+    const int64_t nh;
+    const int64_t nr;
+    const int64_t kv;
+    const int64_t nb;
+    const int64_t bs;
+    const int64_t n_sel;
+    // test-backend-ops perf duplicates ONLY the graph's output node, so a multi-op
+    // graph amortizes every non-output op to 1/n_runs. Each leg therefore has to be
+    // timed as its own output: 0 = full chain (FA-dominated), 1 = GET_ROWS alone,
+    // 2 = the F32->F16 CPY alone. The honest gather-arm cost is 2*(1) + 2*(2) + FA.
+    const int     stage;
+    const ggml_type type_KV;     // KV cache type the gather reads from
+
+    std::string op_desc(ggml_tensor *) override {
+        return stage == 1 ? "GATHER_GET_ROWS_LEG" :
+               stage == 2 ? "GATHER_CAST_LEG"     :
+               stage == 3 ? "GATHER_GET_ROWS_F16_LEG" : "FLASH_ATTN_EXT_GATHER_ROWS";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR9(hs, nh, nr, kv, nb, bs, n_sel, stage, type_KV);
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    uint64_t op_flops(ggml_tensor *) override {
+        if (stage != 0) {
+            return 0;
+        }
+        return 2 * nh*nr * nb * (hs + hs) * (n_sel * bs);
+    }
+
+    test_flash_attn_ext_gather_rows(int64_t hs = 128, int64_t nh = 8, int64_t nr = 2, int64_t kv = 4096,
+                                    int64_t nb = 512, int64_t bs = 64, int64_t n_sel = 16,
+                                    int stage = 0, ggml_type type_KV = GGML_TYPE_F32)
+        : hs(hs), nh(nh), nr(nr), kv(kv), nb(nb), bs(bs), n_sel(n_sel), stage(stage),
+          type_KV(type_KV) {}
+
+    int64_t n_blocks() const { return kv / bs; }
+
+    // Same evenly spaced blocks the sparse arm selects, so both attend to an
+    // identical row set. The regularity is invisible to GET_ROWS, which only sees
+    // the materialized index list.
+    int64_t sel_block(int64_t islot) const { return islot * (n_blocks() / n_sel); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t kv_g = n_sel * bs;
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 1);
+        ggml_set_name(k, "k");
+
+        // One index list per KV head (get_rows requires src0->ne[2] == idx->ne[1]).
+        ggml_tensor * idx = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, kv_g, nh, 1);
+        ggml_set_name(idx, "idx");
+
+        // stage 2 casts a plain tensor, so the CPY is the output node and is what
+        // gets duplicated -- not a CPY fed by a gather that would run only once.
+        if (stage == 2) {
+            ggml_tensor * plain = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, kv_g, nh, 1);
+            ggml_set_name(plain, "plain");
+            ggml_tensor * c = ggml_cast(ctx, plain, GGML_TYPE_F16);
+            ggml_set_name(c, "cast_out");
+            return c;
+        }
+
+        // stage 3: gather straight to F16, collapsing GET_ROWS+CPY into one op. ggml_get_rows
+        // hardcodes a F32 return ("TODO: implement non F32 return" in ggml.c), so the node is
+        // built by hand -- exactly the graph a fused or type-taking get_rows would emit.
+        if (stage == 3) {
+            ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv_g, nh, 1);
+            g->op     = GGML_OP_GET_ROWS;
+            g->src[0] = k;
+            g->src[1] = idx;
+            ggml_set_name(g, "k_gathered_f16");
+            return g;
+        }
+
+        ggml_tensor * k_rows = ggml_get_rows(ctx, k, idx);
+        ggml_set_name(k_rows, "k_rows");
+
+        if (stage == 1) {
+            return k_rows;   // the gather itself is the timed node
+        }
+
+        ggml_tensor * kg = ggml_cast(ctx, k_rows, GGML_TYPE_F16);
+        ggml_set_name(kg, "k_gathered");
+
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 1);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * vg = ggml_cast(ctx, ggml_get_rows(ctx, v, idx), GGML_TYPE_F16);
+        ggml_set_name(vg, "v_gathered");
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*nr, 1);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q,
+                                                ggml_reshape_4d(ctx, kg, hs, kv_g, nh, 1),
+                                                ggml_reshape_4d(ctx, vg, hs, kv_g, nh, 1),
+                                                nullptr, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "idx") == 0) {
+                std::vector<int32_t> rows(n_sel * bs * nh);
+                for (int64_t ih = 0; ih < nh; ih++) {
+                    for (int64_t is = 0; is < n_sel; is++) {
+                        const int64_t blk = sel_block(is);
+                        for (int64_t r = 0; r < bs; r++) {
+                            rows[ih*n_sel*bs + is*bs + r] = (int32_t) (blk*bs + r);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, rows.data(), 0, rows.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// Arm B of the block-sparse comparison: materialize the selected KV blocks into a
+// contiguous buffer, then run ordinary dense flash attention over it. This is the
+// shape mllm's QNN pipeline was forced into -- a compiled QNN graph cannot express
+// indirection inside an op, so the gather has to become a real tensor.
+//
+// The selected blocks are evenly spaced (matching test_flash_attn_ext_sparse's
+// sel_block()), so the gather is a strided view + CONT: one hexagon-native op that
+// stays in F16. GGML_OP_GET_ROWS deliberately is not used -- the hexagon backend
+// accepts only F32 sources for it while flash attention demands F16 K/V, so the
+// idiomatic gather would need an F32 detour plus a cast and would measure that
+// instead of the gather.
+//
+// Against test_flash_attn_ext_sparse at the same (kv, bs, n_sel) this varies exactly
+// one thing: whether materializing the selected blocks costs more than indexing them
+// in place from inside the kernel.
+struct test_flash_attn_ext_gather : public test_case {
+    const int64_t hs;      // head size (DK == DV)
+    const int64_t nh;      // number of KV heads
+    const int64_t nr;      // GQA factor
+    const int64_t kv;      // kv size
+    const int64_t nb;      // number of query tokens
+    const int64_t bs;      // sparse block size
+    const int64_t n_sel;   // blocks selected per kv head
+
+    std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_EXT_GATHER"; }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR7(hs, nh, nr, kv, nb, bs, n_sel);
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    uint64_t op_flops(ggml_tensor *) override {
+        // Attention over the selected blocks only -- identical to the sparse arm, so
+        // the two FLOPS columns are directly comparable. The gather's own traffic is
+        // deliberately not counted; it surfaces as lower achieved FLOPS.
+        return 2 * nh*nr * nb * (hs + hs) * (n_sel * bs);
+    }
+
+    test_flash_attn_ext_gather(int64_t hs = 128, int64_t nh = 8, int64_t nr = 2, int64_t kv = 2048,
+                               int64_t nb = 512, int64_t bs = 128, int64_t n_sel = 8)
+        : hs(hs), nh(nh), nr(nr), kv(kv), nb(nb), bs(bs), n_sel(n_sel) {}
+
+    int64_t n_blocks() const { return (kv + bs - 1) / bs; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t nblk = n_blocks();
+        GGML_ASSERT(nblk % n_sel == 0 && "gather arm requires evenly spaced blocks");
+        const int64_t blk_stride = nblk / n_sel;   // 1 at 100% density
+        const int64_t kv_g       = n_sel * bs;
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*nr, 1);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh, 1);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh, 1);
+        ggml_set_name(v, "v");
+
+        // [hs, bs, n_sel, nh] strided view over the selected blocks, made contiguous.
+        auto gather = [&](ggml_tensor * t, const char * name) {
+            ggml_tensor * view = ggml_view_4d(ctx, t, hs, bs, n_sel, nh,
+                                              t->nb[1],                  // row stride
+                                              t->nb[1]*bs*blk_stride,    // block stride
+                                              t->nb[2],                  // head stride
+                                              0);
+            ggml_tensor * g = ggml_cont(ctx, view);
+            ggml_set_name(g, name);
+            return ggml_reshape_4d(ctx, g, hs, kv_g, nh, 1);
+        };
+
+        ggml_tensor * kg = gather(k, "k_gathered");
+        ggml_tensor * vg = gather(v, "v_gathered");
+
+        // Every gathered block is selected, so no mask is needed.
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, kg, vg, nullptr, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// Block-sparse attention, rank-3 decomposed form ("big-batch rank-3").
+//
+// Mirrors the decomposed graph used by mllm's QNN backend for block-sparse
+// attention (docs/qnn_backend/block_sparse_attention.md in the mllm repo):
+//   - per q-block, the top_k K/V blocks have already been gathered on the host
+//   - Hq * num_qb is flattened into a single leading batch dim ("rank-3"),
+//     so QK and PV are batched matmuls of shape
+//       QK: [d, top_k*bk, batch] x [d, bq, batch] -> [top_k*bk, bq, batch]
+//       PV: [top_k*bk, d, batch] x [top_k*bk, bq, batch] -> [d, bq, batch]
+//   - the (optional) causal mask is broadcast over the batch dim and applied
+//     inside ggml_soft_max_ext together with the 1/sqrt(d) scale.
+//
+// Selection/gather happens upstream; this test feeds in pre-gathered tiles
+// with random data so the backend only sees the rank-3 graph.
+struct test_block_sparse_attn_rank3 : public test_case {
+    const int64_t hq;       // number of query heads (Hq)
+    const int64_t bq;       // q-block size
+    const int64_t bk;       // k-block size
+    const int64_t d;        // head dim
+    const int64_t num_qb;   // number of q-blocks (Sq / bq)
+    const int64_t top_k;    // selected k-blocks per q-block
+    const bool    mask;     // include the score-tensor mask
+    const ggml_prec prec;
+    const ggml_type type_KV;
+
+    std::string op_desc(ggml_tensor *) override { return "BLOCK_SPARSE_ATTN_RANK3"; }
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR9(hq, bq, bk, d, num_qb, top_k, mask, prec, type_KV);
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    uint64_t op_flops(ggml_tensor *) override {
+        const uint64_t batch  = (uint64_t) hq * num_qb;
+        const uint64_t kv_eff = (uint64_t) top_k * bk;
+        // 2 multiply-adds per MAC, QK and PV both contract over d / kv_eff:
+        //   QK: batch * bq * kv_eff * d
+        //   PV: batch * bq * kv_eff * d
+        return 2 * batch * (uint64_t) bq * kv_eff * (uint64_t)(d + d);
+    }
+
+    test_block_sparse_attn_rank3(int64_t hq = 16, int64_t bq = 32, int64_t bk = 32,
+                                 int64_t d = 128, int64_t num_qb = 16, int64_t top_k = 4,
+                                 bool mask = true, ggml_prec prec = GGML_PREC_F32,
+                                 ggml_type type_KV = GGML_TYPE_F16)
+        : hq(hq), bq(bq), bk(bk), d(d), num_qb(num_qb), top_k(top_k),
+          mask(mask), prec(prec), type_KV(type_KV) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t batch  = hq * num_qb;
+        const int64_t kv_eff = top_k * bk;
+
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d,      bq,     batch);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_3d(ctx, type_KV,       d,      kv_eff, batch);
+        ggml_set_name(k, "k");
+
+        // V is laid out with kv_eff as dim 0 so that mul_mat(v, p) contracts on
+        // it without a transpose inside the graph. The host gather is expected
+        // to write V into this layout directly.
+        ggml_tensor * v = ggml_new_tensor_3d(ctx, type_KV,       kv_eff, d,      batch);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * m = nullptr;
+        if (mask) {
+            // Broadcast over the hq*num_qb batch dim.
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv_eff, bq, 1, 1);
+            ggml_set_name(m, "m");
+        }
+
+        ggml_tensor * qk = ggml_mul_mat(ctx, k, q);
+        ggml_mul_mat_set_prec(qk, prec);
+        ggml_set_name(qk, "qk");
+
+        const float scale = 1.0f / sqrtf((float) d);
+        ggml_tensor * p = ggml_soft_max_ext(ctx, qk, m, scale, 0.0f);
+        ggml_set_name(p, "p");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, v, p);
+        ggml_mul_mat_set_prec(out, prec);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -9979,6 +10497,67 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, false));
 
+    // Block-sparse flash attention (src[5] block-index list).
+    // n_sel == kv/bs is the full-but-shuffled permutation case; the rest are
+    // genuinely sparse. All are checked against dense CPU attention, which the
+    // -INF mask outside the selected blocks makes an exact reference.
+    for (int64_t bs : {64, 128}) {
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1024, 64, bs, 1024/bs));  // full permutation
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1024, 64, bs, 4));
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1024, 64, bs, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(64,  2, 4, 1024, 32, bs, 3));
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 2, 8, 2048, 128, bs, 4));
+    }
+    // Non-multiple KV length: the last block is a partial tail.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1000, 64, 64, 4));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1000, 64, 64, 1000/64 + 1));
+
+    // Per-head selection (nr == 1): each KV head carries its own index list, exercising
+    // the sel_nb2 stride in fa_kv_block_start that every shared-selection case above
+    // leaves at zero.
+    // Dense FA with a per-head mask -- no sparsity involved.
+    test_cases.emplace_back(new test_flash_attn_ext_permask(128, 2, 1, 1024, 64));
+    test_cases.emplace_back(new test_flash_attn_ext_permask(128, 4, 1, 1024, 64));
+    test_cases.emplace_back(new test_flash_attn_ext_permask(128, 2, 2, 1024, 64));
+    test_cases.emplace_back(new test_flash_attn_ext_permask(128, 1, 1, 1024, 64));  // control: ne[2]==1
+
+    // Non-broadcast mask with a SHARED selection: isolates the mask path from the
+    // per-head selection stride.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 2, 1, 1024, 64, 64, 4, true, /*per_head_sel=*/false));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 1, 1024, 64, 64, 4, true, /*per_head_sel=*/false));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 1, 1, 1024, 64, 64,  4));  // nh=1: per-head path, zero stride
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 2, 1, 1024, 64, 64,  4));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 1, 1024, 64, 64,  4));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(64,  2, 1, 1024, 32, 128, 3));
+
+    // The gather arms are benchmark scaffolding, but they are built from standard ops,
+    // so the CPU reference can check they really compute attention over the selected
+    // rows -- a wrong stride or index list would otherwise only show up as a silently
+    // meaningless timing number.
+    test_cases.emplace_back(new test_flash_attn_ext_gather(64,  2, 2,  512, 32,  64, 4));
+    test_cases.emplace_back(new test_flash_attn_ext_gather(128, 2, 2, 1024, 32, 128, 4));
+    for (ggml_type kvt : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_gather_rows(64, 2, 2, 512, 32, 64, 4, /*stage=*/0, kvt));
+        test_cases.emplace_back(new test_flash_attn_ext_gather_rows(64, 2, 2, 512, 32, 64, 4, /*stage=*/1, kvt));
+        test_cases.emplace_back(new test_flash_attn_ext_gather_rows(64, 2, 2, 512, 32, 64, 4, /*stage=*/2, kvt));
+    }
+
+    // Block-sparse attention rank-3 eval cases.
+    // Small cases (nrows(Q) <= 1024) cover the basics. The Qwen3-1.7B shape
+    // ladder below intentionally exceeds the old hexagon F16 mul_mat
+    // nrows<=1024 cap to exercise the shapes used by the perf sweep.
+    test_cases.emplace_back(new test_block_sparse_attn_rank3(/*hq=*/4,  /*bq=*/16, /*bk=*/16, /*d=*/64,  /*num_qb=*/2, /*top_k=*/1, /*mask=*/false));
+    test_cases.emplace_back(new test_block_sparse_attn_rank3(/*hq=*/4,  /*bq=*/16, /*bk=*/16, /*d=*/64,  /*num_qb=*/2, /*top_k=*/1, /*mask=*/true));
+    test_cases.emplace_back(new test_block_sparse_attn_rank3(/*hq=*/8,  /*bq=*/32, /*bk=*/32, /*d=*/128, /*num_qb=*/2, /*top_k=*/1, /*mask=*/true));
+    test_cases.emplace_back(new test_block_sparse_attn_rank3(/*hq=*/16, /*bq=*/32, /*bk=*/32, /*d=*/128, /*num_qb=*/2, /*top_k=*/1, /*mask=*/true));
+    // Qwen3-1.7B shape ladder, top_k = max(1, num_qb/4):
+    //   Sq=128:  num_qb=4,  top_k=1, nrows(Q)=2048
+    //   Sq=256:  num_qb=8,  top_k=2, nrows(Q)=4096
+    //   Sq=512:  num_qb=16, top_k=4, nrows(Q)=8192
+    test_cases.emplace_back(new test_block_sparse_attn_rank3(/*hq=*/16, /*bq=*/32, /*bk=*/32, /*d=*/128, /*num_qb=*/4,  /*top_k=*/1, /*mask=*/true));
+    test_cases.emplace_back(new test_block_sparse_attn_rank3(/*hq=*/16, /*bq=*/32, /*bk=*/32, /*d=*/128, /*num_qb=*/8,  /*top_k=*/2, /*mask=*/true));
+    test_cases.emplace_back(new test_block_sparse_attn_rank3(/*hq=*/16, /*bq=*/32, /*bk=*/32, /*d=*/128, /*num_qb=*/16, /*top_k=*/4, /*mask=*/true));
+
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
@@ -10303,6 +10882,79 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Qwen3-1.7B GEMM latency reference (F16 x F16 -> F32)
+    // hidden=2048, intermediate=6144, Hq=16, Hkv=8, head_dim=128
+    // Filter at runtime: -o MUL_MAT -p 'type_a=f16,type_b=f16'
+    {
+        // Linear projections: prefill M=512,1024,2048,4096 + decode M=1
+        for (int64_t M : {1, 512, 1024, 2048, 4096}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 2048, M, 2048, {1, 1}, {1, 1})); // q_proj
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1024, M, 2048, {1, 1}, {1, 1})); // kv_proj
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 2048, M, 2048, {1, 1}, {1, 1})); // o_proj
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 6144, M, 2048, {1, 1}, {1, 1})); // gate/up
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 2048, M, 6144, {1, 1}, {1, 1})); // down
+        }
+
+        // Attention prefill Sq=Skv, 16 heads (will be "not supported" for Sq>=64 due to nrows>1024)
+        for (int64_t Sq : {512, 1024, 2048, 4096}) {
+            // Q.K^T: out (16, Sq, Sq) = A_q (16, Sq, 128) @ B_k (16, Sq, 128)^T
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, Sq, Sq, 128, {16, 1}, {1, 1}));
+            // A.V:   out (16, Sq, 128) = A_p (16, Sq, Sq) @ V (16, Sq, 128)
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 128, Sq, Sq, {16, 1}, {1, 1}));
+        }
+
+        // Attention decode Sq=1, 16 heads
+        for (int64_t Skv : {512, 2048, 4096}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, Skv, 1, 128, {16, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 128, 1, Skv, {16, 1}, {1, 1}));
+        }
+
+        // Square roofline
+        for (int64_t S : {256, 512, 1024, 2048, 4096}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, S, S, S, {1, 1}, {1, 1}));
+        }
+
+        // Q4_0 linear projections (decode + prefill up to M=1024)
+        for (int64_t M : {1, 512, 1024, 2048, 4096}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2048, M, 2048, {1, 1}, {1, 1})); // q_proj
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1024, M, 2048, {1, 1}, {1, 1})); // kv_proj
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2048, M, 2048, {1, 1}, {1, 1})); // o_proj
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 6144, M, 2048, {1, 1}, {1, 1})); // gate/up
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2048, M, 6144, {1, 1}, {1, 1})); // down
+        }
+
+        // Q4_0 squares
+        for (int64_t S : {256, 512, 1024, 2048, 4096}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, S, S, S, {1, 1}, {1, 1}));
+        }
+
+        // Qwen3-1.7B dense attention reference via FLASH_ATTN_EXT, matching
+        // the rank-3 sweep below (Hq=16, Hkv=8, D=128, prefill kv=Sq=nb).
+        // Filter: -o FLASH_ATTN_EXT.
+        for (int64_t Sq : {64, 128, 256, 512, 1024, 2048}) {
+            test_cases.emplace_back(new test_flash_attn_ext(
+                /*hsk=*/128, /*hsv=*/128, /*nh=*/8, /*nr23=*/{2, 1},
+                /*kv=*/Sq, /*nb=*/Sq, /*mask=*/true, /*sinks=*/false,
+                /*max_bias=*/0.0f, /*logit_softcap=*/0.0f,
+                GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+
+        // Block-sparse attention rank-3 sweep at Qwen3-1.7B shape
+        // (Hq=16, BQ=BK=32, D=128, 1/4 sparsity). num_qb = Sq / BQ;
+        // top_k = max(1, num_qb / 4). Filter: -o BLOCK_SPARSE_ATTN_RANK3.
+        // NOTE: cases with Sq>=128 currently hit the hexagon backend's F16
+        // mul_mat nrows<=1024 cap (nrows(Q) = bq*hq*num_qb). The Sq=64 case
+        // (num_qb=2) sits exactly at the cap and is the largest HTP-eligible
+        // datapoint until the cap is lifted.
+        for (int64_t Sq : {64, 128, 256, 512, 1024, 2048}) {
+            const int64_t num_qb = Sq / 32;
+            const int64_t top_k  = std::max<int64_t>(1, num_qb / 4);
+            test_cases.emplace_back(new test_block_sparse_attn_rank3(
+                /*hq=*/16, /*bq=*/32, /*bk=*/32, /*d=*/128,
+                num_qb, top_k, /*mask=*/true, GGML_PREC_F32, GGML_TYPE_F16));
+        }
+    }
+
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
@@ -10376,6 +11028,96 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {nr, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
             }
         }
+    }
+
+    // Block-sparse flash attention: sweep the selected-block count at fixed KV
+    // length. Runtime should track n_sel, not kv -- n_sel == kv/bs is the dense
+    // equivalent and serves as the 100%-density reference point.
+    for (int kv : { 4096, 16384 }) {
+        const int bs = 128;
+        for (int n_sel : { kv/bs, kv/bs/4, kv/bs/8, kv/bs/16 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 4, kv, 128, bs, n_sel));
+        }
+    }
+
+    // Direct like-for-like with mllm's NPU attention figure: Sq=Skv=1024, 25% density,
+    // Qwen3-1.7B shape. mllm reports 97.0 ms wall for 28 layers => 3.46 ms/layer.
+    for (int bs : { 64, 128, 256 }) {
+        const int kv = 1024, nb = 1024, n_sel = (kv / bs) / 4;
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, nb, bs, n_sel, /*mask=*/false));
+    }
+
+    // Square prefill (Sq == Skv), the shape mllm's per-layer attention numbers use.
+    // Maskless, so this is FULL attention -- a causal implementation that skips
+    // fully-masked tiles would do about half this work at these shapes.
+    for (int sq : { 1024, 2048, 4096 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, sq, sq, /*mask=*/false, false, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+
+    // Dense FA vs KV length at fixed query count -- maps the non-monotonic region
+    // around the n_kv_blocks < 3 pipelining threshold.
+    for (int kv : { 64, 128, 192, 256, 320, 384, 448, 512, 640, 768, 896, 1024, 1536 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, kv, 512, /*mask=*/false, false, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+
+    // Block-sparse PREFILL experiment, kv 1k-4k at the Qwen3-1.7B attention shape
+    // (Hkv=8, Hq=16, head_dim=128), one 512-token ubatch of queries. Three arms at
+    // matched density:
+    //   FLASH_ATTN_EXT_SPARSE -- in-kernel indirection, blocks DMA'd in place
+    //   FLASH_ATTN_EXT_GATHER -- selected blocks materialized, then dense FA
+    //   FLASH_ATTN_EXT        -- dense over the full KV, the do-nothing baseline
+    // SPARSE vs GATHER is the experiment; both run maskless so neither is charged
+    // for mask traffic the other avoids. The dense row converts any win into an
+    // end-to-end bound. n_sel == nblk is the 100%-density control.
+    for (int kv : { 1024, 2048, 4096 }) {
+        const int bs   = 128;
+        const int nb   = 512;
+        const int nblk = kv / bs;
+        for (int n_sel : { nblk, nblk/2, nblk/4, nblk/8 }) {
+            // Even spacing keeps the two arms attending to the same blocks, and
+            // n_sel < 3 would drop the hexagon FA to its non-pipelined path.
+            if (n_sel < 3 || nblk % n_sel != 0) {
+                continue;
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, nb, bs, n_sel, /*mask=*/false));
+            test_cases.emplace_back(new test_flash_attn_ext_gather(128, 8, 2, kv, nb, bs, n_sel));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, kv, nb, /*mask=*/false, false, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+
+    // Same effective KV (2048 selected rows), three block sizes. The sparse path pins
+    // the FA chunk size Bc to the graph's block size, while dense FA is free to search
+    // for one. This separates a scatter penalty (flat in bs) from a tiling penalty
+    // (falls as bs grows and Bc is allowed to grow with it).
+    for (int bs : { 128, 256, 512 }) {
+        const int kv    = 4096;
+        const int nb    = 512;
+        const int n_sel = 2048 / bs;
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, nb, bs, n_sel, /*mask=*/false));
+        test_cases.emplace_back(new test_flash_attn_ext_gather(128, 8, 2, kv, nb, bs, n_sel));
+    }
+
+    // The deployment setting: sequence length 1k-4k, fixed selection block size 64,
+    // 25% density. GATHER_ROWS is the real gather (run-time I32 index list); GATHER
+    // is the strided-view lower bound; GATHER_ROWS_ONLY isolates the gather leg so
+    // its cost can be separated from attention. Dense rows at both the effective and
+    // the full KV bound what sparsity buys.
+    for (int kv : { 512, 1024, 2048, 4096 }) {
+        const int bs    = 64;
+        const int nb    = 512;
+        const int n_sel = (kv / bs) / 4;     // 25% density
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, nb, bs, n_sel, /*mask=*/false));
+        test_cases.emplace_back(new test_flash_attn_ext_gather_rows(128, 8, 2, kv, nb, bs, n_sel, /*stage=*/0, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext_gather_rows(128, 8, 2, kv, nb, bs, n_sel, /*stage=*/1, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext_gather_rows(128, 8, 2, kv, nb, bs, n_sel, /*stage=*/2, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext_gather_rows(128, 8, 2, kv, nb, bs, n_sel, /*stage=*/1, GGML_TYPE_F32));
+        test_cases.emplace_back(new test_flash_attn_ext_gather_rows(128, 8, 2, kv, nb, bs, n_sel, /*stage=*/3, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext_gather(128, 8, 2, kv, nb, bs, n_sel));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, n_sel*bs, nb, /*mask=*/false, false, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
 
     for (int col : {8192, 16384, 32768, 65536, 131072, 262144, 524288}) {

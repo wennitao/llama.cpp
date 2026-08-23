@@ -1931,6 +1931,15 @@ ggml_hexagon_session::~ggml_hexagon_session() noexcept(true) {
 
 // ** backend interface
 
+// Sparse flash-attention block size, carried in op_params[4] (see
+// ggml_hexagon_supported_fa_sparse for the full src[5] contract). Zero when the
+// op is dense.
+#define HTP_FA_PARAM_SPARSE_BS 4
+
+static int64_t ggml_hexagon_fa_sparse_bs(const struct ggml_tensor * op) {
+    return op->src[5] ? (int64_t) ggml_get_op_params_i32(op, HTP_FA_PARAM_SPARSE_BS) : 0;
+}
+
 static bool ggml_hexagon_flash_attn_is_hmx_eligible(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * q,
@@ -2025,25 +2034,59 @@ static bool ggml_hexagon_precompute_flash_attn_params(
 
     // Check HMX eligibility
     const struct ggml_tensor * sinks = op->src[4];
+    const struct ggml_tensor * sel   = op->src[5];
     if (ggml_hexagon_flash_attn_is_hmx_eligible(sess, q, k, v, sinks)) {
+        // Sparse: pin the chunk size to the graph's block size and count only
+        // the selected blocks, so every KV-length-derived quantity below (block
+        // count, pipelining, VTCM) reflects the work actually performed.
+        const size_t   bs           = sel ? (size_t) ggml_hexagon_fa_sparse_bs(op) : 0;
+        const uint32_t kv_effective = sel ? (uint32_t) (sel->ne[0] * bs) : nek1;
+        const bool     mask_per_head = (mask != nullptr && mask->ne[2] != 1);
+
+        // Grouping: fold up to m selected blocks into one Bc-wide chunk, so the kernel
+        // tiles wide while the graph keeps a fine selection granularity. Gated on
+        //   - every selected block being full (no interior holes to stitch around),
+        //   - a broadcast/absent mask (per-head grouping is not implemented),
+        //   - and enough chunks left to keep the pipelined path (>= FA_MIN_KV_BLOCKS),
+        //     which is what lets the non-pipelined loop stay a strict m == 1 path.
+        size_t m_max = 1;
+        if (sel && bs && !mask_per_head && (nek1 % bs) == 0) {
+            // The fallback (non-pipelined) loop now handles m > 1 too, so grouping no
+            // longer has to preserve >= FA_MIN_KV_BLOCKS chunks. The chunk-size search
+            // already prices losing threads below that threshold, so let it decide.
+            m_max = (size_t) sel->ne[0];
+            m_max = hex_smin(m_max, (size_t) FA_SPARSE_MAX_M);
+            if (m_max < 1) {
+                m_max = 1;
+            }
+        }
+
         size_t Br = 0, Bc = 0;
-        int ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK, DV, neq1, nek1, sess->vtcm_size, sess->n_threads, kparams->is_q_fp32 != 0);
+        int ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK, DV, neq1, kv_effective, sess->vtcm_size, sess->n_threads,
+                                         kparams->is_q_fp32 != 0, /*bc_step=*/bs, /*bc_cap=*/sel ? m_max * bs : 0,
+                                         /*sel_blocks=*/sel ? (size_t) sel->ne[0] : 0, mask_per_head);
         if (ret == 0) {
             kparams->kernel_type = HTP_FA_KERNEL_HMX;
             kparams->Br = Br;
             kparams->Bc = Bc;
-            kparams->n_kv_blocks = (nek1 + Bc - 1) / Bc;
+            const uint32_t m = (sel && bs) ? (uint32_t) (Bc / bs) : 1;
+            kparams->n_kv_blocks = sel ? (uint32_t) (((size_t) sel->ne[0] + m - 1) / m) : (nek1 + Bc - 1) / Bc;
             kparams->n_threads = (kparams->n_kv_blocks >= 3 && sess->n_threads >= 2) ? sess->n_threads : 1;
 
             kparams->u.hmx.g_br = hex_align_up(G * Br, 32);
             kparams->u.hmx.pipeline = (kparams->n_kv_blocks >= 3 && sess->n_threads >= 2) ? 1 : 0;
-            kparams->vtcm_size = hmx_fa_compute_vtcm_usage(G, DK, DV, Br, Bc, kparams->n_threads, kparams->u.hmx.pipeline != 0, kparams->is_q_fp32 != 0);
+            kparams->vtcm_size = hmx_fa_compute_vtcm_usage(G, DK, DV, Br, Bc, kparams->n_threads, kparams->u.hmx.pipeline != 0, kparams->is_q_fp32 != 0, mask_per_head);
 
-            const size_t row_vec_bytes = hex_align_up(Bc * sizeof(uint16_t), 256);
-            kparams->u.hmx.row_buf_stride = row_vec_bytes / 128; // HVX vector is 128 bytes
+            HEX_VERBOSE("ggml-hex: fa-params neq1 %u kv %u kv_eff %u : Br %zu Bc %zu n_kv_blocks %u "
+                        "n_threads %u pipeline %u g_br %u vtcm %d/%zu\n",
+                        neq1, nek1, kv_effective, Br, Bc, kparams->n_kv_blocks, kparams->n_threads,
+                        kparams->u.hmx.pipeline, kparams->u.hmx.g_br, kparams->vtcm_size, sess->vtcm_size);
 
-            const size_t m_line_bytes = hex_align_up(Bc * sizeof(uint16_t), 128);
-            kparams->u.hmx.mask_buf_row_stride = m_line_bytes / sizeof(uint16_t);
+            // Selection geometry. The kernel derives its own VTCM strides from the layout
+            // it rebuilds, so what it needs from here is only how the chunk decomposes:
+            // Bc covers m = Bc/sparse_bs selected blocks, and n_sel bounds the last one.
+            kparams->u.hmx.sparse_bs = sel ? (uint16_t) bs : 0;
+            kparams->u.hmx.n_sel     = sel ? (uint16_t) sel->ne[0] : 0;
             kparams->u.hmx.mask_broadcast = (mask != nullptr && mask->ne[2] == 1) ? 1 : 0;
             kparams->u.hmx.div_G = init_fastdiv_values(G);
             if (mask) {
@@ -2090,6 +2133,51 @@ static bool ggml_hexagon_precompute_flash_attn_params(
     return true;
 }
 
+// Block-sparse flash attention (experimental).
+//
+// A sparse FLASH_ATTN_EXT carries an extra input in src[5]: an I32 list of KV
+// *block* indices to attend to, instead of the full [0, kv_len) range. The
+// block size is op_params[4] and the kernel chunks KV on exactly that unit, so
+// index i selects rows [idx*BS, idx*BS + BS) of K/V (and the matching mask
+// columns). Selection is shared by all query rows in the op; it may vary per
+// KV head and per sequence.
+//
+//   src[5]: I32, contiguous, ne = [n_sel, 1, n_kv_heads or 1, n_seqs or 1]
+//   op_params[4]: BS, multiple of 64, <= kv_len
+//
+// Only the HMX kernel implements the indirection; anything else rejects the op
+// so it falls back to a dense backend rather than silently ignoring src[5].
+static bool ggml_hexagon_supported_fa_sparse(const struct ggml_tensor * op) {
+    const struct ggml_tensor * k   = op->src[1];
+    const struct ggml_tensor * q   = op->src[0];
+    const struct ggml_tensor * sel = op->src[5];
+
+    if (sel->type != GGML_TYPE_I32 || !ggml_is_contiguous(sel)) {
+        return false;
+    }
+
+    const int64_t bs = ggml_hexagon_fa_sparse_bs(op);
+    if (bs < 64 || (bs % 64) != 0 || bs > k->ne[1]) {
+        return false;
+    }
+
+    // One selection list per (kv_head, seq); q rows share it.
+    if (sel->ne[1] != 1) {
+        return false;
+    }
+    if (sel->ne[2] != 1 && sel->ne[2] != k->ne[2]) {
+        return false;
+    }
+    if (sel->ne[3] != 1 && sel->ne[3] != q->ne[3]) {
+        return false;
+    }
+    if (sel->ne[0] < 1 || sel->ne[0] > (k->ne[1] + bs - 1) / bs) {
+        return false;
+    }
+
+    return true;
+}
+
 static bool ggml_hexagon_supported_flash_attn_ext(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
@@ -2122,8 +2210,17 @@ static bool ggml_hexagon_supported_flash_attn_ext(const struct ggml_hexagon_sess
         return false;
     }
 
+    if (op->src[5] && !ggml_hexagon_supported_fa_sparse(op)) {
+        return false;
+    }
+
     struct htp_fa_kernel_params kparams;
     if (!ggml_hexagon_precompute_flash_attn_params(sess, op, &kparams)) {
+        return false;
+    }
+
+    // The block-index indirection lives only in the HMX kernel.
+    if (op->src[5] && kparams.kernel_type != HTP_FA_KERNEL_HMX) {
         return false;
     }
 
@@ -3138,7 +3235,10 @@ static bool ggml_hexagon_supported_get_rows(const struct ggml_hexagon_session * 
     const struct ggml_tensor * src1 = op->src[1]; // indices
     const struct ggml_tensor * dst  = op;
 
-    if (src0->type != GGML_TYPE_F32) {
+    // F16 sources are gathered with an on-the-fly convert to the F32 result that
+    // ggml_get_rows always produces. Supporting it keeps a F16 KV cache gatherable
+    // without a F32 copy of the whole cache.
+    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) {
         return false;
     }
 
@@ -3146,7 +3246,9 @@ static bool ggml_hexagon_supported_get_rows(const struct ggml_hexagon_session * 
         return false;
     }
 
-    if (dst->type != GGML_TYPE_F32) {
+    // A F16 destination lets a GET_ROWS+CPY pair collapse to a single op, and when it
+    // matches a F16 source the gather degenerates to a raw copy with no conversion.
+    if (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16) {
         return false;
     }
 

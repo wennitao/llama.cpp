@@ -66,8 +66,14 @@ struct htp_fa_kernel_params {
     union {
         struct {
             uint32_t g_br;
-            uint32_t row_buf_stride;
-            uint32_t mask_buf_row_stride;
+            // row_buf_stride / mask_buf_row_stride used to live here. Both were written
+            // by the host and never read on device -- the kernel takes them from the
+            // layout it rebuilds itself (factx.row_buf_stride / .mask_buf_row_stride).
+            // Reclaimed to carry the sparse selection geometry, which the kernel needs
+            // in order to address m selected blocks inside one Bc-wide chunk.
+            uint16_t sparse_bs;          // selection block size; 0 = dense
+            uint16_t n_sel;              // selected blocks per (kv_head, seq); 0 = dense
+            uint32_t _reserved;
             int32_t  mask_broadcast;
             int32_t  pipeline;
             struct fastdiv_values div_G;
@@ -142,7 +148,8 @@ struct hmx_fa_vtcm_layout {
 
 static inline void hmx_fa_vtcm_layout_build(struct hmx_fa_vtcm_layout * L,
                                        size_t gqa_factor, size_t DK, size_t DV,
-                                       size_t Br, size_t Bc, size_t n_threads, bool pipeline, bool is_q_fp32) {
+                                       size_t Br, size_t Bc, size_t n_threads, bool pipeline, bool is_q_fp32,
+                                       bool mask_per_head) {
     const size_t g_br         = hex_align_up(gqa_factor * Br, HMX_FP16_TILE_N_ROWS);
     const size_t q_tile_size  = hex_align_up(g_br * DK   * sizeof(__fp16), HTP_FA_HMX_TILE_SIZE);
     const size_t o_tile_size  = hex_align_up(g_br * DV   * sizeof(__fp16), HTP_FA_HMX_TILE_SIZE);
@@ -163,7 +170,12 @@ static inline void hmx_fa_vtcm_layout_build(struct hmx_fa_vtcm_layout * L,
     const size_t row_vec_size = hex_align_up(Bc   * sizeof(__fp16), 256);
     const size_t m_line_size  = hex_align_up(Bc   * sizeof(__fp16), 128);
     const size_t m_buf_slot   = hex_align_up(Br * m_line_size, 256);
-    const size_t m_buf_size   = m_buf_slot * HMX_FA_DMA_CACHE_SIZE;
+    // A broadcast mask stages one line per query row and is cycled through the
+    // dma_cache's slots. A per-head mask stages gqa_factor lines per query row, and
+    // the pipelined loop prefetches one block ahead, so it needs two such buffers --
+    // otherwise the prefetch lands on the block the softmax is still reading.
+    const size_t m_buf_slots  = mask_per_head ? (2 * gqa_factor) : HMX_FA_DMA_CACHE_SIZE;
+    const size_t m_buf_size   = m_buf_slot * m_buf_slots;
     const size_t slopes_size  = hex_align_up(g_br * sizeof(__fp16), 128);
 
     size_t off = 0;
@@ -232,9 +244,9 @@ static inline void hmx_fa_vtcm_layout_build(struct hmx_fa_vtcm_layout * L,
 }
 
 // Exact VTCM usage for a given (gqa_factor, DK, DV, Br, Bc) configuration.
-static inline size_t hmx_fa_compute_vtcm_usage(size_t gqa_factor, size_t DK, size_t DV, size_t Br, size_t Bc, size_t n_threads, bool pipeline, bool is_q_fp32) {
+static inline size_t hmx_fa_compute_vtcm_usage(size_t gqa_factor, size_t DK, size_t DV, size_t Br, size_t Bc, size_t n_threads, bool pipeline, bool is_q_fp32, bool mask_per_head) {
     struct hmx_fa_vtcm_layout L;
-    hmx_fa_vtcm_layout_build(&L, gqa_factor, DK, DV, Br, Bc, n_threads, pipeline, is_q_fp32);
+    hmx_fa_vtcm_layout_build(&L, gqa_factor, DK, DV, Br, Bc, n_threads, pipeline, is_q_fp32, mask_per_head);
     return L.total_bytes;
 }
 
@@ -262,7 +274,17 @@ static inline size_t hvx_fa_compute_vtcm_usage(size_t DK, size_t DV, bool is_q_f
 
 #define FA_MIN_KV_BLOCKS 3
 
+// Max selected blocks folded into one FA chunk. Bounded so the extra in-flight DMA
+// descriptors (m per tensor) stay well inside the 256-entry queue.
+#define FA_SPARSE_MAX_M  8
+
 // Cost-based (Br, Bc) search for flash attention with pipeline constraint.
+//
+// Bc_fixed pins the KV chunk size instead of searching for it (0 = search).
+// Block-sparse attention needs this: its KV block indices are expressed in
+// units chosen by the graph, so the kernel must chunk on exactly that unit.
+// Only Br is searched in that case, and the call fails if the pinned Bc does
+// not fit the VTCM budget for any Br.
 static inline int hmx_fa_find_chunk_size(size_t * Br_out,
                                   size_t * Bc_out,
                                   size_t   gqa_factor,
@@ -272,7 +294,11 @@ static inline int hmx_fa_find_chunk_size(size_t * Br_out,
                                   size_t   kv_len,
                                   size_t   vtcm_budget,
                                   size_t   n_threads,
-                                  bool     is_q_fp32) {
+                                  bool     is_q_fp32,
+                                  size_t   bc_step,   // Bc must be a multiple of this (0 = bc_unit)
+                                  size_t   bc_cap,    // upper bound on Bc (0 = none)
+                                  size_t   sel_blocks,// selected blocks; Bc/bc_step must divide it (0 = n/a)
+                                  bool     mask_per_head) {
     const size_t T       = HMX_FP16_TILE_N_ROWS;  // 32
     const size_t br_unit = hmx_ceil_div(T, gqa_factor);
     const size_t bc_unit = HMX_FP16_TILE_N_COLS * 2;  // 64
@@ -281,22 +307,52 @@ static inline int hmx_fa_find_chunk_size(size_t * Br_out,
     // Br_max: largest Br aligned to br_unit that does not exceed qo_len.
     const size_t Br_max = qo_len >= br_unit ? hex_align_down(qo_len, br_unit) : br_unit;
 
-    // Pipeline constraint: cap Bc so n_kv_blocks >= FA_MIN_KV_BLOCKS.
+    // Pipeline constraint: cap Bc so n_kv_blocks >= FA_MIN_KV_BLOCKS. The exact bound
+    // is ceil(kv_len/Bc) >= N  <=>  Bc < kv_len/(N-1), so take the largest bc_unit
+    // multiple strictly below that. Deriving it from kv_len/N instead overshoots the
+    // block count whenever kv_len/N is not bc_unit-aligned -- kv=512 yielded Bc=128
+    // and 4 blocks where Bc=192 gives 3 -- and each extra KV block costs a
+    // near-constant ~190us at nb=512, independent of Bc. The search below still walks
+    // downward from this cap, so a candidate that does not fit VTCM just falls back to
+    // the next smaller one.
     // Only relax when kv_len is too short to form enough blocks.
-    const size_t Bc_limit     = can_pipeline ? hex_align_down(kv_len / FA_MIN_KV_BLOCKS, bc_unit) :
+    const size_t Bc_search    = can_pipeline ? hex_align_down((kv_len - 1) / (FA_MIN_KV_BLOCKS - 1), bc_unit) :
                                                (kv_len >= bc_unit ? hex_align_down(kv_len, bc_unit) : bc_unit);
+    // Block-sparse pins the SELECTION granularity, not the tiling: Bc may cover m
+    // selected blocks, so it is searched in multiples of bs rather than fixed to it.
+    const size_t step         = bc_step ? bc_step : bc_unit;
+    const size_t Bc_capped    = bc_cap ? hex_smin(Bc_search, bc_cap) : Bc_search;
+    // Clamp up to one step: when the pipeline cap lands below the selection block size
+    // there is still exactly one legal candidate (Bc == bs, i.e. m == 1). Without this
+    // the range collapses to empty, find_chunk_size fails, and the op silently falls
+    // back to a dense CPU backend instead of running ungrouped.
+    // Sparse only: when the pipeline cap lands below the selection block size there is
+    // still exactly one legal candidate (Bc == bs, m == 1), and without the clamp the
+    // range collapses to empty and the op silently falls back to CPU. Dense keeps the
+    // original bound -- forcing a candidate there changes which kernel gets chosen for
+    // short KV and measurably regresses the dense suite.
+    const size_t Bc_limit     = bc_step ? hex_smax(step, (Bc_capped / step) * step)
+                                        : (Bc_capped / step) * step;
+    const size_t Bc_floor     = step;
     // Cost coefficients calibrated from profiling
     const size_t c_q_fixed    = 800;   // per-Q-block: q_load + epilogue o_update + o_norm + o_store
     const size_t c_iter_base  = 200;   // per-KV-iter base (HMX dot/update + DMA)
     const size_t c_softmax    = 600;   // per 64-row vector chunk on HVX
 
-    size_t best_cost = SIZE_MAX, best_mn = 0;
+    size_t best_cost = SIZE_MAX, best_mn = 0, best_padded = SIZE_MAX;
     size_t best_Br = 0, best_Bc = 0;
 
     for (size_t Br = Br_max; Br >= br_unit; Br -= br_unit) {
-        // Try all Bc candidates from Bc_limit down to bc_unit
-        for (size_t Bc = Bc_limit; Bc >= bc_unit; Bc -= bc_unit) {
-            size_t vtcm_needed = hmx_fa_compute_vtcm_usage(gqa_factor, DK, DV, Br, Bc, n_threads, can_pipeline, is_q_fp32);
+        // Try all Bc candidates from Bc_limit down to Bc_floor
+        for (size_t Bc = Bc_limit; Bc >= Bc_floor; Bc -= step) {
+            // Require m = Bc/bs to divide the selected-block count, so every chunk is
+            // full. A ragged final chunk leaves stale rows in the K/V/mask staging
+            // buffers past its true width, and nothing downstream re-derives that
+            // width per chunk -- so allow only the evenly-dividing factorisations.
+            if (bc_step && sel_blocks && ((sel_blocks % (Bc / bc_step)) != 0)) {
+                continue;
+            }
+            size_t vtcm_needed = hmx_fa_compute_vtcm_usage(gqa_factor, DK, DV, Br, Bc, n_threads, can_pipeline, is_q_fp32, mask_per_head);
             if (vtcm_needed <= vtcm_budget) {
                 // This Bc fits for this Br!
                 const size_t q_blocks       = (qo_len + Br - 1) / Br;
@@ -311,15 +367,26 @@ static inline int hmx_fa_find_chunk_size(size_t * Br_out,
                 const size_t cost           = q_blocks * (c_q_fixed + kv_blocks * c_iter_actual);
                 const size_t mn             = Br * Bc;
 
-                if (cost < best_cost || (cost == best_cost && mn > best_mn)) {
-                    best_cost = cost;
-                    best_mn   = mn;
-                    best_Br   = Br;
-                    best_Bc   = Bc;
+                // The KV width actually processed, ragged tail included: a partial last
+                // block still costs a full Bc of softmax and DMA. The cost model counts
+                // blocks but is blind to Bc, so two candidates with the same block count
+                // tie -- and picking the larger Bc then loses to padding. At kv=768,
+                // Bc=320 gives blocks of 320/320/128 (960 processed for 768 of work)
+                // while Bc=256 gives 256/256/256 and measured 6% faster.
+                const size_t kv_padded = kv_blocks * Bc;
+
+                const bool better = (cost < best_cost) ||
+                                    (cost == best_cost && kv_padded <  best_padded) ||
+                                    (cost == best_cost && kv_padded == best_padded && mn > best_mn);
+                if (better) {
+                    best_cost   = cost;
+                    best_mn     = mn;
+                    best_padded = kv_padded;
+                    best_Br     = Br;
+                    best_Bc     = Bc;
                 }
-                // Since we iterate Bc from largest to smallest, this is the largest Bc that fits
-                // for this Br. We can break to the next Br.
-                break;
+                // Keep scanning smaller Bc for this Br: they can never cost less (fewer
+                // rows per block means more blocks) but they can tie with less padding.
             }
         }
 
