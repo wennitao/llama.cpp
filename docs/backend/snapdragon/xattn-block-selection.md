@@ -324,3 +324,62 @@ adb shell "cd $D && ADSP_LIBRARY_PATH=$D/lib LD_LIBRARY_PATH=./lib \
 
 If `adb devices` is empty, check `ss -lntp | grep 5037` — anything other than
 `ssh` listening there is a local adb server shadowing the tunnel; kill it.
+
+## OpenCL: per-call constant, and a second failed fusion
+
+Measured on the same device (`b4bd0901`, Adreno 830) with the same harness.
+
+### Each backend's per-call cost, measured with stage 5
+
+```
+GPU: whole-graph = 1.583 x replicated + 132.0 us
+NPU: whole-graph = 1.605 x replicated + 307.0 us
+```
+
+The **slopes are the same** (1.58 vs 1.61), so the ~60% serialization penalty is a
+property of timing one graph instead of many -- not of either backend. The **fixed
+terms differ 2.3x**: 132 µs for an OpenCL queue flush against 307 µs for a
+FastRPC/dspqueue round trip. Any NPU-vs-GPU table built from raw `n_runs=1` numbers
+silently hands the GPU a 175 µs head start.
+
+### De-overheaded scoring comparison (stage 2, eager/unfused on both)
+
+Each column inverted through its own backend's fit:
+
+| kv | R | GPU raw | GPU adj | NPU raw | NPU adj | winner |
+|--:|--:|--:|--:|--:|--:|:--|
+| 512 | 8 | 888 | 477 | 562 | **159** | NPU |
+| 512 | 64 | 1152 | **644** | 1360 | 656 | GPU (tied) |
+| 1024 | 8 | 958 | 522 | 632 | **202** | NPU |
+| 1024 | 64 | 1681 | **978** | 2008 | 1060 | GPU |
+| 2048 | 8 | 1334 | 760 | 976 | **417** | NPU |
+| 2048 | 64 | 3238 | 1962 | 3269 | **1845** | NPU |
+
+**The correction flips one verdict.** At kv=2048/R=64 the raw numbers read as a GPU
+win (3238 vs 3269); adjusted, the NPU wins (1845 vs 1962). The NPU dominates at
+R=8 by 2.4-3.0x at every context. The GPU's wins survive only at R=64 and kv<=1024,
+and the kv=512 one is inside noise.
+
+### The OpenCL fused kernel is correct and 17-56x slower
+
+`XATTN_BLOCK_SCORES` passes **3/3 fused and 3/3 eager** on device, so the kernel
+computes the right answer. Its speed is not close:
+
+| kv | R | fused | eager | |
+|--:|--:|--:|--:|:--|
+| 1024 | 8 | 16248 | 958 | **17x slower** |
+| 1024 | 64 | 94245 | 1681 | **56x** |
+| 2048 | 8 | 28004 | 1334 | **21x** |
+| 2048 | 64 | 181835 | 3238 | **56x** |
+
+The design's rate model was explicitly flagged as unvalidated, and the load-bearing
+assumption it named -- risk 6.1, that the per-lane 256-byte-stride K walk would be
+absorbed by cache -- is the obvious suspect. It was not tested before shipping
+because the implementer was correctly barred from the device.
+
+**Both fusion attempts have now failed the same way**: correct, and far slower than
+the composed path they replace. On HVX the cause was proven (per-dot horizontal
+reduction at hs=128). On Adreno it is not yet diagnosed. The common lesson is that
+the DRAM-traffic argument for fusing was never the binding constraint at these
+shapes -- on the GPU the eager chain already runs K at 3.3 GB/s, ~25x under the
+device's bandwidth, so it was never bandwidth-bound to begin with.
