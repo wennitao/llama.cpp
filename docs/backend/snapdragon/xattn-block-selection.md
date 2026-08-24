@@ -377,9 +377,99 @@ assumption it named -- risk 6.1, that the per-lane 256-byte-stride K walk would 
 absorbed by cache -- is the obvious suspect. It was not tested before shipping
 because the implementer was correctly barred from the device.
 
-**Both fusion attempts have now failed the same way**: correct, and far slower than
-the composed path they replace. On HVX the cause was proven (per-dot horizontal
-reduction at hs=128). On Adreno it is not yet diagnosed. The common lesson is that
-the DRAM-traffic argument for fusing was never the binding constraint at these
-shapes -- on the GPU the eager chain already runs K at 3.3 GB/s, ~25x under the
-device's bandwidth, so it was never bandwidth-bound to begin with.
+### Why both attempts failed -- and why it is NOT the fusion premise
+
+> **Correction.** This section first concluded that "the DRAM-traffic argument for
+> fusing was never the binding constraint, because the GPU's eager chain runs K at
+> 3.3 GB/s, ~25x under the device's bandwidth." That is a non-sequitur. 3.3 GB/s is
+> a measurement of **K inside the matmul**. The fusion premise was never about K --
+> it is about **S**, the `[kv, nq, nh]` intermediate, touched four times. Two
+> different tensors; the conclusion was drawn about one from a measurement of the
+> other.
+
+Decomposing the pass with each backend's overhead inverted out (replicated-equivalent µs):
+
+| | kv | R | total | matmul | **chain** | chain share |
+|:--|--:|--:|--:|--:|--:|--:|
+| NPU | 2048 | 8 | 371 | 217 | **154** | 41% |
+| NPU | 2048 | 64 | 1846 | 449 | **1397** | **76%** |
+| NPU | 1024 | 64 | 1066 | 259 | **807** | 76% |
+| GPU | 2048 | 8 | 760 | 582 | **177** | 23% |
+| GPU | 2048 | 64 | 1962 | 1256 | **707** | 36% |
+
+The chain is **23-76% of the scoring pass**, and at kv=2048/R=64 the NPU chain moves
+33.6 MB in 1397 µs -- **24 GB/s against a device that does 76-88**. The traffic is
+real, it dominates at high R, and fusing removes essentially all of it. **The premise
+is confirmed.**
+
+What actually went wrong is that both kernels replaced a tuned matmul with a
+hand-written one:
+
+| | fused matmul | tuned matmul | penalty |
+|:--|--:|--:|--:|
+| NPU (HVX vs HMX) | 42.8 GFLOP/s | 1.55 TFLOP/s | **36x** |
+| GPU (kv=2048/R=64) | 114,784 µs | 1,256 µs | **91x** |
+
+Trading a 36-91x slower matmul to save a chain worth 23-76% loses regardless of how
+good the fusion is. And the two failures are **not independent evidence**: both
+kernels were written to the same instruction -- fuse the chain *and* hand-write the
+matmul inside it. One design error, executed twice.
+
+**The rule: keep the tuned matmul, fuse only the epilogue.** Have HMX (or the tuned
+OpenCL `mul_mat`) produce the score tile into VTCM/local memory, then run softmax and
+block-sum over it in place. Since the chain's share rises to 76% at R=64, this is
+also exactly what makes a higher R -- the selection-quality knob -- affordable.
+
+## Attempt 2: keep the tuned matmul, fuse only the epilogue — it works
+
+Implemented in `xattn-score-ops.c` as an HMX path alongside the HVX one, which stays
+as the fallback (a fused op has no `supports_op` gate, so the device must always have
+a working path). The score matmul is FA's QK^T staging verbatim -- `hmx_interleave_rows_to_tiles`
+transposes K into weight tiles, a Q prep writes activation tiles, and
+`hmx_fa_qk_dot_tile` runs on the dedicated HMX thread. S lands in VTCM as fp16 tiles
+and the softmax and block-sum run over it in place, so the `[kv, nq, nh]` intermediate
+never reaches DRAM.
+
+`XATTN_BLOCK_SCORES` passes **3/3 with the fusion enabled**, and the numbers are a win
+at every shape measured (replicated-equivalent µs, overhead inverted out):
+
+| kv | R | unfused | **fused** | speedup | matmul | epilogue before | epilogue after | removed |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 512 | 8 | 159 | **142** | 1.12x | 80 | 79 | 62 | 17 |
+| 512 | 64 | 659 | **417** | **1.58x** | 173 | 486 | 244 | 242 |
+| 1024 | 8 | 225 | **177** | 1.27x | 125 | 100 | 53 | 47 |
+| 1024 | 64 | 1069 | **687** | **1.56x** | 259 | 810 | 427 | 382 |
+| 2048 | 8 | 422 | **363** | 1.16x | 217 | 205 | 146 | 59 |
+| 2048 | 64 | 1843 | **1187** | **1.55x** | 449 | 1394 | 738 | 656 |
+
+The speedup **grows with R**, which is the point: R is the selection-quality knob, and
+at R=64 fusion takes 1.55-1.58x off the whole pass.
+
+### The chain was about half traffic, half compute
+
+The prediction was that fusing would drive the epilogue toward zero, leaving the
+matmul. It did not -- the epilogue roughly **halves** (1394 -> 738 at kv=2048/R=64)
+and then stops. That is the correct result and it sharpens the model: the chain has a
+traffic component, which fusion removes entirely, and a compute component -- the tile
+de-interleave, the f16->f32 widen, `hvx_exp_f32`, and the reductions -- which fusion
+does not touch. They happen to be about equal here.
+
+At R=8 almost all of the chain was compute (205 -> 146 at kv=2048), which is why the
+win there is only 1.16x. At R=64 the traffic half dominates and fusion collects it.
+
+### Next lever
+
+The remaining epilogue is arithmetic, so the fix is arithmetic: stay in fp16 over the
+S tiles rather than widening to f32 -- `Q6_Vqf16_vsub_VhfVhf` plus `hvx_vec_exp2_f16`
+with qf32 accumulation, exactly what `flash-attn-ops.c` already does in its softmax.
+That halves the vector count and drops the widen entirely. It needs the HMX column
+scale changed from `scale` to `scale * log2(e)`, since exp2 replaces exp, and
+`bs % 64 == 0` so block boundaries stay on vector boundaries.
+
+### The bug that cost the first run
+
+`hmx_interleave_rows_to_tiles` indexes its source as `const __fp16 *`, so `src_stride`
+is in **elements**, not bytes -- FA passes `size_k_row_padded / sizeof(__fp16)`.
+Passing `k->nb[1]` raw made every K row read at twice its stride; the test reported
+NMSE ~0.78-0.88. One-line fix, and the top-ranked risk in the design contract
+("tile de-interleave wrong") was the right thing to have been warned about.
