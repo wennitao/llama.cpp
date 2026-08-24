@@ -166,9 +166,17 @@ int op_xattn_score(struct htp_ops_context * octx) {
         return HTP_STATUS_NO_SUPPORT;
     }
 
-    // The HVX path walks 32 keys and 64 features at a time with aligned loads.
+    // Last-resort guard, and it must stay unreachable. try_fuse_xattn_score is a
+    // superset of these checks, and it has to be: a fused op has no supports_op
+    // gate, and returning HTP_STATUS_NO_SUPPORT here would abort every remaining op
+    // in the batch rather than just this one (main.c stops the loop on the first
+    // non-OK status). Failing loudly still beats computing garbage, so the check
+    // stays -- but any shape that trips it is a host-side gating bug.
     if ((hs % VLEN_FP16) || (kv % VLEN_FP32) || (nblk == 0) || (kv % nblk) ||
-        (k->nb[1] & (VLEN - 1)) || !hex_is_aligned((void *) k->data, VLEN)) {
+        (k->nb[1] & (VLEN - 1)) || !hex_is_aligned((void *) k->data, VLEN) ||
+        !hex_is_aligned((void *) q->data, VLEN)) {
+        FARF(ERROR, "xattn-score: shape not gated by the host: hs %u kv %u nblk %u k.nb1 %u\n", hs, kv, nblk,
+             (unsigned) k->nb[1]);
         return HTP_STATUS_NO_SUPPORT;
     }
 

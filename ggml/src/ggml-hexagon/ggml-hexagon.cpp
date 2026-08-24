@@ -3759,8 +3759,27 @@ static bool try_fuse_xattn_score(const ggml_hexagon_session * sess, const ggml_c
         return false;
     }
 
-    // matches the DSP kernel's aligned-load constraints
+    // Matches the DSP kernel's aligned-load constraints. This gate must stay a
+    // SUPERSET of the checks in op_xattn_score: a fused node never reaches
+    // ggml_backend_hexagon_supports_op, so this is the only gate there is, and a
+    // HTP_STATUS_NO_SUPPORT returned from the device aborts every remaining op in
+    // the batch (main.c:1044 stops the loop on the first non-OK status). Anything
+    // rejected here falls back to the unfused four-op chain, which is safe.
     if ((hs % 64) != 0 || (kv % 32) != 0 || (k->nb[1] % 128) != 0) {
+        return false;
+    }
+
+    // The kernel reads K and Q rows with aligned HVX loads. Contiguity alone does
+    // not imply a 128-byte-aligned base or row stride, and q is the output of a
+    // cont/view in the XAttention graph, so check both explicitly.
+    if ((reinterpret_cast<uintptr_t>(k->data) % 128) != 0 ||
+        (reinterpret_cast<uintptr_t>(q->data) % 128) != 0 ||
+        (q->nb[1] % 128) != 0 || (q->nb[2] % 128) != 0 || (k->nb[2] % 128) != 0) {
+        HEX_VERBOSE("ggml-hex: xattn-score align reject : k.data %% 128 = %u q.data %% 128 = %u "
+                    "q.nb1 %zu q.nb2 %zu k.nb2 %zu\n",
+                    (unsigned) (reinterpret_cast<uintptr_t>(k->data) % 128),
+                    (unsigned) (reinterpret_cast<uintptr_t>(q->data) % 128),
+                    (size_t) q->nb[1], (size_t) q->nb[2], (size_t) k->nb[2]);
         return false;
     }
 

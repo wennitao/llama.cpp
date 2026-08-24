@@ -191,14 +191,31 @@ The R=64 line is the more interesting one: fusion is what makes good selection
 affordable, and good selection is what makes block-sparse attention correct
 enough to deploy.
 
-## Attempt 1 at fusion: correct, and 1.4-3.8x slower
+## Attempt 1 at fusion: UNVERIFIED, and 1.4-3.8x slower
 
 Implemented as `HTP_OP_XATTN_SCORE`
 (`ggml/src/ggml-hexagon/htp/xattn-score-ops.c`), matched on the host by
 `try_fuse_xattn_score` over `MUL_MAT -> SOFT_MAX -> RESHAPE -> SUM_ROWS`. The
 `[kv, nq, nh]` intermediate stays in VTCM exactly as intended, so DRAM traffic
-does drop to K plus the small output. Correctness passes
-(`XATTN_BLOCK_SCORES` and `FLASH_ATTN_EXT_XATTN`, 2/2 backends).
+does drop to K plus the small output.
+
+> **The fused kernel's correctness is NOT established.** An earlier version of
+> this section claimed that `XATTN_BLOCK_SCORES` and `FLASH_ATTN_EXT_XATTN`
+> passing 2/2 backends proved it. They do pass -- but they never ran the fused
+> code. `test-backend-ops test` compares through
+> `ggml_backend_compare_graph_backend`, which evaluates the graph **node by node**
+> so it can check every intermediate. That makes each node an output,
+> `ggml_node_has_n_uses(.., 1)` fails, and no fusion can ever apply. Confirmed
+> empirically: with `GGML_HEXAGON_XATTN_FUSION=1` the "fused xattn-score" trace
+> fires **2519 times in `perf` mode and 0 times in `test` mode**. So `test` mode
+> structurally cannot validate ANY fused op on this backend, not just this one.
+>
+> The perf numbers below ARE the fused kernel -- `perf` mode uses whole-graph
+> compute -- so the regression is real. Only the correctness claim was wrong.
+>
+> Verifying a fused op needs a different harness: run the same graph on HTP with
+> the fusion gate on and off and diff the outputs, or add a whole-graph compare
+> mode. Neither exists yet.
 
 It is still a large regression, because the score matmul was moved from HMX to
 HVX:
