@@ -191,7 +191,7 @@ The R=64 line is the more interesting one: fusion is what makes good selection
 affordable, and good selection is what makes block-sparse attention correct
 enough to deploy.
 
-## Attempt 1 at fusion: UNVERIFIED, and 1.4-3.8x slower
+## Attempt 1 at fusion: correct (now actually tested), and 1.4-3.8x slower
 
 Implemented as `HTP_OP_XATTN_SCORE`
 (`ggml/src/ggml-hexagon/htp/xattn-score-ops.c`), matched on the host by
@@ -199,35 +199,30 @@ Implemented as `HTP_OP_XATTN_SCORE`
 `[kv, nq, nh]` intermediate stays in VTCM exactly as intended, so DRAM traffic
 does drop to K plus the small output.
 
-> **The fused kernel's correctness is NOT established.** An earlier version of
-> this section claimed that `XATTN_BLOCK_SCORES` and `FLASH_ATTN_EXT_XATTN`
-> passing 2/2 backends proved it. They do pass -- but they never ran the fused
-> code. `test-backend-ops test` compares through
-> `ggml_backend_compare_graph_backend`, which evaluates the graph **node by node**
-> so it can check every intermediate. That makes each node an output,
-> `ggml_node_has_n_uses(.., 1)` fails, and no fusion can ever apply. Confirmed
-> empirically: with `GGML_HEXAGON_XATTN_FUSION=1` the "fused xattn-score" trace
-> fires **2519 times in `perf` mode and 0 times in `test` mode**. So `test` mode
-> structurally cannot validate ANY fused op on this backend, not just this one.
+> **Correctness: established, after two false starts.** This section first claimed
+> the fused kernel passed 2/2 backends, then retracted that saying `test` mode
+> "structurally cannot" run a fused op. Both were wrong, for different reasons.
 >
-> The perf numbers below ARE the fused kernel -- `perf` mode uses whole-graph
-> compute -- so the regression is real. Only the correctness claim was wrong.
+> The real cause was mundane: `test_flash_attn_ext_xattn_sel` was registered only in
+> `make_test_cases_perf()`, never in `make_test_cases_eval()`. `test -o
+> XATTN_BLOCK_SCORES` therefore reported **`0/0 tests passed`** and printed OK -- zero
+> failures out of zero cases. Every correctness claim about this kernel was vacuous.
 >
-> Verifying a fused op needs a different harness: run the same graph on HTP with
-> the fusion gate on and off and diff the outputs, or add a whole-graph compare
-> mode. Neither exists yet.
-
-It is still a large regression, because the score matmul was moved from HMX to
-HVX:
-
-| kv | R | unfused (HMX mm) | fused (HVX dot) | |
-|--:|--:|--:|--:|:--|
-| 512 | 8 | 561.5 µs | 766.1 | 1.36x slower |
-| 512 | 64 | 1359.7 | 3306.6 | 2.43x |
-| 1024 | 8 | 632.0 | 1362.7 | 2.16x |
-| 1024 | 64 | 2008.3 | 6296.7 | 3.14x |
-| 2048 | 8 | 976.3 | 2294.7 | 2.35x |
-| 2048 | 64 | 3268.6 | 12541.2 | 3.84x |
+> The retraction was also wrong. `ggml_backend_compare_graph_backend` does support
+> whole-graph comparison: with a non-empty `test_nodes` list it calls
+> `ggml_backend_graph_compute` ONCE over the whole graph and compares only the listed
+> outputs (`ggml/src/ggml-backend.cpp:2240-2243`), and `run_whole_graph()` already
+> feeds it that list. Node-by-node is only the `num_test_nodes == 0` branch.
+>
+> With the cases registered in the eval list, `XATTN_BLOCK_SCORES` now reports
+> **3/3 passed with the fusion trace firing 3 times**, and 3/3 unfused. The fused
+> scoring kernel is genuinely correct. Only its speed is the problem.
+>
+> **Stage 0 stays perf-only.** It runs argsort -> selection -> sparse FA, and fails
+> 0/3 against CPU *with fusion both on and off*. HTP and CPU block scores differ in
+> the last fp bits, argsort flips a rank, a different set of blocks is chosen, and the
+> outputs diverge entirely. Checking stage 0 needs the ranking pinned via a dominant
+> `bias` leaf; the graph has the slot, the harness fills it randomly.
 
 At kv=2048/R=64 the fused kernel sustains 42.8 GFLOP/s against the standalone
 HMX matmul's 1.55 TFLOP/s -- **36x worse**. Saving ~470 µs of chain traffic
@@ -259,6 +254,38 @@ it in place. That keeps the 4x-to-1x traffic win *and* the 1.55 TFLOP/s matmul,
 and it is the combination the projection below assumes. The FA kernel already
 does exactly this staging for QK^T, so the machinery exists in
 `hmx-fa-kernels.h`.
+
+## The whole-graph per-call constant, measured
+
+Stage 5 was added to settle this: byte-identical graph to stage 1, but timed
+whole-graph, so `t(stage5) - t(stage1)` **is** the per-`ggml_backend_graph_compute`
+cost that every `n_runs=1` figure in this doc carries.
+
+| kv | R | replicated | whole-graph | constant |
+|--:|--:|--:|--:|--:|
+| 512 | 8 | 80.0 | 459.7 | **379.7** |
+| 512 | 64 | 173.3 | 599.2 | 426.0 |
+| 1024 | 8 | 124.7 | 500.0 | **375.4** |
+| 1024 | 64 | 257.8 | 712.2 | 454.3 |
+| 2048 | 8 | 213.9 | 612.6 | **398.7** |
+| 2048 | 64 | 448.1 | 1041.6 | 593.5 |
+
+So **~375-400 µs** for a small graph, drifting to ~590 µs as the work grows -- it is
+not a pure constant, because a replicated run also overlaps successive iterations
+that a single run cannot. Two earlier estimates were both too high: ~590 µs (from
+stage4 minus replicated FA) and ~690 µs (derived from stage2-stage1 flatness).
+
+What this does and does not invalidate:
+
+- **Scoring deltas are unaffected.** `stage0 - stage4` cancels the constant, since
+  both sides are whole-graph. Those numbers stand.
+- **Absolute whole-graph figures are inflated** by ~400-600 µs. Read every stage-2
+  and stage-4 number in this doc with that in mind.
+- **Cross-backend whole-graph comparisons are the real casualty.** The NPU pays a
+  FastRPC/dspqueue round trip and the GPU pays an OpenCL queue flush; there is no
+  reason those constants are equal, and neither has been measured against the other.
+  Any NPU-vs-GPU table built from `n_runs=1` numbers needs each backend's own
+  constant subtracted first.
 
 ## Not measured / not verified
 

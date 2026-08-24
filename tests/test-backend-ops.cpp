@@ -7563,7 +7563,8 @@ struct test_flash_attn_ext_xattn_sel : public test_case {
         return stage == 1 ? "XATTN_SCORE_MM" :
                stage == 2 ? "XATTN_BLOCK_SCORES" :
                stage == 3 ? "XATTN_ARGSORT" :
-               stage == 4 ? "XATTN_FA_ONLY" : "FLASH_ATTN_EXT_XATTN";
+               stage == 4 ? "XATTN_FA_ONLY" :
+               stage == 5 ? "XATTN_SCORE_MM_WG" : "FLASH_ATTN_EXT_XATTN";
     }
 
     bool run_whole_graph()  override { return true; }
@@ -7629,7 +7630,10 @@ struct test_flash_attn_ext_xattn_sel : public test_case {
         ggml_tensor * sc = ggml_mul_mat(ctx, k, qr);
         ggml_mul_mat_set_prec(sc, GGML_PREC_F32);
         ggml_set_name(sc, "scores");
-        if (stage == 1) { return sc; }
+        // stage 5 is byte-identical to stage 1 but timed whole-graph, so
+        // t(stage5) - t(stage1) IS the per-ggml_backend_graph_compute constant that
+        // every whole-graph number carries. Measuring it directly beats deriving it.
+        if (stage == 1 || stage == 5) { return sc; }
 
         // 6: softmax over the key axis -- the reference finds the temperature is
         //    load-bearing, so the 1/sqrt(D) scale is folded in here.
@@ -10673,6 +10677,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 1, 1024, 64, 64,  4));
     test_cases.emplace_back(new test_flash_attn_ext_sparse(64,  2, 1, 1024, 32, 128, 3));
 
+    // XAttention scoring. These were previously registered only in the perf list, so
+    // `test -o XATTN_BLOCK_SCORES` reported 0/0 and every correctness claim about them
+    // was vacuous. They matter here for a second reason: run_whole_graph() makes eval
+    // pass a non-empty test_nodes list to ggml_backend_compare_graph_backend, which then
+    // computes the graph in ONE ggml_backend_graph_compute call instead of node by node
+    // (ggml-backend.cpp:2240). That single call is what lets a backend's op fusion fire,
+    // so these are the only cases that can validate a fused scoring kernel at all.
+    // Stage 2 only. Stage 0 continues through argsort into the sparse FA, and it
+    // fails 0/3 against the CPU reference -- with fusion both ON and OFF, so it is
+    // not a kernel bug. HTP and CPU block scores differ in the last fp bits, argsort
+    // flips a rank, a DIFFERENT set of blocks gets selected, and the two attention
+    // outputs then have nothing to do with each other. Making stage 0 checkable needs
+    // the ranking pinned -- a dominant `bias` leaf, which the graph already has a slot
+    // for but which the harness fills with random data. Until that lands, stage 0 is a
+    // perf-only arm.
+    for (int stage : { 2 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_xattn_sel(128, 2, 2, 512, 64, 64, 2, 8, stage));
+        test_cases.emplace_back(new test_flash_attn_ext_xattn_sel(128, 4, 1, 1024, 64, 64, 4, 16, stage));
+        // nq not a multiple of the HMX/wave tile: exercises the partial-tile guards
+        test_cases.emplace_back(new test_flash_attn_ext_xattn_sel(128, 2, 1, 1024, 64, 64, 4, 32, stage));
+    }
+
     // The gather arms are benchmark scaffolding, but they are built from standard ops,
     // so the CPU reference can check they really compute attention over the selected
     // rows -- a wrong stride or index list would otherwise only show up as a silently
@@ -11196,6 +11222,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         // replication times it correctly.
         for (int R : { 8, 16, 32, 64, 128 }) {
             test_cases.emplace_back(new test_flash_attn_ext_xattn_sel(128, 8, 2, kv, nb, bs, n_sel, R, 1));
+        }
+        // stage 5 == stage 1's graph, timed whole-graph. The difference is the
+        // per-call constant carried by every whole-graph figure in this file.
+        for (int R : { 8, 64 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_xattn_sel(128, 8, 2, kv, nb, bs, n_sel, R, 5));
         }
         // end-to-end at the old and a wide R. stage 4 ignores R, so its two rows are
         // a free run-to-run noise check on the overhead-matched control.
