@@ -583,6 +583,10 @@ struct ggml_backend_opencl_context {
     // whether to fold the MoE down-projection bias add into the combine
     cl_uint fuse_moe_bias_combine;
 
+    // whether to fold the XAttention block-selection scoring chain
+    // (MUL_MAT + SOFT_MAX + RESHAPE + SUM_ROWS) into one kernel pair
+    cl_uint fuse_xattn_score;
+
     bool adreno_has_large_buffer;
     bool adreno_use_large_buffer;
     bool adreno_use_bin_kernels;
@@ -619,6 +623,23 @@ struct ggml_backend_opencl_context {
     ggml_cl_buffer prealloc_moe_sa;   // per-block s  [tok_slots * ne00/32] (half)
     // scratch copy of the router weights to avoid dst aliasing
     ggml_cl_buffer prealloc_moe_combine_w;
+
+    // per-split partials of the fused XAttention scorer:
+    //   bsum [nh*nq*nblk]      un-normalized block sums (same size as the result,
+    //                          because each block is written by exactly one split)
+    //   ml   [nh*nq*nsplits*2] the (max, sum) softmax record of each split
+    ggml_cl_buffer prealloc_xattn_bsum;
+    ggml_cl_buffer prealloc_xattn_ml;
+
+    // XAttention scoring kernels, compiled lazily one program per (KT, QT)
+    // register tile -- the tile is a -D constant so the accumulators stay in
+    // named registers.
+    struct xattn_score_kernels {
+        cl_program program = nullptr;
+        cl_kernel  partial = nullptr;
+        cl_kernel  merge   = nullptr;
+    };
+    std::map<std::pair<int, int>, xattn_score_kernels> xattn_score_progs;
 
     // pool of persistent image1d_buffer views over kv-cache layers, keyed by
     // (parent buffer, offset within parent)
@@ -1138,6 +1159,12 @@ struct ggml_backend_opencl_context {
                 if (kv.second.image) { CL_CHECK(clReleaseMemObject(kv.second.image)); }
             }
             dequant_f16_pool.clear();
+            for (auto & kv : xattn_score_progs) {
+                if (kv.second.partial) { CL_CHECK(clReleaseKernel(kv.second.partial)); }
+                if (kv.second.merge)   { CL_CHECK(clReleaseKernel(kv.second.merge)); }
+                if (kv.second.program) { CL_CHECK(clReleaseProgram(kv.second.program)); }
+            }
+            xattn_score_progs.clear();
         }
     }
 };
@@ -1285,6 +1312,91 @@ static void load_cl_kernels_argsort(ggml_backend_opencl_context *backend_ctx) {
         CL_CHECK((backend_ctx->kernel_argsort_f32_i32 = clCreateKernel(backend_ctx->program_argsort_f32_i32, "kernel_argsort_f32_i32", &err), err));
         backend_ctx->kernels_loaded_argsort = true;
     }
+}
+
+// XAttention block-scoring kernels. The (KT, QT) register tile is a -D constant
+// -- the accumulators have to be statically indexed to stay in registers -- so
+// there is one program per tile the dispatcher picks, compiled on first use like
+// the FA per-(DK,DV) programs. fatal=false plus the null checks below keep a
+// compiler failure a fallback to the eager four-op chain instead of an abort.
+static const ggml_backend_opencl_context::xattn_score_kernels * ggml_opencl_ensure_xattn_score_kernels(
+        ggml_backend_opencl_context * backend_ctx, int kt, int qt, int hs, int bs) {
+    const std::pair<int, int> key = { kt, qt };
+
+    auto it = backend_ctx->xattn_score_progs.find(key);
+    if (it != backend_ctx->xattn_score_progs.end()) {
+        return (it->second.partial && it->second.merge) ? &it->second : nullptr;
+    }
+
+#ifdef GGML_OPENCL_EMBED_KERNELS
+    const std::string kernel_src {
+        #include "xattn_score.cl.h"
+    };
+#else
+    const std::string kernel_src = read_file("xattn_score.cl");
+#endif
+
+    const std::string opts = backend_ctx->kernel_compile_opts +
+        " -D XA_HS=" + std::to_string(hs) +
+        " -D XA_BS=" + std::to_string(bs) +
+        " -D XA_KT=" + std::to_string(kt) +
+        " -D XA_QT=" + std::to_string(qt);
+    const std::string tag = "xattn_score KT=" + std::to_string(kt) + " QT=" + std::to_string(qt);
+
+    ggml_backend_opencl_context::xattn_score_kernels ks;
+    // The on-disk binary cache keeps this off the first graph_compute; the tile is
+    // part of the compile options, so each (KT, QT) gets its own entry.
+    ks.program = cl_program_cache_try_load(backend_ctx->program_cache, backend_ctx->context,
+                                           backend_ctx->device, kernel_src.c_str(), opts);
+    if (ks.program == nullptr) {
+        ks.program = build_program_from_source_ex(backend_ctx->context, backend_ctx->device,
+                                                  kernel_src.c_str(), opts, /*fatal=*/false,
+                                                  tag.c_str(), backend_ctx->queue);
+        if (ks.program != nullptr) {
+            cl_program_cache_try_save(backend_ctx->program_cache, ks.program, backend_ctx->device,
+                                      kernel_src.c_str(), opts);
+        }
+    }
+    if (ks.program != nullptr) {
+        cl_int err = CL_SUCCESS;
+        ks.partial = clCreateKernel(ks.program, "kernel_xattn_score_partial", &err);
+        if (err != CL_SUCCESS) {
+            ks.partial = nullptr;
+        }
+        ks.merge = clCreateKernel(ks.program, "kernel_xattn_score_merge", &err);
+        if (err != CL_SUCCESS) {
+            ks.merge = nullptr;
+        }
+    }
+
+    // The wave IS the reduction unit here (one block per wave), so a per-kernel
+    // workgroup limit below 64 -- which register pressure alone can cause -- would
+    // silently produce wrong block sums rather than a slow kernel.
+    if (ks.partial != nullptr && backend_ctx->get_kernel_workgroup_size(ks.partial) < 64) {
+        GGML_LOG_INFO("ggml_opencl: %s per-kernel max workgroup size < 64; skipping registration (will fall back)\n",
+                      tag.c_str());
+        CL_CHECK(clReleaseKernel(ks.partial));
+        ks.partial = nullptr;
+    }
+
+    // On Adreno a non-zero private memory size means the accumulator tile spilled
+    // to per-work-item scratch, which costs far more than the tile buys.
+    // Enable with GGML_OPENCL_XATTN_LOG_SPILL=1.
+    static const bool log_spill = []{
+        const char * e = std::getenv("GGML_OPENCL_XATTN_LOG_SPILL");
+        return e && e[0] && e[0] != '0';
+    }();
+    if (log_spill && ks.partial != nullptr) {
+        cl_ulong priv_mem = 0;
+        if (clGetKernelWorkGroupInfo(ks.partial, backend_ctx->device, CL_KERNEL_PRIVATE_MEM_SIZE,
+                                     sizeof(priv_mem), &priv_mem, NULL) == CL_SUCCESS) {
+            GGML_LOG_INFO("ggml_opencl: [%s] %s private_mem=%llu bytes\n",
+                          priv_mem > 0 ? "SPILL" : "ok", tag.c_str(), (unsigned long long) priv_mem);
+        }
+    }
+
+    auto ins = backend_ctx->xattn_score_progs.emplace(key, ks);
+    return (ks.partial && ks.merge) ? &ins.first->second : nullptr;
 }
 
 static bool use_adreno_bin_kernels(ggml_backend_opencl_context * backend_ctx) {
@@ -6049,6 +6161,10 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     static const char * fuse_moe_combine_env = getenv("GGML_OPENCL_FUSE_MOE_COMBINE");
     backend_ctx->fuse_moe_combine = fuse_moe_combine_env == NULL ? 1 : (atoi(fuse_moe_combine_env) != 0);
 
+    // whether to fuse the XAttention block-selection scoring chain
+    static const char * fuse_xattn_score_env = getenv("GGML_OPENCL_FUSE_XATTN_SCORE");
+    backend_ctx->fuse_xattn_score = fuse_xattn_score_env == NULL ? 1 : (atoi(fuse_xattn_score_env) != 0);
+
     // ragged moe dp4 variant
     static const char * ragged_dp4_env = getenv("GGML_OPENCL_MOE_RAGGED");
     backend_ctx->adreno_use_moe_ragged_dp4 = ragged_dp4_env == NULL ? 1 : (atoi(ragged_dp4_env) != 0);
@@ -7260,6 +7376,287 @@ static void ggml_cl_moe_combine_fused(ggml_backend_t backend, const ggml_tensor 
     backend_ctx->enqueue_ndrange_kernel(kernel, 2, gws, lws, dst);
 }
 
+// XAttention block-selection scoring: MUL_MAT -> SOFT_MAX -> RESHAPE -> SUM_ROWS.
+//
+// Unfused, the [kv, nq, nh] score tensor is written by the matmul, read and
+// rewritten by the softmax and read again by sum_rows -- four passes over a
+// tensor `bs` times larger than the result -- and the matmul itself lands on
+// kernel_mul_mat_f16_f32_l4, which at hs=128 leaves half the wave idle. Fused,
+// the scores never leave registers and only K, Q and the small result cross DRAM.
+//
+// The RESHAPE has to join the matched set even though it computes nothing: it is
+// SUM_ROWS's src[0]. ggml_can_fuse cannot express this chain at all (it demands
+// all four nodes be the same shape), hence ggml_can_fuse_subgraph, which accepts
+// the RESHAPE because its view_src is the SOFT_MAX output -- inside the subgraph.
+static bool ggml_opencl_can_fuse_xattn_score(ggml_backend_opencl_context * backend_ctx,
+                                             const struct ggml_cgraph * cgraph, int node_idx) {
+    static const enum ggml_op xa_ops[] = { GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_RESHAPE, GGML_OP_SUM_ROWS };
+    const int xa_out[] = { node_idx + 3 };
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, 4, xa_ops, xa_out, 1)) {
+        return false;
+    }
+
+    // Past this point the op pattern matched, so a rejection is worth reporting:
+    // it is the difference between "this graph has no scoring chain" and "it has
+    // one and we declined it".
+#define GGML_CL_XATTN_REJECT(reason)                                                    \
+    do {                                                                                \
+        GGML_LOG_DEBUG("ggml_opencl: xattn-score fusion declined: %s\n", (reason));      \
+        return false;                                                                   \
+    } while (0)
+
+    const ggml_tensor * mm = cgraph->nodes[node_idx];
+    const ggml_tensor * sm = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * rs = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * sr = cgraph->nodes[node_idx + 3];
+
+    // strict producer -> consumer chain
+    if (sm->src[0] != mm || rs->src[0] != sm || sr->src[0] != rs) {
+        GGML_CL_XATTN_REJECT("nodes are not a straight producer->consumer chain");
+    }
+
+    // the kernel implements a plain softmax: no mask, no ALiBi slope
+    if (sm->src[1] != nullptr || sm->src[2] != nullptr) {
+        GGML_CL_XATTN_REJECT("soft_max has a mask or sinks");
+    }
+    float scale, max_bias;
+    memcpy(&scale,    (const float *) sm->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (const float *) sm->op_params + 1, sizeof(float));
+    if (max_bias != 0.0f) {
+        GGML_CL_XATTN_REJECT("soft_max has max_bias != 0");
+    }
+
+    const ggml_tensor * k = mm->src[0];
+    const ggml_tensor * q = mm->src[1];
+
+    if (k->type != GGML_TYPE_F16 || q->type != GGML_TYPE_F32 || sr->type != GGML_TYPE_F32) {
+        GGML_CL_XATTN_REJECT("expects f16 K, f32 Q, f32 dst");
+    }
+    if (!ggml_is_contiguous(k) || !ggml_is_contiguous(q) || !ggml_is_contiguous(sr)) {
+        GGML_CL_XATTN_REJECT("K, Q or dst is not contiguous");
+    }
+    if (k->ne[3] != 1 || q->ne[3] != 1 || k->ne[0] != q->ne[0] || k->ne[2] != q->ne[2]) {
+        GGML_CL_XATTN_REJECT("shape mismatch between K and Q (or a batch dim)");
+    }
+
+    const int64_t hs   = k->ne[0];
+    const int64_t kv   = k->ne[1];
+    const int64_t nh   = k->ne[2];
+    const int64_t nq   = q->ne[1];
+    const int64_t nblk = sr->ne[1];
+
+    // the reshape must only be regrouping the kv axis into [bs, nblk]
+    if (nblk <= 0 || rs->ne[2] != nq || rs->ne[3] != nh || rs->ne[0]*nblk != kv) {
+        GGML_CL_XATTN_REJECT("the reshape is not a [bs, nblk] regroup of the kv axis");
+    }
+    if (sr->ne[0] != 1 || sr->ne[2] != nq || sr->ne[3] != nh) {
+        GGML_CL_XATTN_REJECT("sum_rows output is not [1, nblk, nq, nh]");
+    }
+
+    // Kernel-shape constraints. hs=128 fixes the 32-iteration half4 walk of a key
+    // row; bs=64 is what makes one wave equal one selection block, which is the
+    // whole reason the block sum is a single subgroup reduce.
+    if (hs != 128) {
+        GGML_CL_XATTN_REJECT("head size is not 128");
+    }
+    if (rs->ne[0] != 64) {
+        GGML_CL_XATTN_REJECT("selection block size is not 64");
+    }
+    if ((kv % 64) != 0) {
+        GGML_CL_XATTN_REJECT("kv is not a multiple of 64");
+    }
+
+    // The wave is the reduction unit and its width is baked in at 64. The backend
+    // hard-codes that only for Adreno, so do not claim the chain anywhere else.
+    if (backend_ctx->gpu_family != GPU_FAMILY::ADRENO || backend_ctx->adreno_wave_size != 64 ||
+        backend_ctx->max_workgroup_size < 64) {
+        GGML_CL_XATTN_REJECT("device is not a 64-wide-wave Adreno");
+    }
+
+    // half4/float4 loads need the tensor bases aligned; contiguity alone does not
+    // give it, and q is the output of a cont/view in the XAttention graph.
+    const ggml_tensor_extra_cl * ek = (const ggml_tensor_extra_cl *) k->extra;
+    const ggml_tensor_extra_cl * eq = (const ggml_tensor_extra_cl *) q->extra;
+    const ggml_tensor_extra_cl * ed = (const ggml_tensor_extra_cl *) sr->extra;
+    if (!ek || !eq || !ed) {
+        GGML_CL_XATTN_REJECT("a tensor has no device extra");
+    }
+    if (((ek->offset + k->view_offs) % 8) != 0 || ((eq->offset + q->view_offs) % 16) != 0 ||
+        ((ed->offset + sr->view_offs) % 4) != 0) {
+        GGML_CL_XATTN_REJECT("K, Q or dst base offset is not vector-aligned");
+    }
+
+    // one kernel reads K/Q and writes dst, so an allocator overlap that was safe
+    // for the separate kernels would be a race here
+    if (ggml_cl_tensors_overlap(k, sr) || ggml_cl_tensors_overlap(q, sr)) {
+        GGML_CL_XATTN_REJECT("dst overlaps K or Q");
+    }
+
+#undef GGML_CL_XATTN_REJECT
+    return true;
+}
+
+// Pick the (KT, QT) register tile: the largest KT*QT that still leaves enough
+// waves to fill the machine. nq alone never does -- at nq=16/QT=4 the (head,
+// query-tile) grid is 32 workgroups -- so the kv axis is split as well and the
+// splits are merged by a second kernel. KT*QT <= 16 accumulators is the ceiling
+// the FA kernels' spill experience suggests; ties go to the larger KT because it
+// halves the number of splits (and hence of merge inputs) for the same tile.
+//
+// The 256-wave target is a guess: the backend never queries
+// CL_DEVICE_MAX_COMPUTE_UNITS, so there is no CU count to derive it from.
+// GGML_OPENCL_XATTN_KT / _QT override it for sweeping.
+static bool ggml_cl_xattn_score_pick_tile(int64_t kv, int64_t nh, int64_t nq, int64_t bs, int * out_kt, int * out_qt) {
+    static const char * kt_env = getenv("GGML_OPENCL_XATTN_KT");
+    static const char * qt_env = getenv("GGML_OPENCL_XATTN_QT");
+
+    auto viable = [&](int kt, int qt) {
+        const int64_t w = 64*(int64_t) kt;
+        return (w % bs) == 0 && (kv % w) == 0 && kt*qt <= 16;
+    };
+
+    if (kt_env && qt_env) {
+        const int kt = atoi(kt_env);
+        const int qt = atoi(qt_env);
+        if (kt >= 1 && kt <= 2 && (qt == 4 || qt == 8 || qt == 16) && viable(kt, qt)) {
+            *out_kt = kt;
+            *out_qt = qt;
+            return true;
+        }
+    }
+
+    int best = -1;
+    for (int kt = 1; kt <= 2; ++kt) {
+        for (int qt = 4; qt <= 16; qt *= 2) {
+            if (!viable(kt, qt)) {
+                continue;
+            }
+            const int64_t nsplits = kv / (64*(int64_t) kt);
+            const int64_t nqt     = (nq + qt - 1) / qt;
+            if (nsplits*nh*nqt < 256) {
+                continue;
+            }
+            const int score = 2*kt*qt + kt;   // maximize KT*QT, tie-break to larger KT
+            if (score > best) {
+                best = score;
+                *out_kt = kt;
+                *out_qt = qt;
+            }
+        }
+    }
+    if (best >= 0) {
+        return true;
+    }
+
+    // Nothing reaches the occupancy target (small kv and small nq): fall back to
+    // the finest tile, which is also the one with the most workgroups.
+    if (viable(1, 4)) {
+        *out_kt = 1;
+        *out_qt = 4;
+        return true;
+    }
+    return false;
+}
+
+// Dispatch the fused scorer. Returns false without touching anything if the
+// kernels are unavailable for this shape, so the caller falls back to eager.
+static bool ggml_cl_xattn_score_fused(ggml_backend_t backend, const ggml_tensor * mm,
+                                      const ggml_tensor * sm, ggml_tensor * dst) {
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+
+    const ggml_tensor * k = mm->src[0];
+    const ggml_tensor * q = mm->src[1];
+
+    const int64_t hs   = k->ne[0];
+    const int64_t kv   = k->ne[1];
+    const int64_t nh   = k->ne[2];
+    const int64_t nq   = q->ne[1];
+    const int64_t nblk = dst->ne[1];
+    const int64_t bs   = kv / nblk;
+
+    int kt = 0, qt = 0;
+    if (!ggml_cl_xattn_score_pick_tile(kv, nh, nq, bs, &kt, &qt)) {
+        return false;
+    }
+
+    const ggml_backend_opencl_context::xattn_score_kernels * ks =
+        ggml_opencl_ensure_xattn_score_kernels(backend_ctx, kt, qt, (int) hs, (int) bs);
+    if (ks == nullptr) {
+        return false;
+    }
+
+    const int64_t w       = 64*(int64_t) kt;
+    const int64_t nsplits = kv / w;
+    const int64_t nqt     = (nq + qt - 1) / qt;
+
+    float scale;
+    memcpy(&scale, (const float *) sm->op_params + 0, sizeof(float));
+
+    ggml_tensor_extra_cl * ek = (ggml_tensor_extra_cl *) k->extra;
+    ggml_tensor_extra_cl * eq = (ggml_tensor_extra_cl *) q->extra;
+    ggml_tensor_extra_cl * ed = (ggml_tensor_extra_cl *) dst->extra;
+
+    const cl_ulong k_offset = ek->offset + k->view_offs;
+    const cl_ulong q_offset = eq->offset + q->view_offs;
+    const cl_ulong d_offset = ed->offset + dst->view_offs;
+
+    // bsum is exactly the size of the result: blocks nest inside splits, so each
+    // (query, block) is produced by one workgroup. Grow-on-demand rather than a
+    // clCreateBuffer per dispatch.
+    backend_ctx->prealloc_xattn_bsum.allocate(backend_ctx->context, (size_t) (nh*nq*nblk)*sizeof(float));
+    backend_ctx->prealloc_xattn_ml.allocate(backend_ctx->context, (size_t) (nh*nq*nsplits*2)*sizeof(float));
+
+    const cl_mem bsum = backend_ctx->prealloc_xattn_bsum.buffer;
+    const cl_mem ml   = backend_ctx->prealloc_xattn_ml.buffer;
+
+    const int kv_i      = (int) kv;
+    const int nq_i      = (int) nq;
+    const int nqt_i     = (int) nqt;
+    const int nblk_i    = (int) nblk;
+    const int nsplits_i = (int) nsplits;
+    const int bps_i     = (int) (w / bs);   // selection blocks per kv split
+
+    {
+        cl_kernel kernel = ks->partial;
+        int a = 0;
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &ek->data_device));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &k_offset));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &eq->data_device));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &q_offset));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &bsum));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &ml));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &kv_i));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &nq_i));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &nqt_i));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &nblk_i));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &nsplits_i));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(float),    &scale));
+
+        size_t gws[3] = { 64, (size_t) (nh*nqt), (size_t) nsplits };
+        size_t lws[3] = { 64, 1, 1 };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, gws, lws, dst);
+    }
+
+    {
+        cl_kernel kernel = ks->merge;
+        int a = 0;
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &bsum));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &ml));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &ed->data_device));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &d_offset));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &nq_i));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &nblk_i));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &nsplits_i));
+        CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &bps_i));
+
+        size_t gws[3] = { 64, (size_t) nh, (size_t) nq };
+        size_t lws[3] = { 64, 1, 1 };
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, gws, lws, dst);
+    }
+
+    return true;
+}
+
 static bool ggml_opencl_can_fuse(const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
@@ -7394,6 +7791,16 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                 i += 2 * (int)node->ne[1] - 1;   // skip the k VIEWs + (k-1) ADDs
                 continue;
             }
+        }
+
+        // Fold the XAttention block-selection scoring chain:
+        // mul_mat(K, Q_reps) + soft_max + reshape + sum_rows -> score/softmax/block-sum
+        // kernel plus a cross-split merge. Opt out GGML_OPENCL_FUSE_XATTN_SCORE=0.
+        if (backend_ctx->fuse_xattn_score && !backend_ctx->disable_fusion &&
+            ggml_opencl_can_fuse_xattn_score(backend_ctx, cgraph, i) &&
+            ggml_cl_xattn_score_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+3])) {
+            i += 3;
+            continue;
         }
 
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
