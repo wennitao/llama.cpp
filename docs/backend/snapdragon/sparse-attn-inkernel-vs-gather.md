@@ -369,3 +369,72 @@ Cases live in `make_test_cases_perf()` / `make_test_cases_eval()` in
 `tests/test-backend-ops.cpp`. Maskless sparse cases are perf-only by design.
 `NHVX=1` forces the non-pipelined path, which is useful for isolating
 pipelining-related behaviour.
+
+## Per-query-block selection: where the 3x actually goes
+
+Real XAttention selects a different KV block set per query block. The kernel now supports
+that (`sel` gains a query-block axis), and it measured 2.99x slower at `Bq = 64`. The MAC
+count is identical across every row below -- 2.15 GFLOP -- so every difference is schedule,
+not math.
+
+### The indexing itself is free
+
+| | time | |
+|:--|--:|:--|
+| shared selection (mean of 2 runs) | 998.0 µs | baseline |
+| per-query-block, `Bq = 512` | **995.2 µs** | **0.997x** |
+
+At `Bq = 512` one kernel query tile still covers the whole 512-token chunk, so `Br` is
+unchanged and the only difference is which row of `sel` is read. It costs nothing
+measurable. **The mechanism has no intrinsic overhead.**
+
+### The cost is the `Br <= Bq` constraint
+
+A kernel query tile spans `[q_start, q_start + Br)` and resolves one selection, so it may
+not straddle two scorer query blocks. Pinning `Bq` therefore pins `Br`, and that drives two
+separate costs. Sweeping `Bq` with `bs` and `n_sel` held fixed (kv=2048, nb=512, bs=64,
+n_sel=8, G=2):
+
+| Bq | Br | q_blocks | softmax threads | time | vs Bq=512 |
+|--:|--:|--:|--:|--:|--:|
+| 512 | 512 | 1 | 6 | 995.2 | 1.00x |
+| 256 | 256 | 2 | 6 | 1326.6 | 1.33x |
+| 128 | 128 | 4 | 4 | 1571.3 | 1.58x |
+| 64 | 64 | 8 | 2 | **2994.7** | **3.01x** |
+
+- **(a) K/V re-staging.** Staging lives inside the `q_start` loop
+  (`flash-attn-ops.c:2180`, with every `fa_phase_k/v_interleave` and `fa_push_chunk` call
+  at `:2213`-`:2470` inside it), so each query tile re-streams its selected blocks.
+  `q_blocks = nb/Br`, so `Bq=64` streams K/V 8x (2 MiB -> 16 MiB).
+- **(b) Softmax thread starvation.** `fa_phase_softmax_and_build_d` (`:1646`) uses
+  `n_use = min(n_threads, ceil(n_rows_g/64))` with `n_rows_g = n_rows_q * G`
+  (`:2182`). At `G=2`: `Br=512` -> 1024 rows -> 16 -> **6 threads**; `Br=64` -> 128 rows
+  -> 2 -> **2 threads**. Softmax is the serializing phase of the pipeline.
+
+### Which dominates: the GQA control
+
+Regroup the same 16 Q heads as `nh=2, nr=8`. Now `G=8`, so at `Br=64`
+`ceil(8*64/64) = 8` and **all 6 softmax threads survive** -- while `q_blocks` is still 8,
+i.e. the full re-staging penalty is still paid:
+
+| | shared | per-qblock `Bq=64` | ratio |
+|:--|--:|--:|--:|
+| `nh=8, nr=2` (G=2, **2 threads**) | 998.0 | 2994.7 | **3.00x** |
+| `nh=2, nr=8` (G=8, **6 threads**) | 917.7 | 1337.2 | **1.46x** |
+
+Same `q_blocks = 8` in both. The only difference is thread count. So:
+
+- **K/V re-staging costs 1.46x**
+- **Softmax starvation costs a further 2.06x**, and is the dominant term
+
+### What this implies for the fix
+
+The union-staging workaround attacks (a), the smaller half. The bigger win is to stop the
+softmax phase partitioning over query rows. It currently splits `n_rows_g` into 64-row
+vectors; at small `Br` there are not enough to go round. Partitioning over the KV/column
+axis instead -- per-thread partial max and sum, then a cheap combine -- would hold 6
+threads at any `Br` and should take 3.00x down to about 1.46x without giving up
+per-query-block selection at all.
+
+That is a change to how one phase is parallelised, not to the algorithm or the data
+layout, and it is independent of everything else in this document.

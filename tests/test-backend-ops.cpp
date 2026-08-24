@@ -11733,6 +11733,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext_gather_rows(128, 8, 2, kv, nb, bs, n_sel, /*stage=*/2, GGML_TYPE_F16));
         test_cases.emplace_back(new test_flash_attn_ext_gather_rows(128, 8, 2, kv, nb, bs, n_sel, /*stage=*/1, GGML_TYPE_F32));
         test_cases.emplace_back(new test_flash_attn_ext_gather_rows(128, 8, 2, kv, nb, bs, n_sel, /*stage=*/3, GGML_TYPE_F16));
+    }
+
+    // Attribute the per-query-block penalty. The MAC count is identical across every
+    // row here -- only the SCHEDULE changes -- so any difference is tiling cost alone.
+    //
+    // Requiring a kernel query tile to stay inside one scorer query block pins Br to bq,
+    // and that single constraint drives two separate costs:
+    //   (a) K/V re-staging: staging lives inside the q_start loop, so it runs once per
+    //       query tile. q_blocks = nb/Br, so bq=64 re-streams K/V 8x versus bq=512.
+    //   (b) softmax thread starvation: fa_phase_softmax_and_build_d uses
+    //       n_use = min(n_threads, ceil(G*Br/64)), so with G=2 the phase gets
+    //       2/4/6/6 threads at bq = 64/128/256/512.
+    //
+    // Holding bs and n_sel fixed and sweeping bq separates them: 512 -> 256 keeps 6
+    // threads and only doubles the re-staging, so it prices (a) on its own; the lower
+    // steps add (b) on top.
+    {
+        const int kv = 2048, nb = 512, bs = 64, n_sel = 8;
+        for (int bq : { 64, 128, 256, 512 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, nb, bs, n_sel, /*mask=*/false,
+                                                                   /*per_head_sel=*/true, bq, /*per_qblock=*/true));
+        }
+        // Same 16 Q heads regrouped as GQA 8, so ceil(G*Br/64) = 8 keeps all 6 softmax
+        // threads even at Br=64. Compare each against its own shared-selection row: if
+        // the penalty largely vanishes here, thread starvation was the dominant term.
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 2, 8, kv, nb, bs, n_sel, /*mask=*/false));
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 2, 8, kv, nb, bs, n_sel, /*mask=*/false,
+                                                               /*per_head_sel=*/true, /*bq=*/64, /*per_qblock=*/true));
         test_cases.emplace_back(new test_flash_attn_ext_gather(128, 8, 2, kv, nb, bs, n_sel));
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, n_sel*bs, nb, /*mask=*/false, false, 0, 0,
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
