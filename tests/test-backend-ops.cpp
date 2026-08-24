@@ -7216,6 +7216,12 @@ struct test_flash_attn_ext : public test_case {
 // to KV ordering when the mask is permuted along with it, so that case must
 // also reproduce dense attention exactly while still exercising non-identity
 // indices.
+//
+// per_qblock adds the query axis: sel becomes [n_sel, NBq, heads, 1] with
+// NBq = ceil(nb/bq) and bq in op_params[5], so each query block retrieves from its
+// own set of KV blocks -- what real XAttention scoring produces. The same trick
+// keeps CPU a valid reference, the -INF mask just has to be built per query ROW
+// (from that row's query block) instead of once per head.
 // DENSE flash attention with a per-head mask (mask->ne[2] > 1). Upstream's
 // test_flash_attn_ext hardcodes mask->ne[2] == 1, so the non-broadcast mask path
 // -- fa_push_mask_dma_gqa on the hexagon backend -- is exercised by nothing. No
@@ -7270,11 +7276,23 @@ struct test_flash_attn_ext_sparse : public test_case {
     // whether the SELECTION is also per-head. Setting it false isolates the
     // non-broadcast mask path from the per-head sel_nb2 stride.
     const bool    per_head_sel;
+    const int64_t bq;          // query-block size the sel rows use; 0 => bs
+    const bool    per_qblock;  // give sel a query axis (sel->ne[1] == NBq)
+    // Hand the kernel a sel whose nb[1] is NOT 4*n_sel, by viewing the first n_sel
+    // columns of an [n_blocks, NBq, ...] tensor. That is exactly the layout
+    // ggml_argsort_top_k produces, and the only case that proves sel_nb1 is read
+    // rather than assumed contiguous.
+    const bool    sel_strided;
 
     std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_EXT_SPARSE"; }
 
     std::string vars() override {
-        return VARS_TO_STR9(hs, nh, nr, kv, nb, bs, n_sel, mask, per_head_sel);
+        // The query-axis knobs are appended only when in use, so every pre-existing
+        // registration keeps its exact name and stays comparable to its perf baseline.
+        if (!per_qblock) {
+            return VARS_TO_STR9(hs, nh, nr, kv, nb, bs, n_sel, mask, per_head_sel);
+        }
+        return VARS_TO_STR12(hs, nh, nr, kv, nb, bs, n_sel, mask, per_head_sel, bq, per_qblock, sel_strided);
     }
 
     double max_nmse_err() override {
@@ -7288,11 +7306,16 @@ struct test_flash_attn_ext_sparse : public test_case {
     }
 
     test_flash_attn_ext_sparse(int64_t hs = 128, int64_t nh = 4, int64_t nr = 4, int64_t kv = 1024,
-                               int64_t nb = 64, int64_t bs = 64, int64_t n_sel = 4, bool mask = true, bool per_head_sel = true)
+                               int64_t nb = 64, int64_t bs = 64, int64_t n_sel = 4, bool mask = true, bool per_head_sel = true,
+                               int64_t bq = 0, bool per_qblock = false, bool sel_strided = false)
         : hs(hs), nh(nh), nr(nr), kv(kv), nb(nb), bs(bs), n_sel(n_sel), mask(mask),
-          per_head_sel(per_head_sel) {}
+          per_head_sel(per_head_sel), bq(bq), per_qblock(per_qblock), sel_strided(sel_strided) {}
 
     int64_t n_blocks() const { return (kv + bs - 1) / bs; }
+
+    // op_params[5] semantics: 0 means "same as the selection block size".
+    int64_t bq_eff()     const { return bq ? bq : bs; }
+    int64_t n_qblocks()  const { return per_qblock ? (nb + bq_eff() - 1) / bq_eff() : 1; }
 
     // Per-head selection needs a per-head mask, and a per-KV-head mask is only
     // expressible without GQA: the mask head is chosen as (query head %
@@ -7302,17 +7325,30 @@ struct test_flash_attn_ext_sparse : public test_case {
     int64_t n_mask_heads() const { return per_head() ? nh : 1; }
     int64_t n_sel_heads()  const { return (per_head() && per_head_sel) ? nh : 1; }
 
-    // Deterministic per-(head, block-slot) selection, so the mask built in
-    // initialize_tensors and the index list always agree.
-    int64_t sel_block(int64_t ih_in, int64_t islot) const {
-        const int64_t ih = per_head_sel ? ih_in : 0;
+    // Deterministic per-(query block, head, block-slot) selection, so the mask built
+    // in initialize_tensors and the index list always agree.
+    //
+    // The iqb term is ESSENTIAL and must not be "simplified" away: without it every
+    // query block selects the same set, and a kernel that ignores the query axis
+    // entirely (reading row 0 for everything) passes. With it, at n_sel = nblk/NBq
+    // the query blocks' selections are pairwise DISJOINT -- a late query block owns
+    // KV blocks no other block selects -- so a query-agnostic kernel attends only to
+    // -INF mask columns and fails by orders of magnitude, not by rounding.
+    //
+    // Adding a constant modulo nblk is a bijection, so each row still holds n_sel
+    // DISTINCT blocks. That matters: the kernel clamps out-of-range indices but never
+    // deduplicates, and its online softmax needs the chunks feeding one accumulator to
+    // be disjoint in KV. Duplicates ACROSS rows are harmless -- that is the point.
+    int64_t sel_block(int64_t iqb, int64_t ih_in, int64_t islot) const {
+        const int64_t ih   = per_head_sel ? ih_in : 0;
+        const int64_t iq   = per_qblock ? iqb : 0;
         const int64_t nblk = n_blocks();
         if (n_sel == nblk) {
             // Full but shuffled: a fixed coprime stride permutes the blocks.
-            return (islot * 7 + ih * 3) % nblk;
+            return (islot * 7 + ih * 3 + iq * 5) % nblk;
         }
-        // Spread the selected blocks over the KV range, offset per head.
-        return (islot * nblk / n_sel + ih) % nblk;
+        // Spread the selected blocks over the KV range, offset per head/query block.
+        return (islot * nblk / n_sel + ih + iq) % nblk;
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -7340,10 +7376,20 @@ struct test_flash_attn_ext_sparse : public test_case {
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
 
         // The block-index list rides in the first free src slot.
-        ggml_tensor * sel = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_sel, 1, n_sel_heads(), 1);
-        ggml_set_name(sel, "sel");
+        // With sel_strided the list is a view of the first n_sel columns of a wider
+        // tensor, so nb[1] != 4*n_sel -- the layout ggml_argsort_top_k hands back.
+        const int64_t row_len = sel_strided ? n_blocks() : n_sel;
+        ggml_tensor * full = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, row_len, n_qblocks(), n_sel_heads(), 1);
+        ggml_set_name(full, "sel");
+        ggml_tensor * sel = full;
+        if (sel_strided) {
+            sel = ggml_view_4d(ctx, full, n_sel, n_qblocks(), n_sel_heads(), 1,
+                               full->nb[1], full->nb[2], full->nb[3], 0);
+            ggml_set_name(sel, "sel_view");
+        }
         out->src[5] = sel;
         out->op_params[4] = (int32_t) bs;
+        out->op_params[5] = (int32_t) (per_qblock ? bq_eff() : 0);
 
         ggml_set_name(out, "out");
 
@@ -7353,13 +7399,24 @@ struct test_flash_attn_ext_sparse : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "sel") == 0) {
-                std::vector<int32_t> idx(n_sel * n_sel_heads());
+                // t is the FULL tensor: with sel_strided its rows are n_blocks() wide
+                // and only the first n_sel entries are viewed. The padding is filled
+                // with a valid index too, so a kernel that mistakenly walked past
+                // n_sel would still read in-range data and the failure would show up
+                // as a wrong ANSWER rather than as a clamp.
+                const int64_t row_len = t->ne[0];
+                std::vector<int32_t> idx(row_len * n_qblocks() * n_sel_heads());
                 for (int64_t ih = 0; ih < n_sel_heads(); ih++) {
-                    for (int64_t is = 0; is < n_sel; is++) {
-                        idx[ih*n_sel + is] = (int32_t) sel_block(ih, is);
+                    for (int64_t iqb = 0; iqb < n_qblocks(); iqb++) {
+                        for (int64_t is = 0; is < row_len; is++) {
+                            idx[(ih*n_qblocks() + iqb)*row_len + is] =
+                                (int32_t) sel_block(iqb, ih, is % n_sel);
+                        }
                     }
                 }
                 ggml_backend_tensor_set(t, idx.data(), 0, idx.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "sel_view") == 0) {
+                // Shares "sel"'s storage; the default uniform fill would clobber it.
             } else if (strcmp(t->name, "m") == 0) {
                 // -INF outside the selected blocks; finite noise inside.
                 const int64_t ne0 = t->ne[0];
@@ -7370,14 +7427,23 @@ struct test_flash_attn_ext_sparse : public test_case {
                 std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
 
                 for (int64_t ih = 0; ih < n_mask_heads(); ih++) {
+                    // keep[] has to be rebuilt whenever the query block changes: the
+                    // -INF pattern IS the selection, so a per-query-block selection is
+                    // a per-query-ROW mask pattern.
+                    int64_t cur_qb = -1;
                     std::vector<bool> keep(ne0, false);
-                    for (int64_t is = 0; is < n_sel; is++) {
-                        const int64_t blk = sel_block(ih, is);
-                        for (int64_t j = blk*bs; j < std::min(blk*bs + bs, kv); j++) {
-                            keep[j] = true;
-                        }
-                    }
                     for (int64_t i1 = 0; i1 < ne1; i1++) {
+                        const int64_t iqb = per_qblock ? i1 / bq_eff() : 0;
+                        if (iqb != cur_qb) {
+                            cur_qb = iqb;
+                            keep.assign(ne0, false);
+                            for (int64_t is = 0; is < n_sel; is++) {
+                                const int64_t blk = sel_block(iqb, ih, is);
+                                for (int64_t j = blk*bs; j < std::min(blk*bs + bs, kv); j++) {
+                                    keep[j] = true;
+                                }
+                            }
+                        }
                         for (int64_t i0 = 0; i0 < ne0; i0++) {
                             const float val = keep[i0] ? dis(gen) : -INFINITY;
                             data[ih*ne1*ne0 + i1*ne0 + i0] = ggml_fp32_to_fp16(val);
@@ -7552,10 +7618,14 @@ struct test_flash_attn_ext_gather_rows : public test_case {
 //    the causal prefix, which changes every score in the row.
 //  * NO 1/S TEMPERATURE (there is no S here). The softmax temperature is therefore
 //    not the paper's, and the reference notes the temperature is load-bearing.
-//  * FIXED top-k, and ONE selection per (kv_head, seq) shared by all nb query rows,
-//    because ggml_hexagon_supported_fa_sparse enforces sel->ne[1] == 1. XAttention
-//    emits a VARIABLE-count selection per query block from a cumulative-mass
-//    threshold. At nb=512/bs=64 this is mllm's g=8 super-block case, which they
+//  * FIXED top-k, and ONE selection per (kv_head, seq) shared by all nb query rows.
+//    That is now a CHOICE, not a limitation: sel->ne[1] may be NBq and the kernel
+//    reads row q_start/op_params[5] (see test_flash_attn_ext_sparse's per_qblock).
+//    This arm deliberately keeps ne[1] == 1 -- it is the shared/super-block control.
+//    XAttention emits a VARIABLE-count selection per query block from a cumulative-
+//    mass threshold; the count stays fixed here and in the per-query-block arm, since
+//    the kernel's chunk decomposition and its untagged DMA FIFO both require it.
+//    At nb=512/bs=64 this is mllm's g=8 super-block case, which they
 //    measured inflating union density to 45-48% -- so at 25% density this discards
 //    roughly half the blocks a per-query-block scorer would keep. The recall of THIS
 //    estimator is unmeasured in either project.
@@ -10932,6 +11002,37 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 1, 1024, 64, 64,  4));
     test_cases.emplace_back(new test_flash_attn_ext_sparse(64,  2, 1, 1024, 32, 128, 3));
 
+    // PER-QUERY-BLOCK selection (sel->ne[1] == NBq): each query block gets its own
+    // list, which is what XAttention scoring produces. nb must be > bq or NBq == 1 and
+    // the case is vacuous, so these all use a multi-query-block prefill.
+    //
+    // At n_sel == n_blocks/NBq the query blocks' selections come out pairwise disjoint
+    // (see sel_block), so a kernel that ignored the query axis would attend only to
+    // -INF columns for every query block but the first. This is the row that catches
+    // the cross-query-block prefetch bug: sel[qb][0] differs for consecutive qb, and
+    // the tail prefetch stages the next query block's chunk 0 while the loop still
+    // describes the current one.
+    //                                                     hs   nh nr  kv    nb  bs n_sel mask  perhd  bq  perqb
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 1, 1024, 256, 64, 4, true, true,  64, true));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1024, 256, 64, 4, true, true,  64, true));   // GQA x query axis
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 2, 8, 2048, 512, 128, 4, true, true, 128, true));  // Bl = 128 (the paper's)
+    // n_sel == 2 keeps n_kv_blocks below FA_MIN_KV_BLOCKS, which forces the
+    // NON-pipelined KV loop. It has its own set of selection call sites, so a patch
+    // that only touched the pipelined path passes every row above and fails here.
+    // The nr == 4 row folds both blocks into one chunk (m == 2, n_kv_blocks == 1);
+    // the nr == 1 row has a per-head mask, which disables grouping, so it runs two
+    // chunks and additionally exercises the fallback's next-chunk K/V prefetch.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1024, 256, 64, 2, true, true,  64, true));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 1, 1024, 256, 64, 2, true, true,  64, true));
+    // KV length that is not a multiple of bs: partial tail block x query axis.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1000, 256, 64, 4, true, true,  64, true));
+    // nb not a multiple of bq: the last query block is short.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1024, 192, 64, 4, true, true,  64, true));
+    // Strided sel view (nb[1] != 4*n_sel), the ggml_argsort_top_k layout: the only
+    // case that proves the kernel reads sel->nb[1] instead of assuming contiguity.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 1, 1024, 256, 64, 4, true, true,  64, true, /*sel_strided=*/true));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1024, 256, 64, 4, true, true,  64, true, /*sel_strided=*/true));
+
     // Query-subsampling top-k scoring (the XAttention stand-in). These were previously
     // registered only in the perf list, so `test -o QSUB_BLOCK_SCORES` reported 0/0 and
     // every correctness claim about them was vacuous. They matter here for a second
@@ -11600,6 +11701,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         const int nb    = 512;
         const int n_sel = 2048 / bs;
         test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, nb, bs, n_sel, /*mask=*/false));
+        // Same sweep with a query axis: bq rides along with bs, so this also measures
+        // how the tiling penalty falls as the query block (and hence Br) grows.
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, nb, bs, n_sel, /*mask=*/false,
+                                                               /*per_head_sel=*/true, /*bq=*/bs, /*per_qblock=*/true));
         test_cases.emplace_back(new test_flash_attn_ext_gather(128, 8, 2, kv, nb, bs, n_sel));
     }
 
@@ -11613,6 +11718,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         const int nb    = 512;
         const int n_sel = (kv / bs) / 4;     // 25% density
         test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, nb, bs, n_sel, /*mask=*/false));
+        // Per-query-block selection at the same density. NOT a like-for-like row: it
+        // computes a different (stronger) attention, and it pays a tiling penalty the
+        // shared-selection row above does not. Requiring a tile to stay inside one
+        // query block pins Br to bq, so at nb=512/bq=64 the search picks Br=64 and
+        // q_blocks goes 1 -> 8: K/V is re-staged 8x (same bytes per q-block, 8x as
+        // many q-blocks) and the HVX softmax drops from 6 threads to 2. The MAC count
+        // and the mask/Q traffic are unchanged. Measure the gap here before treating
+        // per-query-block selection as free.
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, nb, bs, n_sel, /*mask=*/false,
+                                                               /*per_head_sel=*/true, /*bq=*/bs, /*per_qblock=*/true));
         test_cases.emplace_back(new test_flash_attn_ext_gather_rows(128, 8, 2, kv, nb, bs, n_sel, /*stage=*/0, GGML_TYPE_F16));
         test_cases.emplace_back(new test_flash_attn_ext_gather_rows(128, 8, 2, kv, nb, bs, n_sel, /*stage=*/1, GGML_TYPE_F16));
         test_cases.emplace_back(new test_flash_attn_ext_gather_rows(128, 8, 2, kv, nb, bs, n_sel, /*stage=*/2, GGML_TYPE_F16));

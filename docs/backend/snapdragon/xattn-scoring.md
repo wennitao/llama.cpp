@@ -205,13 +205,36 @@ So the selector belongs on the host, over the read-back `[NBk, NBq, Hq]` tensor.
 `attn_sum`. In llama.cpp proper it means a device→host sync mid-layer, whose cost is
 unmeasured.
 
-**No flash-attention wiring.** `ggml_hexagon_supported_fa_sparse` requires
-`sel->ne[1] == 1` — one selection shared by every query row — and the device side has no
-`sel_nb1` at all, so no query index ever reaches the block-list lookup. Real XAttention
-emits one selection *per query block*. Landing scoring alone buys a correctness-anchored,
-CPU-comparable implementation of the real estimator and a measurable per-layer scoring
-cost. **It buys no speedup**, and the density that would decide whether a speedup exists is
-data-dependent and unmeasured here.
+**No flash-attention wiring.** ~~`ggml_hexagon_supported_fa_sparse` requires
+`sel->ne[1] == 1`~~ — **this is no longer true.** `sel` now carries a query-block axis:
+`ne = [n_sel, NBq, n_kv_heads or 1, n_seqs or 1]` with the query-block size in
+`op_params[5]`, and the kernel reads row `q_start / BQ` (`fa_sel_row` →
+`fa_chunk_block_start`). `ne[1] == 1` remains the shared-selection layout and is
+bit-identical to before. The scoring graph is still not *wired* to a sparse FA op in
+this repo — the host-side selector below still has to run — but the kernel can now
+express what the scorer produces.
+
+Two constraints came with it. `n_sel` must be **fixed** across query blocks (top-k, not
+the paper's variable-count `tau` threshold): the chunk decomposition, the pipelining
+decision and the VTCM budget are all derived from `sel->ne[0]`, and the kernel's untagged
+DMA FIFO relies on `fa_chunk_nblk` being query-block-independent. And a kernel query tile
+must not straddle a query block, i.e. **`Br` must divide `BQ`**, which pins `Br` far below
+what the tiling search would otherwise pick. At `neq1=512, BQ=64` that takes `q_blocks`
+from 1 to 8 — modelled cost 8 800 → 32 000 — so the selection has to buy back a ~3.6×
+tiling penalty (~1.8× at `BQ=128`) before per-query-block selection is net positive.
+
+Landing scoring alone buys a correctness-anchored, CPU-comparable implementation of the
+real estimator and a measurable per-layer scoring cost. **It buys no speedup**, and the
+density that would decide whether a speedup exists is data-dependent and unmeasured here.
+
+**The cheapest unmeasured number, and it decides the design.** How much do adjacent query
+blocks' selections actually overlap on a real model? If they overlap heavily, staging the
+*union* of the query blocks inside one large `Br` and carving the per-query-block
+restriction into the FA mask (`src[3]`, already `[kv, nq, heads]` and already staged per
+query row) computes the same attention with **no kernel change at all** and keeps `Br`
+large. It is never worse than per-query-block in K/V DMA, and it degenerates to dense only
+when the selections are disjoint. That number can be computed offline from `attn_sum`
+with no kernel work. Nothing in this repo measures it.
 
 **Neither fused block-score kernel can serve this graph.** `try_fuse_xattn_score` rejects
 any `SOFT_MAX` carrying a mask (`ggml-hexagon.cpp:3724-3726`, comment: *"no mask and no
@@ -227,6 +250,37 @@ graph reproduces for free — but `src[5]` is per *KV* head, and reducing `Hq` p
 selections to one per KV head (union, max-of-scores, or score per KV head directly) is a
 policy the reference does not supply. None of the three is the reference's; whichever gets
 picked must be named in the code and must not be called "XAttention for GQA".
+
+The reduction is **forced, not chosen**: the kernel stages one K/V chunk per
+`(sequence, query block, kv_head)` and multiplies all `G = Hq/Hkv` query heads against it
+in a single `g_br = align_up(G·Br, 32)` row tile. Honouring a per-Q-head selection would
+mean `G` separate stagings per query block, i.e. discarding the GQA amortisation the tile
+exists for. Of the candidate policies only SUM (equivalently MEAN — a uniform positive
+scale is order-preserving within a row) is expressible in ggml: there is no row-max-value
+op (`SUM_ROWS`/`CUMSUM`/`MEAN`/`ARGMAX` only, and `ARGMAX` returns an index), and a union
+of per-head top-k has data-dependent length, which is the same stream-compaction blocker
+as `find_blocks` and violates fixed `n_sel`. The SUM chain, for the record:
+
+```c
+a4  = ggml_reshape_4d(ctx, attn_sum, NBk, NBq, G, Hkv);   // free view; h = kv_head*G + g
+ap  = ggml_permute   (ctx, a4, 1, 2, 0, 3);               // [G, NBk, NBq, Hkv]
+ac  = ggml_cont      (ctx, ap);                           // LOAD-BEARING: hexagon argsort
+                                                          // has no contiguity gate and
+                                                          // addresses rows as data + r*nb[1]
+ah  = ggml_sum_rows  (ctx, ac);                           // [1, NBk, NBq, Hkv]
+as  = ggml_reshape_3d(ctx, ah, NBk, NBq, Hkv);
+sel = ggml_argsort_top_k(ctx, as, n_sel);                 // I32 [n_sel, NBq, Hkv, 1]
+fa->src[5] = sel; fa->op_params[4] = Bl; fa->op_params[5] = Bl;
+```
+
+`ggml_top_k` is not usable — `GGML_OP_TOP_K` has no case in the hexagon `supports_op`
+switch, so it would split the graph. This chain is **untested here**: it can never be
+NMSE-checked against CPU (CPU flash attention ignores `src[5]` and computes dense
+attention), and argsort tie-breaking differences flip ranks. Note also that argsort over a
+full `NBk` row hands an early query block *future* key blocks as soon as `n_sel` exceeds
+its causally-allowed count — the scorer's reduced causal mask only drives those scores to
+`-1e30f`, it does not remove them from the ranking. Only the FA mask `src[3]` stops them
+being attended.
 
 ## Reproduce
 

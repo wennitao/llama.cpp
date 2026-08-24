@@ -1942,8 +1942,27 @@ ggml_hexagon_session::~ggml_hexagon_session() noexcept(true) {
 // op is dense.
 #define HTP_FA_PARAM_SPARSE_BS 4
 
+// Query-block size the src[5] rows are expressed in, carried in op_params[5].
+// Zero means "same as the selection block size", which is what an XAttention
+// scorer emits: it uses one block size Bl for both the query and the key axis.
+#define HTP_FA_PARAM_SPARSE_BQ 5
+
 static int64_t ggml_hexagon_fa_sparse_bs(const struct ggml_tensor * op) {
     return op->src[5] ? (int64_t) ggml_get_op_params_i32(op, HTP_FA_PARAM_SPARSE_BS) : 0;
+}
+
+static int64_t ggml_hexagon_fa_sparse_bq(const struct ggml_tensor * op) {
+    if (!op->src[5]) {
+        return 0;
+    }
+    const int64_t bq = (int64_t) ggml_get_op_params_i32(op, HTP_FA_PARAM_SPARSE_BQ);
+    return bq ? bq : ggml_hexagon_fa_sparse_bs(op);
+}
+
+// True when the selection carries a query-block axis, i.e. the kernel must pick a
+// different sel[] row per query block instead of broadcasting row 0 to all of them.
+static bool ggml_hexagon_fa_sparse_per_qblock(const struct ggml_tensor * op) {
+    return op->src[5] && op->src[5]->ne[1] > 1;
 }
 
 static bool ggml_hexagon_flash_attn_is_hmx_eligible(
@@ -2067,10 +2086,23 @@ static bool ggml_hexagon_precompute_flash_attn_params(
             }
         }
 
+        // Per-query-block selection: the kernel picks the sel[] row as q_start/bq, so a
+        // query tile must not straddle a query block. Constrain the search rather than
+        // validating after it -- Br is chosen from VTCM pressure, and a validate-only
+        // rule would silently disable the backend whenever the search moved.
+        const size_t br_align = ggml_hexagon_fa_sparse_per_qblock(op) ? (size_t) ggml_hexagon_fa_sparse_bq(op) : 0;
+
         size_t Br = 0, Bc = 0;
         int ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK, DV, neq1, kv_effective, sess->vtcm_size, sess->n_threads,
                                          kparams->is_q_fp32 != 0, /*bc_step=*/bs, /*bc_cap=*/sel ? m_max * bs : 0,
-                                         /*sel_blocks=*/sel ? (size_t) sel->ne[0] : 0, mask_per_head);
+                                         /*sel_blocks=*/sel ? (size_t) sel->ne[0] : 0, br_align, mask_per_head);
+        if (ret != 0 && br_align) {
+            // br_unit is ceil(32/G), so for G in {3,5,6,7} nothing divides a 64- or
+            // 128-wide query block. Fail-closed (the op drops to a dense backend), but
+            // it is a silent capability cliff, so name it.
+            HEX_VERBOSE("ggml-hex: fa-params no (Br, Bc) with Br dividing bq %zu (G %u neq1 %u kv_eff %u)\n",
+                        br_align, G, neq1, kv_effective);
+        }
         if (ret == 0) {
             kparams->kernel_type = HTP_FA_KERNEL_HMX;
             kparams->Br = Br;
@@ -2084,15 +2116,19 @@ static bool ggml_hexagon_precompute_flash_attn_params(
             kparams->vtcm_size = hmx_fa_compute_vtcm_usage(G, DK, DV, Br, Bc, kparams->n_threads, kparams->u.hmx.pipeline != 0, kparams->is_q_fp32 != 0, mask_per_head);
 
             HEX_VERBOSE("ggml-hex: fa-params neq1 %u kv %u kv_eff %u : Br %zu Bc %zu n_kv_blocks %u "
-                        "n_threads %u pipeline %u g_br %u vtcm %d/%zu\n",
+                        "n_threads %u pipeline %u g_br %u vtcm %d/%zu sel_nq %lld bq %zu\n",
                         neq1, nek1, kv_effective, Br, Bc, kparams->n_kv_blocks, kparams->n_threads,
-                        kparams->u.hmx.pipeline, kparams->u.hmx.g_br, kparams->vtcm_size, sess->vtcm_size);
+                        kparams->u.hmx.pipeline, kparams->u.hmx.g_br, kparams->vtcm_size, sess->vtcm_size,
+                        sel ? (long long) sel->ne[1] : 0LL, br_align);
 
             // Selection geometry. The kernel derives its own VTCM strides from the layout
             // it rebuilds, so what it needs from here is only how the chunk decomposes:
             // Bc covers m = Bc/sparse_bs selected blocks, and n_sel bounds the last one.
             kparams->u.hmx.sparse_bs = sel ? (uint16_t) bs : 0;
             kparams->u.hmx.n_sel     = sel ? (uint16_t) sel->ne[0] : 0;
+            // Only meaningful with a query axis; the shared-selection path leaves it 0
+            // so the device keeps taking row 0 for every query block, as before.
+            kparams->u.hmx.sel_bq    = (uint16_t) br_align;
             kparams->u.hmx.mask_broadcast = (mask != nullptr && mask->ne[2] == 1) ? 1 : 0;
             kparams->u.hmx.div_G = init_fastdiv_values(G);
             if (mask) {
@@ -2145,11 +2181,23 @@ static bool ggml_hexagon_precompute_flash_attn_params(
 // *block* indices to attend to, instead of the full [0, kv_len) range. The
 // block size is op_params[4] and the kernel chunks KV on exactly that unit, so
 // index i selects rows [idx*BS, idx*BS + BS) of K/V (and the matching mask
-// columns). Selection is shared by all query rows in the op; it may vary per
-// KV head and per sequence.
+// columns). Selection may vary per query block, per KV head and per sequence.
 //
-//   src[5]: I32, contiguous, ne = [n_sel, 1, n_kv_heads or 1, n_seqs or 1]
+//   src[5]: I32, nb[0] == 4, ne = [n_sel, NBq or 1, n_kv_heads or 1, n_seqs or 1]
 //   op_params[4]: BS, multiple of 64, <= kv_len
+//   op_params[5]: BQ, the query-block size the sel rows are expressed in (0 => BS).
+//                 NBq = ceil(q->ne[1] / BQ). The kernel reads row q_start/BQ, so a
+//                 query tile must not straddle a query block: the chunk-size search
+//                 is constrained to Br | BQ (see ggml_hexagon_precompute_...).
+//
+// ne[1] == 1 is the shared-selection layout: every query row in the op sees the
+// same list. That is what an attn_sum reduced over the query axis produces, and it
+// stays the cheap path -- the kernel zeroes the row stride and never divides.
+//
+// n_sel is FIXED across query blocks by construction (top-k, not a tau threshold).
+// Everything the host derives from sel->ne[0] -- chunk count, pipelining, VTCM --
+// would otherwise become per-query-block, and the kernel's DMA FIFO would desync
+// because its push and pop sites do not see the same query block.
 //
 // Only the HMX kernel implements the indirection; anything else rejects the op
 // so it falls back to a dense backend rather than silently ignoring src[5].
@@ -2172,8 +2220,16 @@ static bool ggml_hexagon_supported_fa_sparse(const struct ggml_tensor * op) {
         return false;
     }
 
-    // One selection list per (kv_head, seq); q rows share it.
-    if (sel->ne[1] != 1) {
+    // Query axis: either broadcast (one list for the whole op) or exactly one list
+    // per query block. The 32-alignment keeps Br | BQ reachable -- Br is quantised to
+    // ceil(32/G), so an unaligned BQ could only ever be divided by a smaller G's unit.
+    // The upper bound is what fits kparams.Br (uint16_t): Br divides BQ, so a BQ the
+    // field cannot hold would silently truncate on the way to the device.
+    const int64_t bq = ggml_hexagon_fa_sparse_bq(op);
+    if (bq < 32 || (bq % 32) != 0 || bq > UINT16_MAX) {
+        return false;
+    }
+    if (sel->ne[1] != 1 && sel->ne[1] != (q->ne[1] + bq - 1) / bq) {
         return false;
     }
     if (sel->ne[2] != 1 && sel->ne[2] != k->ne[2]) {
@@ -2233,6 +2289,18 @@ static bool ggml_hexagon_supported_flash_attn_ext(const struct ggml_hexagon_sess
     // The block-index indirection lives only in the HMX kernel.
     if (op->src[5] && kparams.kernel_type != HTP_FA_KERNEL_HMX) {
         return false;
+    }
+
+    // Belt and braces on the query-tile alignment. The chunk-size search is already
+    // constrained to Br | BQ, so this cannot fire unless the search regressed -- and
+    // a straddling tile is silent (the kernel would give every row of the tile one
+    // query block's selection and still produce a plausible-looking result).
+    if (ggml_hexagon_fa_sparse_per_qblock(op)) {
+        const size_t bq = (size_t) ggml_hexagon_fa_sparse_bq(op);
+        if (kparams.Br == 0 || (bq % kparams.Br) != 0) {
+            HEX_VERBOSE("ggml-hex: skip flash_attn_ext, Br %u does not divide bq %zu\n", (unsigned) kparams.Br, bq);
+            return false;
+        }
     }
 
     if ((size_t) kparams.vtcm_size > sess->vtcm_size) {

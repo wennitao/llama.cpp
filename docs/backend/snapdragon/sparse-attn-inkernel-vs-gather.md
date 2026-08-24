@@ -30,7 +30,7 @@ Four arms, all single-backend on HTP:
 
 | Arm | Graph |
 |---|---|
-| `FLASH_ATTN_EXT_SPARSE` | one fused FA op, block indices in `src[5]` |
+| `FLASH_ATTN_EXT_SPARSE` | one fused FA op, block indices in `src[5]` (`src[5]->ne[1] == 1` here -- one selection for the whole op; the per-query-block rows are a separate arm, see [flash-attn-htp-anatomy.md](flash-attn-htp-anatomy.md) §8) |
 | `FLASH_ATTN_EXT_GATHER_ROWS` | `GET_ROWS`(+`CPY`) -> dense FA -- **real** run-time I32 index list |
 | `FLASH_ATTN_EXT_GATHER` | strided view + `CONT` -> dense FA (regular stride; lower bound) |
 | `FLASH_ATTN_EXT` | dense FA over the full KV -- the do-nothing baseline |

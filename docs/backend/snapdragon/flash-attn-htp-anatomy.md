@@ -653,7 +653,11 @@ The genuine fp32 accumulation is the per-block row sum, reduced by a 5-step tree
 
 ## 8. Where block-sparsity plugs in
 
-An optional `src[5]` (I32, `ne = [n_sel, 1, n_kv_heads or 1, n_seqs or 1]`, with block size BS in `op_params[4]`) turns the dense KV range into a selected block list. It is **HMX-only** and the op is rejected otherwise (`ggml-hexagon.cpp:2222-2224`).
+An optional `src[5]` (I32, `ne = [n_sel, NBq or 1, n_kv_heads or 1, n_seqs or 1]`, with block size BS in `op_params[4]`) turns the dense KV range into a selected block list. It is **HMX-only** and the op is rejected otherwise (`ggml-hexagon.cpp:2222-2224`). Only `nb[0] == 4` is required; `nb[1..3]` are honoured as strides, so a `ggml_argsort_top_k` view is accepted directly.
+
+`ne[1]` is the **query-block axis**: `NBq = ceil(neq1 / BQ)` with `BQ` in `op_params[5]` (0 => BS), and the kernel reads row `q_start / BQ`. `ne[1] == 1` is the shared-selection layout — every query row of the op sees one list — and stays the cheap path (the row stride is zeroed and no division happens). `n_sel` is **fixed** across query blocks: everything the host derives from `sel->ne[0]` (chunk count, pipelining, VTCM) would otherwise become per-query-block, and `fa_chunk_nblk` would desync the untagged DMA FIFO, whose push and pop sites are one loop iteration apart and do not see the same query block.
+
+The query axis forces a tiling constraint: a kernel query tile `[q_start, q_start+Br)` must not straddle a query block, which holds exactly when **`Br` divides `BQ`** (not the reverse — a tile spanning several query blocks has aligned edges but still gives all its rows one selection). `hmx_fa_find_chunk_size` takes a `br_align` parameter for this, the symmetric counterpart of `bc_step`/`bc_cap` on the KV axis, and returns −1 when no legal `Br` exists — `br_unit = ceil(32/G)` divides neither 64 nor 128 for `G ∈ {3,5,6,7}`, so those drop the op to a dense backend. This is not free: pinning `Br` to `BQ` at `neq1=512, BQ=64` takes `q_blocks` from 1 to 8, which re-streams K/V eight times and drops the HVX softmax from 6 threads to 2 (`min(n_threads, ceil(Br·G/64))`). Measured with the in-tree cost model at 8 MiB VTCM / 6 threads: modelled cost 8 800 → 32 000 at `BQ=64`, → 16 000 at `BQ=128`. The cost model is blind to whether K/V addresses repeat, so the DMA side of that is not even priced.
 
 Host-side, `kv_effective = sel->ne[0] * bs` replaces `nek1` everywhere the search reasons about KV length, and Bc must be a multiple of bs — `m = Bc/bs` selected blocks fold into one chunk, capped at `FA_SPARSE_MAX_M = 8` because "the extra in-flight DMA descriptors (m per tensor) stay well inside the 256-entry queue" (`htp/flash-attn-ops.h:277-279`). The search additionally requires `sel_blocks % (Bc/bc_step) == 0` so no chunk is ragged: *"A ragged final chunk leaves stale rows in the K/V/mask staging buffers past its true width, and nothing downstream re-derives that width per chunk"* (`htp/flash-attn-ops.h:348-351`).
 
@@ -663,14 +667,16 @@ Host-side, `kv_effective = sel->ne[0] * bs` replaces `nek1` everywhere the searc
     if (__builtin_expect(factx->sel == NULL, true)) {
         return c * factx->Bc;
     }
-    const int32_t * list = (const int32_t *) ((const uint8_t *) factx->sel + kv_head * factx->sel_nb2 + ib3 * factx->sel_nb3);
+    const int32_t * list = (const int32_t *) ((const uint8_t *) factx->sel + qb * factx->sel_nb1 + kv_head * factx->sel_nb2 + ib3 * factx->sel_nb3);
     uint32_t idx = (uint32_t) list[c * factx->m + j];
     if (idx >= factx->n_blk_total) {
         idx = factx->n_blk_total - 1;   // clamp the INDEX, never the row count: a zero
     }                                   // row count would break n_col_tiles > 0 downstream
     return idx * factx->sparse_bs;
 ```
-(`htp/flash-attn-ops.c:193-211`). `fa_push_chunk` then pushes m descriptors per tensor, each writing block j into slot `j*bs*row_stride` of the same Bc-wide VTCM buffer — and does the **same for the mask**, from the identical block starts in the identical order (`:1885-1894`).
+(`htp/flash-attn-ops.c`, `fa_chunk_block_start`). `qb` comes from `fa_sel_row(factx, q_start)`. `fa_push_chunk` then pushes m descriptors per tensor, each writing block j into slot `j*bs*row_stride` of the same Bc-wide VTCM buffer — and does the **same for the mask**, from the identical block starts in the identical order.
+
+`fa_push_chunk` derives `qb` from **its own** `q_start` rather than taking it as a parameter, and that is load-bearing. The tail prefetch at the bottom of the loop nest stages the *next* iteration's chunk 0 while `factx` still describes the current one, passing `next_q_start`; the consumer one iteration later re-derives the row from its own `q_start` to pick `blk0_rows`, which sets `qk_job[0].n_col_tiles`. If producer and consumer disagreed you would DMA one block's rows and tile them as another's — no assert, no NaN, just a different plausible attention output. Deriving the row in one place makes that unrepresentable: there is no `next_qb` to get wrong.
 
 That is why nothing downstream needs to know. The invariant is stated in the source:
 

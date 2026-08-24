@@ -72,8 +72,12 @@ struct htp_fa_kernel_params {
             // Reclaimed to carry the sparse selection geometry, which the kernel needs
             // in order to address m selected blocks inside one Bc-wide chunk.
             uint16_t sparse_bs;          // selection block size; 0 = dense
-            uint16_t n_sel;              // selected blocks per (kv_head, seq); 0 = dense
-            uint32_t _reserved;
+            uint16_t n_sel;              // selected blocks per selection row; 0 = dense
+            // Query-block size the sel[] rows are expressed in (op_params[5]). This is
+            // the SCORER's block size, not the kernel's Br -- the kernel picks row
+            // q_start/sel_bq. 0 = shared selection (sel->ne[1] == 1), the legacy layout.
+            uint16_t sel_bq;
+            uint16_t _reserved;
             int32_t  mask_broadcast;
             int32_t  pipeline;
             struct fastdiv_values div_G;
@@ -285,6 +289,14 @@ static inline size_t hvx_fa_compute_vtcm_usage(size_t DK, size_t DV, bool is_q_f
 // units chosen by the graph, so the kernel must chunk on exactly that unit.
 // Only Br is searched in that case, and the call fails if the pinned Bc does
 // not fit the VTCM budget for any Br.
+//
+// br_align is the symmetric constraint on the QUERY axis, needed only when the
+// selection has a query-block axis: a kernel query tile [q_start, q_start+Br) must
+// not straddle a scorer query block, which holds exactly when Br divides the block
+// size. Note the direction -- Br | Bq, not Bq | Br: a tile that spans several query
+// blocks has aligned edges but still gives all its rows one selection, which is the
+// same silent failure. The search returns -1 when no legal Br fits, so the op is
+// rejected and drops to a dense backend rather than computing the wrong attention.
 static inline int hmx_fa_find_chunk_size(size_t * Br_out,
                                   size_t * Bc_out,
                                   size_t   gqa_factor,
@@ -298,6 +310,7 @@ static inline int hmx_fa_find_chunk_size(size_t * Br_out,
                                   size_t   bc_step,   // Bc must be a multiple of this (0 = bc_unit)
                                   size_t   bc_cap,    // upper bound on Bc (0 = none)
                                   size_t   sel_blocks,// selected blocks; Bc/bc_step must divide it (0 = n/a)
+                                  size_t   br_align,  // Br must DIVIDE this (0 = unconstrained)
                                   bool     mask_per_head) {
     const size_t T       = HMX_FP16_TILE_N_ROWS;  // 32
     const size_t br_unit = hmx_ceil_div(T, gqa_factor);
@@ -306,6 +319,9 @@ static inline int hmx_fa_find_chunk_size(size_t * Br_out,
 
     // Br_max: largest Br aligned to br_unit that does not exceed qo_len.
     const size_t Br_max = qo_len >= br_unit ? hex_align_down(qo_len, br_unit) : br_unit;
+    // With a query-block axis, Br | br_align implies Br <= br_align, so start the walk
+    // there instead of scanning candidates that can only be rejected below.
+    const size_t Br_start = br_align ? hex_smin(Br_max, hex_align_down(br_align, br_unit)) : Br_max;
 
     // Pipeline constraint: cap Bc so n_kv_blocks >= FA_MIN_KV_BLOCKS. The exact bound
     // is ceil(kv_len/Bc) >= N  <=>  Bc < kv_len/(N-1), so take the largest bc_unit
@@ -342,9 +358,15 @@ static inline int hmx_fa_find_chunk_size(size_t * Br_out,
     size_t best_cost = SIZE_MAX, best_mn = 0, best_padded = SIZE_MAX;
     size_t best_Br = 0, best_Bc = 0;
 
-    for (size_t Br = Br_max; Br >= br_unit; Br -= br_unit) {
+    for (size_t Br = Br_start; Br >= br_unit; Br -= br_unit) {
+        // A query tile must lie inside one scorer query block. br_unit is ceil(32/G),
+        // so for G in {3,5,6,7} nothing divides a 64- or 128-wide query block and the
+        // search legitimately finds no candidate at all -- the caller then rejects the
+        // op, which is the fail-closed outcome.
+        const bool br_ok = (br_align == 0) || ((br_align % Br) == 0);
+
         // Try all Bc candidates from Bc_limit down to Bc_floor
-        for (size_t Bc = Bc_limit; Bc >= Bc_floor; Bc -= step) {
+        for (size_t Bc = Bc_limit; br_ok && Bc >= Bc_floor; Bc -= step) {
             // Require m = Bc/bs to divide the selected-block count, so every chunk is
             // full. A ragged final chunk leaves stale rows in the K/V/mask staging
             // buffers past its true width, and nothing downstream re-derives that
