@@ -2152,7 +2152,12 @@ static bool ggml_hexagon_supported_fa_sparse(const struct ggml_tensor * op) {
     const struct ggml_tensor * q   = op->src[0];
     const struct ggml_tensor * sel = op->src[5];
 
-    if (sel->type != GGML_TYPE_I32 || !ggml_is_contiguous(sel)) {
+    // The kernel indexes sel as base + kv_head*nb[2] + ib3*nb[3], then list[i] --
+    // so it needs unit stride within a row and nothing more. Requiring full
+    // contiguity rejects the natural output of ggml_argsort_top_k, which is a
+    // strided view of the argsort result, and would silently drop the whole FA op
+    // to a dense CPU fallback.
+    if (sel->type != GGML_TYPE_I32 || sel->nb[0] != sizeof(int32_t)) {
         return false;
     }
 

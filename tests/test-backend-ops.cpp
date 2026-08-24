@@ -1216,6 +1216,10 @@ struct test_case {
     }
 
     virtual bool run_whole_graph() { return false; }
+    // perf: time the WHOLE graph rather than duplicating just the output node.
+    // eval_perf replicates only `out`, so a multi-op graph would otherwise report
+    // its last op alone and silently hide everything upstream.
+    virtual bool perf_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
 
@@ -1594,6 +1598,9 @@ struct test_case {
         }
 
         // duplicate the op
+        if (perf_whole_graph()) {
+            n_runs = 1;   // the graph is the unit of work; do not replicate the tail
+        }
         for (int i = 1; i < n_runs; i++) {
             ggml_graph_add_node(gf, out);
         }
@@ -7524,6 +7531,142 @@ struct test_flash_attn_ext_gather_rows : public test_case {
     }
 };
 
+// Block-selection scoring + block-sparse attention, measured together.
+//
+// This is block scoring in XAttention's SHAPE -- score -> softmax -> block-sum ->
+// top-k -- but it is not faithful XAttention. Two deliberate departures:
+//
+//  * Query axis is SUBSAMPLED (R strided rows), not antidiagonal-packed. Pooling
+//    would need a permute+cont of the [D, nb, Hq] query tensor, ~4 MB/layer --
+//    more traffic than the score matmul it feeds. A strided view + 64 KB cont is
+//    free. R is already a 64x reduction at R=8, far past what packing buys.
+//  * One selection per (kv_head, seq), shared by all nb query rows, because
+//    ggml_hexagon_supported_fa_sparse enforces sel->ne[1] == 1. Real XAttention
+//    selects per query block. At nb=512/bs=64 this is mllm's g=8 super-block case,
+//    which they measured inflating union density to 45-48% -- so at 25% density
+//    this discards roughly half the blocks a per-query-block scorer would keep.
+//    The recall of THIS estimator is unmeasured in either project.
+//
+// Every node is HTP-supported, so the graph should incur zero backend splits.
+struct test_flash_attn_ext_xattn_sel : public test_case {
+    const int64_t hs;      // head size
+    const int64_t nh;      // KV heads
+    const int64_t nr;      // GQA factor
+    const int64_t kv;      // context length
+    const int64_t nb;      // query tokens
+    const int64_t bs;      // selection block size
+    const int64_t n_sel;   // blocks kept
+    const int64_t R;       // query representatives per head (R*nr must exceed 4: HMX gate)
+    const int     stage;   // 0 = whole graph, 1 = score matmul, 2 = block scores, 3 = argsort
+
+    std::string op_desc(ggml_tensor *) override {
+        return stage == 1 ? "XATTN_SCORE_MM" :
+               stage == 2 ? "XATTN_BLOCK_SCORES" :
+               stage == 3 ? "XATTN_ARGSORT" :
+               stage == 4 ? "XATTN_FA_ONLY" : "FLASH_ATTN_EXT_XATTN";
+    }
+
+    bool run_whole_graph()  override { return true; }
+    // stage 1's measured op IS the output node, so normal replication times it
+    // correctly and amortizes per-call overhead. The multi-op stages need the
+    // whole graph, which costs amortization -- on a backend with high per-call
+    // overhead that inflates them, so compare stages only within a backend.
+    bool perf_whole_graph() override { return stage != 1; }
+
+    std::string vars() override { return VARS_TO_STR9(hs, nh, nr, kv, nb, bs, n_sel, R, stage); }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    uint64_t op_flops(ggml_tensor *) override {
+        const int64_t nblk = kv / bs;
+        // scoring: (R*nr) query reps x kv keys x hs, per KV head, 2 flops/MAC
+        const uint64_t score = 2ull * nh * (R*nr) * kv * hs;
+        if (stage != 0) {
+            return score;
+        }
+        return score + 2ull * nh*nr * nb * (hs + hs) * (n_sel * bs) + (uint64_t) nblk * 0;
+    }
+
+    test_flash_attn_ext_xattn_sel(int64_t hs = 128, int64_t nh = 8, int64_t nr = 2, int64_t kv = 2048,
+                                  int64_t nb = 512, int64_t bs = 64, int64_t n_sel = 8,
+                                  int64_t R = 8, int stage = 0)
+        : hs(hs), nh(nh), nr(nr), kv(kv), nb(nb), bs(bs), n_sel(n_sel), R(R), stage(stage) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t nblk = kv / bs;
+        GGML_ASSERT(kv % bs == 0);
+        GGML_ASSERT(nb % R == 0);
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*nr, 1);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh, 1);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh, 1);
+        ggml_set_name(v, "v");
+
+        // stage 4: identical FA, selection supplied as a leaf instead of computed.
+        // stage0 - stage4 is the scoring cost with the n_runs=1 per-call overhead
+        // cancelled, since both time exactly one whole graph.
+        if (stage == 4) {
+            ggml_tensor * lsel = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_sel, 1, nh, 1);
+            ggml_set_name(lsel, "sel");
+            ggml_tensor * o = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f/sqrtf((float) hs), 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
+            o->src[5] = lsel;
+            o->op_params[4] = (int32_t) bs;
+            ggml_set_name(o, "out");
+            return o;
+        }
+
+        // 1-4: strided query representatives, [hs, nb, nr, nh] -> [hs, R*nr, nh]
+        ggml_tensor * q4 = ggml_reshape_4d(ctx, q, hs, nb, nr, nh);
+        ggml_tensor * qv = ggml_view_4d(ctx, q4, hs, R, nr, nh,
+                                        q4->nb[1] * (nb / R), q4->nb[2], q4->nb[3], 0);
+        ggml_tensor * qr = ggml_reshape_3d(ctx, ggml_cont(ctx, qv), hs, R*nr, nh);
+        ggml_set_name(qr, "q_reps");
+
+        // 5: score matmul -> [kv, R*nr, nh]
+        ggml_tensor * sc = ggml_mul_mat(ctx, k, qr);
+        ggml_mul_mat_set_prec(sc, GGML_PREC_F32);
+        ggml_set_name(sc, "scores");
+        if (stage == 1) { return sc; }
+
+        // 6: softmax over the key axis -- the reference finds the temperature is
+        //    load-bearing, so the 1/sqrt(D) scale is folded in here.
+        ggml_tensor * sm = ggml_soft_max_ext(ctx, sc, nullptr, 1.0f/sqrtf((float) hs), 0.0f);
+
+        // 7-9: reduce the KV axis FIRST (free reshape; mul_mat dst is contiguous)
+        ggml_tensor * blk = ggml_reshape_4d(ctx, sm, bs, nblk, R*nr, nh);
+        blk = ggml_reshape_3d(ctx, ggml_sum_rows(ctx, blk), nblk, R*nr, nh);
+
+        // 10-12: only now permute-cont the query axis, on a tensor 64x smaller
+        ggml_tensor * bt = ggml_cont(ctx, ggml_permute(ctx, blk, 1, 0, 2, 3));
+        ggml_tensor * bscore = ggml_reshape_4d(ctx, ggml_sum_rows(ctx, bt), nblk, 1, nh, 1);
+        ggml_set_name(bscore, "block_scores");
+        if (stage == 2) { return bscore; }
+
+        // 14-15: bias lets a test pin the ranking; argsort descending
+        ggml_tensor * bias = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nblk, 1, 1, 1);
+        ggml_set_name(bias, "bias");
+        ggml_tensor * ranked = ggml_argsort(ctx, ggml_add(ctx, bscore, bias), GGML_SORT_ORDER_DESC);
+        if (stage == 3) { return ranked; }
+
+        // 16: top-n_sel is a strided view of the argsort -- this is exactly the
+        //     shape that the old full-contiguity check on sel used to reject.
+        ggml_tensor * sel = ggml_view_4d(ctx, ranked, n_sel, 1, nh, 1,
+                                         ranked->nb[1], ranked->nb[2], ranked->nb[3], 0);
+        ggml_set_name(sel, "sel");
+
+        // 17: block-sparse FA consuming a COMPUTED selection
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f/sqrtf((float) hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        out->src[5] = sel;
+        out->op_params[4] = (int32_t) bs;
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // Arm B of the block-sparse comparison: materialize the selected KV blocks into a
 // contiguous buffer, then run ordinary dense flash attention over it. This is the
 // shape mllm's QNN pipeline was forced into -- a compiled QNN graph cannot express
@@ -11038,6 +11181,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int n_sel : { kv/bs, kv/bs/4, kv/bs/8, kv/bs/16 }) {
             test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 4, kv, 128, bs, n_sel));
         }
+    }
+
+    // Block-selection scoring + attention, ctx 512..2048. Pair each stage-0 row with
+    // the matching test_flash_attn_ext_sparse row: scoring cost = difference.
+    // R*nr = 16 > 4 clears the HMX min-rows gate for the score matmul.
+    for (int kv : { 512, 1024, 2048 }) {
+        const int bs = 64, nb = 512, nblk = kv / bs, n_sel = nblk / 4;
+        // R sweep. R*nr query rows feed the score matmul; R=8 gives 16 rows, which
+        // only half-fills one HMX 32-row tile, so the matrix unit runs mostly empty.
+        // Sweeping R separates "starved" from "the kernel is slow": if time is flat
+        // in R the cost is dispatch/traffic, if it scales the unit was already busy.
+        // Stage 1 is the score matmul alone AND the graph output node, so ordinary
+        // replication times it correctly.
+        for (int R : { 8, 16, 32, 64, 128 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_xattn_sel(128, 8, 2, kv, nb, bs, n_sel, R, 1));
+        }
+        // end-to-end at the old and a wide R. stage 4 ignores R, so its two rows are
+        // a free run-to-run noise check on the overhead-matched control.
+        for (int R : { 8, 64 }) {
+            for (int stage : { 0, 2, 4 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_xattn_sel(128, 8, 2, kv, nb, bs, n_sel, R, stage));
+            }
+        }
+        // the paired attention-only baseline at identical params
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, nb, bs, n_sel, /*mask=*/false));
     }
 
     // Direct like-for-like with mllm's NPU attention figure: Sq=Skv=1024, 25% density,

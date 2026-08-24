@@ -231,8 +231,11 @@ static inline uint32_t fa_chunk_rows(const struct hmx_fa_context * factx,
     return rows;
 }
 
-// Back-compat shims: today m == 1, so a chunk is exactly one block and these keep the
-// existing call sites honest while the semantics are separated.
+// Chunk-level shims. fa_kv_block_start returns the FIRST selected block's offset, so it
+// is only valid where a KV *position* is wanted (trace tags, mask/DMA base of block 0).
+// Never derive a chunk's width from it: with m > 1 the chunk spans m scattered blocks
+// and nek1 - first_start under-reports whenever that first block sits near the KV end.
+// Use fa_chunk_rows for widths.
 static inline uint32_t fa_kv_block_start(const struct hmx_fa_context * factx,
                                          uint32_t b, uint32_t kv_head, uint32_t ib3) {
     return fa_chunk_block_start(factx, b, 0, kv_head, ib3);
@@ -2142,7 +2145,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                 // Sparse selection can differ per head and sequence, so this is
                 // recomputed here rather than hoisted out of the loop nest.
                 const uint32_t blk0_start = fa_kv_block_start(&factx, 0, kv_head, ib3);
-                const uint32_t blk0_rows  = hex_smin(Bc, nek1 - blk0_start);
+                const uint32_t blk0_rows  = fa_chunk_rows(&factx, 0, kv_head, ib3, nek1);
 
                 // 1. Push Q and KV DMAs for the very first iteration.
                 // Subsequent iterations are enqueued early at the end of the previous iteration.
@@ -2208,7 +2211,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                     for (uint32_t kv_blk = 0; kv_blk < factx.n_kv_blocks; ++kv_blk) {
                         const uint32_t kv_start    = fa_kv_block_start(&factx, kv_blk, kv_head, ib3);
-                        const uint32_t kv_rows     = hex_smin(Bc, nek1 - kv_start);
+                        const uint32_t kv_rows     = fa_chunk_rows(&factx, kv_blk, kv_head, ib3, nek1);
                         const size_t   n_col_tiles = hmx_ceil_div(kv_rows, HMX_FP16_TILE_N_COLS);
 
                         // ---- 1. Pop and run V-prep for current block ----
@@ -2256,7 +2259,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         // ---- 4. Pop and run K-prep for next block & push next QK-dot ----
                         if (kv_blk + 1 < factx.n_kv_blocks) {
                             const uint32_t next_start = fa_kv_block_start(&factx, kv_blk + 1, kv_head, ib3);
-                            const uint32_t next_rows  = hex_smin(Bc, nek1 - next_start);
+                            const uint32_t next_rows  = fa_chunk_rows(&factx, kv_blk + 1, kv_head, ib3, nek1);
                             const size_t   next_buf   = 1 - buf_idx;
 
                             fa_pop_n(dma, fa_chunk_nblk(&factx, kv_blk + 1));
@@ -2509,7 +2512,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         // The next iteration may be a different head/sequence, so
                         // its first block comes from that iteration's own list.
                         const uint32_t next_blk0_start = fa_kv_block_start(&factx, 0, next_kv_head, next_ib3);
-                        const uint32_t next_blk0_rows  = hex_smin(Bc, nek1 - next_blk0_start);
+                        const uint32_t next_blk0_rows  = fa_chunk_rows(&factx, 0, next_kv_head, next_ib3, nek1);
 
                         uint32_t next_im3 = im3;
                         if (mask && next_ib3 != ib3) {
