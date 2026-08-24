@@ -739,6 +739,9 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_SOFTMAX:
             return op_softmax(octx);
 
+        case HTP_OP_XATTN_SCORE:
+            return op_xattn_score(octx);
+
         case HTP_OP_ROPE:
             return op_rope(octx);
 

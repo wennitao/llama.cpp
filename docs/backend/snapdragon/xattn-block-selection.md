@@ -178,7 +178,8 @@ reference implementation are needed — the CPU path keeps running the unfused o
 
 ### Projected payoff
 
-If fusion brings scoring to near its matmul floor, at `kv=2048`:
+This assumes the HMX-staged design (attempt 2 below), not the HVX one that was
+actually built first. If fusion brings scoring to near its matmul floor, at `kv=2048`:
 
 | | today | fused (projected) |
 |---|--:|--:|
@@ -189,6 +190,58 @@ If fusion brings scoring to near its matmul floor, at `kv=2048`:
 The R=64 line is the more interesting one: fusion is what makes good selection
 affordable, and good selection is what makes block-sparse attention correct
 enough to deploy.
+
+## Attempt 1 at fusion: correct, and 1.4-3.8x slower
+
+Implemented as `HTP_OP_XATTN_SCORE`
+(`ggml/src/ggml-hexagon/htp/xattn-score-ops.c`), matched on the host by
+`try_fuse_xattn_score` over `MUL_MAT -> SOFT_MAX -> RESHAPE -> SUM_ROWS`. The
+`[kv, nq, nh]` intermediate stays in VTCM exactly as intended, so DRAM traffic
+does drop to K plus the small output. Correctness passes
+(`XATTN_BLOCK_SCORES` and `FLASH_ATTN_EXT_XATTN`, 2/2 backends).
+
+It is still a large regression, because the score matmul was moved from HMX to
+HVX:
+
+| kv | R | unfused (HMX mm) | fused (HVX dot) | |
+|--:|--:|--:|--:|:--|
+| 512 | 8 | 561.5 µs | 766.1 | 1.36x slower |
+| 512 | 64 | 1359.7 | 3306.6 | 2.43x |
+| 1024 | 8 | 632.0 | 1362.7 | 2.16x |
+| 1024 | 64 | 2008.3 | 6296.7 | 3.14x |
+| 2048 | 8 | 976.3 | 2294.7 | 2.35x |
+| 2048 | 64 | 3268.6 | 12541.2 | 3.84x |
+
+At kv=2048/R=64 the fused kernel sustains 42.8 GFLOP/s against the standalone
+HMX matmul's 1.55 TFLOP/s -- **36x worse**. Saving ~470 µs of chain traffic
+bought ~1800 µs of extra matmul.
+
+**Root cause: `hs = 128` is only two HVX f16 vectors per dot product.**
+`hvx_dot_f16_f16_aa_rx4` issues 2 multiply-accumulates per row and then a full
+horizontal reduction -- 4 vector adds plus a multi-step shuffle-reduce -- and
+`hvx_dot_f16_f16_aa_rx32` adds a `vsetq`/`vmux` per group of 4 on top. The
+reduction costs more than the arithmetic it reduces. HMX never pays this: its
+32x32 tile accumulates in place, so a short K dimension costs it nothing.
+
+The earlier reasoning in this doc -- that the pass is K-streaming bound, so the
+matmul engine hardly matters -- was wrong in a specific way. The K-streaming
+term bounds *HMX*, which is fast enough to be waiting on memory. HVX is far
+enough below that bound to be compute-bound instead, and at `hs=128` its
+per-dot reduction overhead dominates.
+
+**The fusion is therefore gated off by default** (`opt_xattn_fusion`, enable with
+`GGML_HEXAGON_XATTN_FUSION=1`). With it off the numbers reproduce the unfused
+baseline within noise, so nothing regresses.
+
+### What attempt 2 needs
+
+The structure is right and worth keeping: VTCM-resident intermediate, one pass,
+block sums emitted directly. Only the matmul engine has to change -- stage the
+score tile through HMX into VTCM, then let HVX do the softmax and block-sum over
+it in place. That keeps the 4x-to-1x traffic win *and* the 1.55 TFLOP/s matmul,
+and it is the combination the projection below assumes. The FA kernel already
+does exactly this staging for QK^T, so the machinery exists in
+`hmx-fa-kernels.h`.
 
 ## Not measured / not verified
 

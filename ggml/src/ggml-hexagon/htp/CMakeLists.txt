@@ -28,6 +28,7 @@ add_library(${HTP_LIB} SHARED
     unary-ops.c
     sum-rows-ops.c
     softmax-ops.c
+    xattn-score-ops.c
     act-ops.c
     rope-ops.c
     set-rows-ops.c

@@ -86,6 +86,12 @@ static int opt_optrace  = 0;    // trace buffer size per thread (0 means default
 static int opt_oppoll   = 0;    // polling for batch completions
 static int opt_opfusion = 1;    // enable/disable op fusion
 
+// XAttention scoring fusion. Off by default: the fused kernel is correct but the
+// HVX dot it uses for the score matmul is slower than the unfused HMX MUL_MAT at
+// every shape measured, so enabling it is currently a regression. See
+// docs/backend/snapdragon/xattn-block-selection.md.
+static int opt_xattn_fusion = 0;
+
 static std::regex* opt_opfilter = NULL; // regex of ops to not claim
 
 #define HEX_VERBOSE(...) \
@@ -3667,9 +3673,118 @@ static bool is_qkv_mergeable(const ggml_tensor * n_q, const ggml_tensor * n_k, c
     return true;
 }
 
+// XAttention block-selection scoring: MUL_MAT -> SOFT_MAX -> RESHAPE -> SUM_ROWS.
+//
+// Unfused, the [kv, nq, nh] score tensor is written by the matmul, read and
+// rewritten by the softmax, and read again by sum_rows -- four passes over a
+// tensor that is `bs` times larger than the result. Measured on SM8750 that chain
+// is ~90% of the marginal cost of the scoring pass while the matmul is ~10%
+// (docs/backend/snapdragon/xattn-block-selection.md). Fused, the intermediate
+// stays in VTCM and only K plus the small output cross DRAM.
+//
+// The RESHAPE has to join the fused set even though it computes nothing: it is
+// SUM_ROWS's src[0], and htp_opnode::get_inputs() treats any src that is not
+// itself a member of the group as a real input to be marshalled.
+static bool try_fuse_xattn_score(const ggml_hexagon_session * sess, const ggml_cgraph * graph, int & i,
+                                 std::vector<htp_opnode> & nodes) {
+    if (!opt_xattn_fusion) {
+        return false;
+    }
+    if (i + 3 >= graph->n_nodes) {
+        return false;
+    }
+
+    ggml_tensor * mm = graph->nodes[i];
+    ggml_tensor * sm = graph->nodes[i + 1];
+    ggml_tensor * rs = graph->nodes[i + 2];
+    ggml_tensor * sr = graph->nodes[i + 3];
+
+    if (mm->op != GGML_OP_MUL_MAT || sm->op != GGML_OP_SOFT_MAX ||
+        rs->op != GGML_OP_RESHAPE || sr->op != GGML_OP_SUM_ROWS) {
+        return false;
+    }
+
+    // strict producer -> consumer chain
+    if (sm->src[0] != mm || rs->src[0] != sm || sr->src[0] != rs) {
+        return false;
+    }
+
+    // Every intermediate must be dead outside the group. The RESHAPE needs the
+    // raw use count rather than ggml_node_has_n_uses, which rejects anything with
+    // a view_src -- true of every reshape. Its view source is the SOFT_MAX output,
+    // and that tensor having exactly one use is already checked below, so a second
+    // consumer reaching in through the view cannot hide from us.
+    if (!ggml_node_has_n_uses(graph, i, 1) || !ggml_node_has_n_uses(graph, i + 1, 1)) {
+        return false;
+    }
+    if (ggml_node_get_use_count(graph, i + 2) != 1 || (rs->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+
+    // no mask and no ALiBi slope -- the kernel implements a plain softmax
+    if (sm->src[1] != nullptr) {
+        return false;
+    }
+    float scale, max_bias;
+    memcpy(&scale,    &sm->op_params[0], sizeof(float));
+    memcpy(&max_bias, &sm->op_params[1], sizeof(float));
+    if (max_bias != 0.0f) {
+        return false;
+    }
+
+    const ggml_tensor * k = mm->src[0];
+    const ggml_tensor * q = mm->src[1];
+
+    if (k->type != GGML_TYPE_F16 || q->type != GGML_TYPE_F32 || sr->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(k) || !ggml_is_contiguous(q) || !ggml_is_contiguous(sr)) {
+        return false;
+    }
+    if (k->ne[3] != 1 || q->ne[3] != 1 || k->ne[0] != q->ne[0] || k->ne[2] != q->ne[2]) {
+        return false;
+    }
+
+    const int64_t hs   = k->ne[0];
+    const int64_t kv   = k->ne[1];
+    const int64_t nh   = k->ne[2];
+    const int64_t nq   = q->ne[1];
+    const int64_t nblk = sr->ne[1];
+
+    // the reshape must only be regrouping the kv axis into [bs, nblk]
+    if (rs->ne[2] != nq || rs->ne[3] != nh || nblk == 0 || rs->ne[0] * nblk != kv) {
+        return false;
+    }
+    if (sr->ne[0] != 1 || sr->ne[2] != nq || sr->ne[3] != nh) {
+        return false;
+    }
+
+    // matches the DSP kernel's aligned-load constraints
+    if ((hs % 64) != 0 || (kv % 32) != 0 || (k->nb[1] % 128) != 0) {
+        return false;
+    }
+
+    htp_opnode node(mm, {}, HTP_OP_XATTN_SCORE);
+    node.add_fused(sm);
+    node.add_fused(rs);
+    node.add_fused(sr);
+    memcpy(&node.kernel_params[0], &scale, sizeof(float));
+
+    nodes.push_back(std::move(node));
+    i += 3;  // consume SOFT_MAX, RESHAPE and SUM_ROWS
+
+    HEX_VERBOSE("ggml-hex: fused xattn-score : hs %lld kv %lld nh %lld nq %lld nblk %lld\n", (long long) hs,
+                (long long) kv, (long long) nh, (long long) nq, (long long) nblk);
+    return true;
+}
+
 static bool try_fuse_node(const ggml_hexagon_session * sess, const ggml_cgraph * graph, int & i, std::vector<htp_opnode> & nodes) {
     if (!opt_opfusion) {
         return false;
+    }
+
+    if (try_fuse_xattn_score(sess, graph, i, nodes)) {
+        return true;
     }
 
     ggml_tensor * n = graph->nodes[i];
@@ -4492,6 +4607,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_opqueue  = getenv("GGML_HEXAGON_OPQUEUE");
     const char * str_oppoll   = getenv("GGML_HEXAGON_OPPOLL");
     const char * str_opfusion = getenv("GGML_HEXAGON_OPFUSION");
+    const char * str_xattn_fusion = getenv("GGML_HEXAGON_XATTN_FUSION");
     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
     const char * str_etm      = getenv("GGML_HEXAGON_ETM");
@@ -4544,6 +4660,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_optrace   = str_optrace  ? strtoul(str_optrace, NULL, 0)          : (opt_opbatch * 256);
     opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
     opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
+    opt_xattn_fusion = str_xattn_fusion ? atoi(str_xattn_fusion)          : opt_xattn_fusion;
     opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
     opt_etm       = str_etm      ? atoi(str_etm)                          : 0;
     opt_nhvx      = str_nhvx     ? strtoul(str_nhvx, NULL, 0)             : opt_nhvx;
