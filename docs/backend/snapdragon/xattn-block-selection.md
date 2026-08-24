@@ -1,10 +1,43 @@
 # Block selection on HTP: what scoring actually costs
 
+> ## Correction: none of this measured XAttention
+>
+> Everything below measures `test_flash_attn_ext_qsubsample_topk` — **query-subsampled
+> top-k block selection**. It was named `XATTN_*` throughout, cited arXiv:2503.16428, and
+> was presented in this file and in commits `c99384b7a`, `c7f9c3d1c`, `8c08c8346`,
+> `7064fa298`, `05768f736`, `fd1a0324d` as an implementation of XAttention. **It is not.**
+> It shares only the outer shape — score, softmax, block-sum, select — and departs from
+> that estimator on all four of its defining properties: no antidiagonal packing (it
+> subsamples `R` strided query rows instead, which is lossy where the pack is not), no
+> causal mask on the score matrix, no `1/S` temperature, and a fixed top-k shared by
+> every query row instead of a per-query-block cumulative-mass threshold. Its selection
+> recall is unmeasured in this project and in mllm.
+>
+> **What is still valid:** every latency number here. They are correct measurements of a
+> real op chain, and they remain the calibration baseline for the fusion work — the chain
+> `MUL_MAT -> SOFT_MAX -> RESHAPE -> SUM_ROWS` that `HTP_OP_XATTN_SCORE` fuses is
+> algorithm-agnostic. **What is not valid:** any sentence that reads them as evidence
+> about XAttention's cost or quality.
+>
+> The names are corrected in `tests/test-backend-ops.cpp` (the arm is now `QSUB_*` /
+> `FLASH_ATTN_EXT_QSUB_TOPK`) and the reproduce commands below are updated to match. The
+> hexagon and OpenCL opcode, file and env-var names (`HTP_OP_XATTN_SCORE`,
+> `xattn-score-ops.c`, `GGML_HEXAGON_XATTN_FUSION`, `GGML_OPENCL_FUSE_XATTN_SCORE`, ...)
+> are **not** renamed here — they are owned by another change — so they still read
+> `XATTN` while computing something algorithm-agnostic. Git history cannot be corrected
+> at all; the six commits above keep their wrong subjects. This file also keeps its
+> `xattn-` filename, because two comments in `ggml/src/ggml-hexagon/ggml-hexagon.cpp`
+> (`:92`, `:3682`) cite the path and that file is out of scope here.
+>
+> The faithful estimator, and what it costs, is in
+> [xattn-scoring.md](xattn-scoring.md). That is now the only file in this directory that
+> cites arXiv:2503.16428.
+
 Companion to [sparse-attn-inkernel-vs-gather.md](sparse-attn-inkernel-vs-gather.md),
 which measured block-sparse *attention* against a materialized gather but supplied
 the block selection as a constant leaf. This doc measures the missing half: what it
-costs to **compute** the selection with real attention-score-based ranking
-(XAttention, Xu et al. ICML 2025, arXiv:2503.16428), and where that cost lives.
+costs to **compute** a selection by ranking attention scores, and where that cost
+lives.
 
 Headline: the score matmul was running at ~7% of the HMX's demonstrated throughput,
 but fixing that does not reduce latency, because the matmul is only ~10% of the
@@ -12,7 +45,7 @@ marginal cost. The scoring cost is the **unfused op chain around it**.
 
 ## Setup
 
-`test_flash_attn_ext_xattn_sel` in `tests/test-backend-ops.cpp`. Qwen3-1.7B-ish
+`test_flash_attn_ext_qsubsample_topk` in `tests/test-backend-ops.cpp`. Qwen3-1.7B-ish
 shape: `hs=128`, `nh=8` KV heads, `nr=2` (16 Q heads), `nb=512` query tokens,
 selection block `bs=64`, 25% density (`n_sel = nblk/4`). Device `b4bd0901`
 (SM8750, Hexagon V79), `build-sparse`.
@@ -98,9 +131,12 @@ Two consequences:
    floor you were paying anyway. The reason `R` is expensive today is entirely
    the unfused chain, not the matmul.
 2. **~183 µs at kv=2048 is an irreducible floor for scoring**, because ranking
-   blocks requires looking at every key at least once. XAttention's antidiagonal
-   reshape does not help here — it repacks the same `L·d` elements, so it moves
-   the same bytes. This is what the fusion projection below is anchored to.
+   blocks requires looking at every key at least once. An antidiagonal reshape does
+   not lower this floor either — it repacks the same `L·d` elements, so it moves the
+   same bytes. Note what that does *not* say: this arm reads K once to score `R·nr`
+   query rows, an antidiagonal scorer reads it once to score `L/S` reduced rows, so
+   the floor is shared and the useful work bought on top of it is not. This is what
+   the fusion projection below is anchored to.
 
 ## Result 2 — but ~90% of the marginal cost is not the matmul
 
@@ -203,9 +239,10 @@ does drop to K plus the small output.
 > the fused kernel passed 2/2 backends, then retracted that saying `test` mode
 > "structurally cannot" run a fused op. Both were wrong, for different reasons.
 >
-> The real cause was mundane: `test_flash_attn_ext_xattn_sel` was registered only in
+> The real cause was mundane: the test case (then `test_flash_attn_ext_xattn_sel`,
+> now `test_flash_attn_ext_qsubsample_topk`) was registered only in
 > `make_test_cases_perf()`, never in `make_test_cases_eval()`. `test -o
-> XATTN_BLOCK_SCORES` therefore reported **`0/0 tests passed`** and printed OK -- zero
+> QSUB_BLOCK_SCORES` therefore reported **`0/0 tests passed`** and printed OK -- zero
 > failures out of zero cases. Every correctness claim about this kernel was vacuous.
 >
 > The retraction was also wrong. `ggml_backend_compare_graph_backend` does support
@@ -214,15 +251,22 @@ does drop to K plus the small output.
 > outputs (`ggml/src/ggml-backend.cpp:2240-2243`), and `run_whole_graph()` already
 > feeds it that list. Node-by-node is only the `num_test_nodes == 0` branch.
 >
-> With the cases registered in the eval list, `XATTN_BLOCK_SCORES` now reports
+> With the cases registered in the eval list, `QSUB_BLOCK_SCORES` now reports
 > **3/3 passed with the fusion trace firing 3 times**, and 3/3 unfused. The fused
 > scoring kernel is genuinely correct. Only its speed is the problem.
 >
-> **Stage 0 stays perf-only.** It runs argsort -> selection -> sparse FA, and fails
-> 0/3 against CPU *with fusion both on and off*. HTP and CPU block scores differ in
-> the last fp bits, argsort flips a rank, a different set of blocks is chosen, and the
-> outputs diverge entirely. Checking stage 0 needs the ranking pinned via a dominant
-> `bias` leaf; the graph has the slot, the harness fills it randomly.
+> **Stage 0 stays perf-only, and cannot be made otherwise.** It runs argsort ->
+> selection -> sparse FA, and fails 0/3 against CPU *with fusion both on and off*.
+> This file previously blamed last-bit score differences flipping an argsort rank, and
+> proposed pinning the ranking with a dominant `bias` leaf as "the whole fix". **That
+> diagnosis was incomplete and the fix would not have worked.** Stage 0 ends in
+> `ggml_flash_attn_ext` with a NULL mask and the selection in `src[5]`, and no CPU
+> backend reads `src[5]` at all -- so the CPU reference computes *dense* attention over
+> the full KV while HTP computes sparse attention over `n_sel` blocks. Those cannot
+> agree however stable the ranking is. It is the same reason
+> `test_flash_attn_ext_sparse`'s maskless rows are perf-only, and pinning the bias does
+> not help: the selection is computed, so the matching -INF mask cannot be built ahead
+> of time in `initialize_tensors`.
 
 At kv=2048/R=64 the fused kernel sustains 42.8 GFLOP/s against the standalone
 HMX matmul's 1.55 TFLOP/s -- **36x worse**. Saving ~470 µs of chain traffic
@@ -289,14 +333,16 @@ What this does and does not invalidate:
 
 ## Not measured / not verified
 
-- **HTP == CPU is verified; the algorithm's quality is not.**
-  `test-backend-ops test -b HTP0 -o FLASH_ATTN_EXT_XATTN` passes, so the whole
-  chain -- score matmul, softmax, both reductions, argsort, and the sparse FA
-  consuming the computed `sel` -- reproduces the CPU reference within NMSE
-  tolerance, and the ranking is stable enough that both backends select the same
-  blocks. What is *not* tested is whether XAttention picks *good* blocks: there is
-  no retrieval or perplexity arm. Every number here is a latency, and the accuracy
-  claim is only "HTP agrees with CPU", not "the selector works".
+- **HTP == CPU is verified for the block SCORES only, not for the end-to-end arm.**
+  `test-backend-ops test -b HTP0 -o QSUB_BLOCK_SCORES` passes 3/3, so the score
+  matmul, the softmax and both reductions reproduce the CPU reference within NMSE
+  tolerance. The whole-chain arm (`FLASH_ATTN_EXT_QSUB_TOPK`, stage 0) is **not**
+  checked and structurally cannot be -- see the stage-0 note above. An earlier
+  revision of this file claimed `test -b HTP0 -o FLASH_ATTN_EXT_XATTN` passes; that
+  claim was wrong, and is retracted here.
+- **The selector's quality is not measured at all.** There is no retrieval or
+  perplexity arm. Every number here is a latency, and the accuracy claim is only
+  "HTP agrees with CPU on the block scores", never "the selector picks good blocks".
 - ctx=4096 end-to-end.
 - `R` between 128 and `nb`, where the matmul should saturate.
 - OpenCL scoring. mllm already measured eager-op OpenCL scoring at 48.4 ms for
@@ -313,13 +359,13 @@ adb push build-sparse/bin/test-backend-ops /data/local/tmp/llama.cpp/bin/
 # ADSP_LIBRARY_PATH is required or session 0 fails to open with 0x80000406
 D=/data/local/tmp/llama.cpp
 adb shell "cd $D && ADSP_LIBRARY_PATH=$D/lib LD_LIBRARY_PATH=./lib \
-  ./bin/test-backend-ops perf -b HTP0 -o XATTN_SCORE_MM"     # stage 1, R sweep
+  ./bin/test-backend-ops perf -b HTP0 -o QSUB_SCORE_MM"      # stage 1, R sweep
 adb shell "cd $D && ADSP_LIBRARY_PATH=$D/lib LD_LIBRARY_PATH=./lib \
-  ./bin/test-backend-ops perf -b HTP0 -o XATTN_BLOCK_SCORES" # stage 2
+  ./bin/test-backend-ops perf -b HTP0 -o QSUB_BLOCK_SCORES"  # stage 2
 adb shell "cd $D && ADSP_LIBRARY_PATH=$D/lib LD_LIBRARY_PATH=./lib \
-  ./bin/test-backend-ops perf -b HTP0 -o FLASH_ATTN_EXT_XATTN" # stage 0
+  ./bin/test-backend-ops perf -b HTP0 -o FLASH_ATTN_EXT_QSUB_TOPK" # stage 0
 adb shell "cd $D && ADSP_LIBRARY_PATH=$D/lib LD_LIBRARY_PATH=./lib \
-  ./bin/test-backend-ops perf -b HTP0 -o XATTN_FA_ONLY"      # stage 4 control
+  ./bin/test-backend-ops perf -b HTP0 -o QSUB_FA_ONLY"       # stage 4 control
 ```
 
 If `adb devices` is empty, check `ss -lntp | grep 5037` — anything other than
@@ -362,7 +408,7 @@ and the kv=512 one is inside noise.
 
 ### The OpenCL fused kernel is correct and 17-56x slower
 
-`XATTN_BLOCK_SCORES` passes **3/3 fused and 3/3 eager** on device, so the kernel
+`QSUB_BLOCK_SCORES` passes **3/3 fused and 3/3 eager** on device, so the kernel
 computes the right answer. Its speed is not close:
 
 | kv | R | fused | eager | |
@@ -430,7 +476,7 @@ transposes K into weight tiles, a Q prep writes activation tiles, and
 and the softmax and block-sum run over it in place, so the `[kv, nq, nh]` intermediate
 never reaches DRAM.
 
-`XATTN_BLOCK_SCORES` passes **3/3 with the fusion enabled**, and the numbers are a win
+`QSUB_BLOCK_SCORES` passes **3/3 with the fusion enabled**, and the numbers are a win
 at every shape measured (replicated-equivalent µs, overhead inverted out):
 
 | kv | R | unfused | **fused** | speedup | matmul | epilogue before | epilogue after | removed |
