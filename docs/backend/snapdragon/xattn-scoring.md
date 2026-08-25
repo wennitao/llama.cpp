@@ -332,3 +332,68 @@ was the per-query-block structure forcing attention out of one fused graph into 
 dispatches. That is exactly the structure a faithful implementation has. Landing scoring
 alone is therefore not timidity; it is the only step whose value does not depend on that
 unresolved question.
+
+## Optimising the scorer: the reversal is the wrong operand
+
+Profiled at the shape a chunked prefill actually scores -- `Lq=512` against every key so far,
+not the square `Lq=Lk` used earlier. That changes the picture completely (S=16,
+replicated-equivalent µs):
+
+| Lk | total | matmul | **reversal** | epilogue |
+|--:|--:|--:|--:|--:|
+| 512 | 620 | 233 (38%) | **264 (43%)** | 123 (20%) |
+| 1024 | 779 | 329 (42%) | **264 (34%)** | 187 (24%) |
+| 2048 | 1052 | 534 (51%) | **261 (25%)** | 257 (24%) |
+
+The antidiagonal reversal -- `ggml_get_rows(q, antidiag_idx)` -- is a flat ~262 µs and the
+LARGEST term at short context. The epilogue is only 20-24% here, not the 61-74% measured on
+the square shape, because `Lq` is pinned so the epilogue's `Nq` axis never grows.
+
+Also worth recording: **`try_fuse_xattn_score` can never fire on this graph.** It rejects any
+softmax with a mask (`ggml-hexagon.cpp`, `sm->src[1] != nullptr`) and the real scorer passes a
+causal mask, so the HMX-staged fusion and its 1.12-1.58x only ever applied to the QSUB stand-in.
+
+### Either operand can carry the reversal
+
+Entry `(rq, rk)` must be `sum_j Q[a_j + rq*S] . K[b_j + rk*S]` with `a_j + b_j == S-1`.
+Reversing Q gives `(S-1-j, j)`; reversing K gives `(j, S-1-j)`. Substituting `j' = S-1-j` maps
+one onto the other exactly -- the matrices are **identical**, not merely equivalent. Confirmed
+on device: `XATTN_SCORE` 8/8 with the portable K-side variant.
+
+| Lk | reversal alone: revQ / revK portable / revK direct-F16 | full scoring: revQ / revK-F16 | |
+|--:|--:|--:|--:|
+| 512 | 262 / 91 / **48** | 605 / **472** | **1.28x** |
+| 1024 | 264 / 220 / **102** | 778 / **671** | **1.16x** |
+| 2048 | 262 / 465 / **261** | 1049 / 1065 | 1.00x |
+
+Two things fall out.
+
+**A type-taking `get_rows` is worth 2-4x on this op alone.** `ggml_get_rows` hardcodes an F32
+result, so the portable K-side form pays a cast back to F16 and is 1.8-2.2x slower than the
+hand-built F16 node (which ggml-hexagon's F16->F16 GET_ROWS already supports). The direct form
+is perf-only here because ggml-cpu's `get_rows_f16` writes F32
+(`ggml_cpu_fp16_to_fp32` into a `float *`, `ops.cpp:4925`), so a CPU reference miscomputes it
+and an eval row would fail on the harness rather than the kernel. `rev_k=1` validates the
+identical algebra portably; `rev_k=2` measures its speed.
+
+**The K-side reversal scales with `Lk` while the Q-side is fixed**, so it wins outright only
+below `Lk ~ 2048`. But that is the wrong way to deploy it: **K is the KV cache -- written once,
+read by every later chunk -- so the permutation belongs at cache-write time**, amortised across
+every chunk that reads it, instead of being redone per chunk. Q then needs no reversal at all:
+
+| Lk | per-chunk scoring, reversal amortised away | |
+|--:|--:|--:|
+| 512 | 605 -> 343 | **1.76x** |
+| 1024 | 778 -> 514 | **1.51x** |
+| 2048 | 1049 -> 787 | **1.33x** |
+
+That is the largest single win available in the scorer, and it needs no kernel work -- only
+storing K in antidiagonal-packed order.
+
+### What is left after that
+
+At `Lk=2048` with the reversal gone: matmul 534 (68%), epilogue 257 (32%). The matmul runs at
+**502 GFLOP/s against the 1.71 TFLOP/s the same op reaches on the square shape** -- `Nq = Lq/S`
+is only 32 rows at `Lq=512, S=16`, so it is tall-skinny and starved, the same shape pathology
+the original stand-in had. Raising `S` makes it worse, not better (`Nq` shrinks); `S=8` gets
+926 GFLOP/s but loses overall on 2x the FLOPs.

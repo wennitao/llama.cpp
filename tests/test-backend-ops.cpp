@@ -7930,6 +7930,13 @@ struct test_xattn_score : public test_case {
     const int64_t Lk;    // key tokens (>= Lq; Lk > Lq is chunked prefill)
     const int64_t S;     // antidiagonal stride
     const int64_t Bl;    // XAttention block size (the paper only ever uses 128)
+    // Which operand carries the antidiagonal reversal. The pairing only requires the
+    // query and key offsets to sum to S-1, so reversing K is algebraically identical to
+    // reversing Q -- and K is the KV cache, written once and read by every later chunk,
+    // so in a runtime the permutation becomes a cache-write cost amortised across chunks
+    // rather than a per-chunk one. Measured at Lq=512 the Q-side reversal is a flat
+    // ~262 us, which is 25-43% of the whole scoring pass.
+    const int     rev_k;   // 0 = reverse Q, 1 = reverse K portably, 2 = reverse K direct to F16
     const int     stage; // 0 attn_sum, 1 reduced matmul, 2 the reversal,
                          // 3 row-mass invariant, 4 stage 1 timed whole-graph
 
@@ -7953,7 +7960,12 @@ struct test_xattn_score : public test_case {
     // number only against another whole-graph number on the SAME backend.
     bool perf_whole_graph() override { return stage != 1 && stage != 2; }
 
-    std::string vars() override { return VARS_TO_STR8(d, Hq, Hkv, Lq, Lk, S, Bl, stage); }
+    std::string vars() override {
+        // append only when the K-side variant is selected, so the existing rows keep
+        // their names and their recorded baselines stay comparable
+        if (!rev_k) return VARS_TO_STR8(d, Hq, Hkv, Lq, Lk, S, Bl, stage);
+        return VARS_TO_STR9(d, Hq, Hkv, Lq, Lk, S, Bl, stage, rev_k);
+    }
 
     // Stage 3 is not compared against a reference at all -- see err() -- so its
     // tolerance is an ABSOLUTE deviation from P, not an NMSE. It is loose because
@@ -7989,8 +8001,9 @@ struct test_xattn_score : public test_case {
     }
 
     test_xattn_score(int64_t d = 128, int64_t Hq = 16, int64_t Hkv = 8, int64_t Lq = 1024,
-                     int64_t Lk = 1024, int64_t S = 8, int64_t Bl = 64, int stage = 0)
-        : d(d), Hq(Hq), Hkv(Hkv), Lq(Lq), Lk(Lk), S(S), Bl(Bl), stage(stage) {}
+                     int64_t Lk = 1024, int64_t S = 8, int64_t Bl = 64, int stage = 0,
+                     int rev_k = 0)
+        : d(d), Hq(Hq), Hkv(Hkv), Lq(Lq), Lk(Lk), S(S), Bl(Bl), rev_k(rev_k), stage(stage) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // The reference asserts NONE of these and S | Bl in particular fails SILENTLY
@@ -8014,13 +8027,44 @@ struct test_xattn_score : public test_case {
         // an involution. get_rows has no broadcast over ne1, so the identical
         // permutation has to be repeated for every head -- at Lq=4096, Hq=32 that is a
         // 512 KB leaf. Annoying, not fatal.
-        ggml_tensor * idx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, Lq, Hq);
+        // sized for whichever operand carries the reversal: get_rows requires
+        // src0->ne[2] == idx->ne[1], so K's variant needs [Lk, Hkv]
+        ggml_tensor * idx = rev_k ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, Lk, Hkv)
+                                  : ggml_new_tensor_2d(ctx, GGML_TYPE_I32, Lq, Hq);
         ggml_set_name(idx, "xattn_idx");
 
-        // The reversal: the only data movement the algorithm needs.
-        ggml_tensor * qperm = ggml_get_rows(ctx, q, idx);       // F32 [d, Lq, Hq]
-        ggml_set_name(qperm, "q_antidiag");
-        if (stage == 2) { return qperm; }
+        // The reversal: the only data movement the algorithm needs, and it can ride on
+        // EITHER operand. Entry (rq, rk) must be sum_j Q[a_j + rq*S] . K[b_j + rk*S] with
+        // a_j + b_j == S-1; reversing Q gives (S-1-j, j) and reversing K gives (j, S-1-j).
+        // Identical antidiagonal. Reversing K is preferable in a real runtime because K is
+        // the KV cache -- written once, read by every later chunk -- so the permutation
+        // becomes a cache-write cost amortised over all chunks instead of a per-chunk one.
+        ggml_tensor * qperm = q;
+        ggml_tensor * kperm = k;
+        if (rev_k == 2) {
+            // ggml_get_rows hardcodes an F32 result ("TODO: implement non F32 return" in
+            // ggml.c), so the portable form below pays a cast back to F16. Build the node
+            // by hand instead -- exactly the graph a type-taking get_rows would emit, and
+            // the shape ggml-hexagon's F16->F16 GET_ROWS accepts.
+            //
+            // PERF ONLY: ggml-cpu's get_rows_f16 writes F32 (ggml_cpu_fp16_to_fp32 into a
+            // float* dst, ops.cpp:4925), so the CPU reference miscomputes this node and an
+            // eval row would fail on the harness rather than on the kernel. rev_k=1
+            // validates the identical algebra portably; this only measures its speed.
+            ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, Lk, Hkv, 1);
+            g->op     = GGML_OP_GET_ROWS;
+            g->src[0] = k;
+            g->src[1] = idx;
+            ggml_set_name(g, "k_antidiag");
+            kperm = g;
+        } else if (rev_k == 1) {
+            kperm = ggml_cast(ctx, ggml_get_rows(ctx, k, idx), GGML_TYPE_F16);
+            ggml_set_name(kperm, "k_antidiag");
+        } else {
+            qperm = ggml_get_rows(ctx, q, idx);                 // F32 [d, Lq, Hq]
+            ggml_set_name(qperm, "q_antidiag");
+        }
+        if (stage == 2) { return rev_k ? kperm : qperm; }
 
         // Both reshapes are free views. For K it is a plain contiguous reshape:
         // element (k*d + e, rk) sits at rk*S*d + k*d + e == K[e, rk*S + k], which is
@@ -8029,7 +8073,7 @@ struct test_xattn_score : public test_case {
         // ggml_reshape_3d asserts contiguity -- this is the single biggest hazard in
         // reusing this graph outside the test harness.
         ggml_tensor * rq = ggml_reshape_3d(ctx, qperm, S*d, Nq(), Hq);
-        ggml_tensor * rk = ggml_reshape_3d(ctx, k,     S*d, Nk(), Hkv);
+        ggml_tensor * rk = ggml_reshape_3d(ctx, kperm, S*d, Nk(), Hkv);
 
         // The reduced matmul. GQA broadcast is free: mul_mat needs only
         // b->ne[2] % a->ne[2] == 0. The reference forbids GQA outright
@@ -8091,10 +8135,14 @@ struct test_xattn_score : public test_case {
                 // Must be written explicitly: the default fill is random, and a
                 // garbage I32 index makes CPU abort on GGML_ASSERT(i01 < ne01) while
                 // hexagon silently skips the row and leaves the output uninitialized.
-                std::vector<int32_t> perm(Lq * Hq);
-                for (int64_t h = 0; h < Hq; h++) {
-                    for (int64_t l = 0; l < Lq; l++) {
-                        perm[h*Lq + l] = (int32_t) ((l/S)*S + (S - 1 - l%S));
+                // whichever operand carries the reversal -- the permutation itself is
+                // the same involution either way, only its length and head count differ
+                const int64_t PL = rev_k ? Lk  : Lq;
+                const int64_t PH = rev_k ? Hkv : Hq;
+                std::vector<int32_t> perm(PL * PH);
+                for (int64_t h = 0; h < PH; h++) {
+                    for (int64_t l = 0; l < PL; l++) {
+                        perm[h*PL + l] = (int32_t) ((l/S)*S + (S - 1 - l%S));
                     }
                 }
                 ggml_backend_tensor_set(t, perm.data(), 0, perm.size()*sizeof(int32_t));
@@ -11317,6 +11365,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_xattn_score(128, 4, 1, 256, 512, 8, 64, stage));
         // S == Bl, i.e. P == 1: one reduced row per block, the degenerate pool
         test_cases.emplace_back(new test_xattn_score(128, 2, 1, 512, 512, 64, 64, stage));
+        // the same shapes with the reversal moved to K. Algebraically identical output,
+        // so these fail loudly if the offset pairing is wrong on either side.
+        test_cases.emplace_back(new test_xattn_score(128, 4, 2, 512, 512, 8, 64, stage, /*rev_k=*/1));
+        test_cases.emplace_back(new test_xattn_score(128, 4, 1, 256, 512, 8, 64, stage, /*rev_k=*/1));
+        test_cases.emplace_back(new test_xattn_score(128, 2, 1, 512, 512, 64, 64, stage, /*rev_k=*/1));
         // S == 1: no reduction and no reversal, the identity control for the whole chain
         test_cases.emplace_back(new test_xattn_score( 64, 2, 2, 128, 128, 1, 64, stage)); // Nk=128
     }
@@ -11888,7 +11941,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         // kv=2048, which is exactly the mismatched-shape error this file has fallen for
         // before.
         for (int S : { 8, 16 }) {
-            test_cases.emplace_back(new test_xattn_score(128, 16, 8, 512, kv, S, 64, /*stage=*/0));
+            // stage 1 = the reduced matmul alone (replicated, so amortised correctly);
+            // 2 = the antidiagonal reversal; 4 = stage 1's graph timed whole-graph, so
+            // 4 minus 1 is the per-call constant. Together these split the pass into
+            // matmul vs epilogue at the shape a chunked prefill actually scores.
+            for (int stage : { 1, 2, 4, 0 }) {
+                test_cases.emplace_back(new test_xattn_score(128, 16, 8, 512, kv, S, 64, stage));
+            }
+            // same shapes with the reversal moved to K
+            for (int rk : { 1, 2 }) {
+                for (int stage : { 2, 0 }) {
+                    test_cases.emplace_back(new test_xattn_score(128, 16, 8, 512, kv, S, 64, stage, rk));
+                }
+            }
         }
     }
     // kv=4096 too: scoring is linear in Lk at fixed Lq, while 25%-density attention is
@@ -12040,6 +12105,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // that against the 1862 us an exact per-scorer-block selection costs.
     for (int n_sel : { 8, 10, 12, 14, 16, 17, 18, 20 }) {
         test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, 2048, 512, 64, n_sel, /*mask=*/false));
+    }
+
+    // THE DEPLOYABLE CONFIGURATION, priced against dense at each context length.
+    // Measured on real Qwen3-1.7B activations, the union of a whole nb=512 chunk's query
+    // blocks is 1.93x the per-query-block selection (examples/xattn-overlap), so at 25%
+    // scoring density the attention runs at ~50% density with ONE selection per chunk and
+    // no per-query-block machinery. n_sel is that union rounded UP to a value with a large
+    // divisor, because the chunk count is u / (largest divisor of u <= 8) and a prime u is
+    // catastrophic -- n_sel=17 costs 2.48x n_sel=18.
+    for (int kv : { 512, 1024, 2048, 4096 }) {
+        const int nblk = kv / 64;
+        const int u    = nblk / 2;            // ceil(1.93 * nblk/4) rounded to a power of 2
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, 512, 64, u, /*mask=*/false));
     }
 
     // Attribute the per-query-block penalty. The MAC count is identical across every
