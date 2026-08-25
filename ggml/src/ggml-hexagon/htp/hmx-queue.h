@@ -17,10 +17,16 @@
 extern "C" {
 #endif
 
+// V79 used to fall straight into qurt_futex_wait after every drain (poll count 1), so
+// every subsequent push cost a futex wake plus a thread wakeup. Profiling showed that as
+// ~1150 idle cycles paid once per HMX job, and ~45% of all fully-idle gaps resumed into
+// HMX_COMP. A short spin removes it. 64 is the measured knee: 64/512/2000 are within
+// noise of each other, and a shorter spin steals fewer cycles from the six HVX workers
+// that share the hardware threads.
 #if __HVX_ARCH__ > 79
 #define HMX_QUEUE_POLL_COUNT 2000
 #else
-#define HMX_QUEUE_POLL_COUNT 1
+#define HMX_QUEUE_POLL_COUNT 64
 #endif
 
 typedef void (*hmx_queue_func)(void *);

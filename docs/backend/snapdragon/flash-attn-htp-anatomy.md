@@ -922,3 +922,67 @@ no gain.
 Kept rather than reverted because it is correct, gated, and the loop linearisation it
 introduced (`fa_iter_at`, `kv_head_outer`) is what any future union-staging work needs. But
 it should not be enabled, and it should be deleted if union staging does not end up wanting it.
+
+### Why it stalls: the HMX queue futex round-trip
+
+Merging every genuine busy interval across all seven units and measuring the windows where
+**nothing at all** is running:
+
+| | shared (Br=512) | per-query-block (Bq=64) |
+|:--|--:|--:|
+| fully-idle time | 132 163 cyc (7.6% of wall) | 1 265 090 cyc (**33.9%**) |
+| number of gaps | 113 | **1090** |
+| mean gap | 1170 cyc | **1161 cyc** |
+| median gap | 1155 | 1135 |
+| gaps resuming into `HMX_COMP` | 48 (42%) | 486 (45%) |
+
+**The gap size does not change. Only the count does** -- 113 -> 1090, a 9.6x rise that tracks
+the 8x rise in every phase's interval count. So the stall is a *fixed per-handoff latency*
+paid many more times, not a growing wait on any resource.
+
+Nearly half of those gaps resume into `HMX_COMP`, which pointed straight at the HMX queue.
+`hmx-queue.h` had:
+
+```c
+#if __HVX_ARCH__ > 79
+#define HMX_QUEUE_POLL_COUNT 2000
+#else
+#define HMX_QUEUE_POLL_COUNT 1      // V79
+#endif
+```
+
+With a poll count of 1, `--poll_cnt` reaches zero on the first miss and the HMX thread drops
+into `qurt_futex_wait` after **every** drain (`hmx-queue.c:76-82`), so every subsequent push
+costs a futex wake plus a thread wakeup. ~1150 cycles at 1.7 GHz is ~0.68 µs, which is exactly
+the scale of a futex round-trip. V81+ already spins instead.
+
+Setting the V79 count to 64 (measured knee -- 64, 512 and 2000 are within noise of each other,
+and a shorter spin steals fewer cycles from the six HVX workers sharing the hardware threads):
+
+| poll count | per-query-block, kv=2048 |
+|--:|--:|
+| 1 | 2143.1 µs |
+| **64** | **1922.1 µs** |
+| 512 | 1915.6 |
+| 2000 | 1918.5 |
+
+Full sweep, per-query-block attention:
+
+| kv | POLL=1 | POLL=64 | gain | vs shared | vs dense |
+|--:|--:|--:|--:|--:|--:|
+| 512 | 1748 | 1707 | 1.02x | 1.25x | 0.54x |
+| 1024 | 1910 | 1733 | **1.10x** | 1.85x | 0.71x |
+| 2048 | 2144 | 1926 | **1.11x** | 1.95x | **1.08x** |
+| 4096 | 2905 | 2672 | **1.09x** | 1.97x | **1.63x** |
+
+Dense and shared-selection are unchanged within noise (dense kv=2048: 2078 µs; shared kv=2048:
+988 µs), and correctness is unaffected: FLASH_ATTN_EXT 2174/2196 with zero non-sinks=1
+failures, SPARSE 36/36, GATHER 2/2, XATTN_SCORE 5/5, QSUB 3/3.
+
+Cumulative on per-query-block attention at kv=2048 this session: 2989.9 -> 2059.7 (32-row
+softmax granularity) -> 1926.4 µs, **1.55x**.
+
+The remaining ~55% of idle time is the other phases' fork/join barriers (`HVX_V_PREP` 194
+gaps, `HVX_K_PREP` 130, `HVX_O_PROC` 128), which is the same fixed-latency-times-count
+structure one level down. Union staging attacks it at the root by cutting the iteration count
+itself rather than the per-iteration cost.
