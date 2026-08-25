@@ -55,12 +55,22 @@ static void work_queue_thread(void * context) {
     FARF(HIGH, "work-queue: thread %u started", me->id);
 
     unsigned int prev_seqn = 0;
+    unsigned int fast      = WORK_QUEUE_FAST_SPIN;
 
     while (!atomic_load_explicit(&q->killed, memory_order_relaxed)) {
         unsigned int seqn = atomic_load_explicit(&q->seqn, memory_order_acquire);
         if (seqn == prev_seqn) {
             if (atomic_load_explicit(&q->active, memory_order_relaxed)) {
-                hex_pause();
+                // A fork is only ever a few hundred cycles behind the previous join, so
+                // watch closely for a bounded window and then decay to the idle-grade
+                // pause so a genuinely long phase does not steal issue slots from the
+                // threads doing the work.
+                if (fast) {
+                    --fast;
+                    hex_pause_short();
+                } else {
+                    hex_pause();
+                }
             } else {
                 qurt_futex_wait(&q->seqn, prev_seqn);
             }
@@ -83,13 +93,17 @@ static void work_queue_thread(void * context) {
 
                 atomic_fetch_sub_explicit(&task->barrier, 1, memory_order_release);
             } else {
+                // A worker with id >= n is pinned here rather than skipping the task, so
+                // its exit latency lands on the NEXT phase's critical path. Rendezvous.
                 while (atomic_load_explicit(&task->barrier, memory_order_relaxed) > 0) {
-                    hex_pause();
+                    hex_pause_short();
                 }
             }
 
             ir = (ir + 1) & q->idx_mask;
         }
+
+        fast = WORK_QUEUE_FAST_SPIN;  // the next fork is imminent; watch closely
     }
 
     FARF(HIGH, "work-queue: thread %u stopped", me->id);
@@ -125,8 +139,12 @@ bool work_queue_run_async(work_queue_t q, work_queue_func_t func, void * data, u
 
     atomic_fetch_sub_explicit(&task->barrier, 1, memory_order_release);
 
+    // The join is a rendezvous with workers that are already finishing. Detecting it at
+    // pause(#255) granularity was the measured 373 cyc between a phase's last worker
+    // retiring and the main thread's next traced event (flash-attn Q_PREP -> A_PREP,
+    // the one path that contains nothing else), paid on every fork.
     while (atomic_load_explicit(&task->barrier, memory_order_relaxed) > 0) {
-        hex_pause();
+        hex_pause_short();
     }
 
     atomic_thread_fence(memory_order_acquire);

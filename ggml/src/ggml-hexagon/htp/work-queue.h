@@ -12,6 +12,16 @@ typedef struct work_queue_s * work_queue_t;
 
 #define WORK_QUEUE_MAX_N_THREADS      10
 
+// How long a worker watches for the next fork at rendezvous granularity
+// (hex_pause_short) after finishing a task, before reverting to the idle-grade
+// pause(#255). Sized to cover the observed inter-phase gap in flash-attn
+// (517-914 cyc): 128 * HEX_PAUSE_SHORT_IMM(16) ~= 2048 cyc of close watching.
+// The cost is bounded by this prefix and does not scale with phase length, so a
+// fork-sparse kernel pays it once per task and then behaves exactly as before.
+#ifndef WORK_QUEUE_FAST_SPIN
+#define WORK_QUEUE_FAST_SPIN 128
+#endif
+
 size_t       work_queue_sizeof(uint32_t n_threads, uint32_t capacity, uint32_t stack_size);
 size_t       work_queue_alignof(void);
 work_queue_t work_queue_init(void * ptr, uint32_t n_threads, uint32_t capacity, uint32_t stack_size);

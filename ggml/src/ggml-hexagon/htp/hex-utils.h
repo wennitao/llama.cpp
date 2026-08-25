@@ -53,8 +53,33 @@ static inline void hex_l2flush(void * addr, size_t size) {
     }
 }
 
+// pause(#N) suspends this hardware thread for up to N cycles. That is also the
+// granularity at which a spinning thread can observe a store from another thread,
+// so the immediate is a direct latency floor on every spin-detected handoff.
+//
+// #255 is right for an IDLE wait -- a thread with nothing to do must not steal
+// issue slots from the threads that are working. It is wrong for a RENDEZVOUS
+// whose event is tens-to-hundreds of cycles away: a work-queue worker picking up a
+// task published microseconds ago, the main thread joining that task, or
+// hmx_queue_pop waiting on a descriptor it pushed itself. Measured cost of one such
+// rendezvous on the one path that contains nothing else (Q_PREP join -> A_PREP
+// start): 373 cycles, paid 896 times per per-query-block flash-attn op.
 static inline void hex_pause() {
     asm volatile(" pause(#255)\n");
+}
+
+// Rendezvous-grade pause. Set HEX_PAUSE_SHORT_IMM to 255 for a bit-exact no-op
+// control (identical instruction stream at every hex_pause_short site) -- that is
+// the zero point of the tuning sweep.
+#ifndef HEX_PAUSE_SHORT_IMM
+#define HEX_PAUSE_SHORT_IMM 16
+#endif
+
+#define HEX_STR_(x) #x
+#define HEX_STR(x)  HEX_STR_(x)
+
+static inline void hex_pause_short(void) {
+    asm volatile(" pause(#" HEX_STR(HEX_PAUSE_SHORT_IMM) ")\n");
 }
 
 #endif /* HEX_UTILS_H */

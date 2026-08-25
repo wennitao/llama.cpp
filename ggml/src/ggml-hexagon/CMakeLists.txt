@@ -23,6 +23,12 @@ include(${HEXAGON_SDK_ROOT}/build/cmake/hexagon_fun.cmake)
 include(ExternalProject)
 
 option(GGML_HEXAGON_HTP_DEBUG  "ggml-hexagon: enable HTP debug output" OFF)
+
+# Rendezvous-spin tuning knobs, forwarded to the HTP skels. Empty means "use the
+# header defaults"; set them to sweep the pause/duty tradeoff without editing sources.
+set(GGML_HEXAGON_PAUSE_SHORT_IMM "" CACHE STRING "ggml-hexagon: pause() immediate for rendezvous spins (255 = no-op control)")
+set(GGML_HEXAGON_WQ_FAST_SPIN    "" CACHE STRING "ggml-hexagon: work-queue fast-spin window in hex_pause_short units (0 = no-op control)")
+set(GGML_HEXAGON_HMX_COND_WAKE   "" CACHE STRING "ggml-hexagon: gate the HMX-queue futex wake on a sleeping consumer (0 = no-op control)")
 set(GGML_HEXAGON_HTP_CERT  "$ENV{HEXAGON_HTP_CERT}" CACHE PATH "ggml-hexagon: enable HTP library signing using certificate")
 
 add_library(htp_iface OBJECT
@@ -70,6 +76,9 @@ function(build_htp_skel V)
             -DHEXAGON_SDK_ROOT=${HEXAGON_SDK_ROOT}
             -DHEXAGON_TOOLS_ROOT=${HEXAGON_TOOLS_ROOT}
             -DHEXAGON_HTP_DEBUG=${GGML_HEXAGON_HTP_DEBUG}
+            -DHEX_PAUSE_SHORT_IMM=${GGML_HEXAGON_PAUSE_SHORT_IMM}
+            -DWORK_QUEUE_FAST_SPIN=${GGML_HEXAGON_WQ_FAST_SPIN}
+            -DHMX_QUEUE_COND_WAKE=${GGML_HEXAGON_HMX_COND_WAKE}
             -DDSP_VERSION=${V}
             -DPREBUILT_LIB_DIR="toolv19_${V}")
     list(APPEND HTP_SKELS ${CMAKE_CURRENT_BINARY_DIR}/libggml-htp-${V}.so)

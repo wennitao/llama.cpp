@@ -29,6 +29,14 @@ extern "C" {
 #define HMX_QUEUE_POLL_COUNT 64
 #endif
 
+// The push-side futex wake is a QuRT syscall on the critical path of every HMX
+// dispatch, and the consumer is almost never actually asleep during an op (see
+// hmx_queue_push). Set to 0 to restore the unconditional wake -- the control for
+// attributing any measured change to this mechanism rather than to the pause grades.
+#ifndef HMX_QUEUE_COND_WAKE
+#define HMX_QUEUE_COND_WAKE 1
+#endif
+
 typedef void (*hmx_queue_func)(void *);
 
 // Dummy funcs used as signals
@@ -54,6 +62,7 @@ struct hmx_queue_s {
     uint32_t         capacity;
 
     atomic_uint      seqn;      // incremented for all pushes, used with futex
+    atomic_uint      sleeping;  // 1 only while the consumer is inside qurt_futex_wait
     qurt_thread_t    thread;
     void *           stack;
     uint32_t         hap_rctx;
@@ -89,9 +98,21 @@ static inline bool hmx_queue_push(hmx_queue_t q, struct hmx_queue_desc d) {
 
     q->desc[iw] = d;
     atomic_store(&q->idx_write, (iw + 1) & q->idx_mask);
-    // wake up our thread
     atomic_fetch_add(&q->seqn, 1);
-    qurt_futex_wake(&q->seqn, 1);
+
+    // The wake is a QuRT syscall (~250 cyc, derived from idle-before-O_PROC) on the
+    // critical path of all 576 pushes per per-query-block flash-attn op. With
+    // HMX_QUEUE_POLL_COUNT 64 the consumer spins ~16k cycles after each drain, which
+    // exceeds every inter-push interval in an FA op -- so in the steady state it never
+    // has a waiter to wake.
+    //
+    // No lost wakeup: the seqn increment above is seq_cst and precedes this load; the
+    // consumer stores `sleeping` seq_cst BEFORE re-comparing seqn. If we read
+    // sleeping == 0, the consumer's compare is ordered after our increment and it
+    // returns/skips without sleeping.
+    if (!HMX_QUEUE_COND_WAKE || atomic_load(&q->sleeping)) {
+        qurt_futex_wake(&q->seqn, 1);
+    }
 
     return true;
 }
@@ -121,7 +142,14 @@ static inline struct hmx_queue_desc hmx_queue_pop_one(hmx_queue_t q) {
         return rd;
     }
 
-    // Wait for desc to complete
+    // Deliberately the LONG pause, unlike the bounded rendezvous spins in work-queue.c.
+    // This wait is a whole HMX tile-matmul, not a handoff: several call sites push a job
+    // and immediately pop it with nothing overlapped (matmul-ops.c:2843, :2781, :3056,
+    // :3314; flash-attn-ops.c:2804, :2860, :2933), and those are the dense and
+    // shared-selection paths. Worse, the waiter competes for a hardware thread with the
+    // HMX thread it is waiting on -- n_hvx workers plus the HMX thread is one more
+    // runnable thread than there are hardware threads -- so a tighter spin here steals
+    // cycles from the very job it is waiting for.
     struct hmx_queue_desc * d = &q->desc[ip];
     while (!atomic_load(&d->done)) {
         FARF(HIGH, "hmx-queue-pop: waiting for HMX queue : %u\n", ip);

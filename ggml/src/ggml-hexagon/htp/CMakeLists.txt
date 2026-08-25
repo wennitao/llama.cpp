@@ -50,6 +50,20 @@ target_compile_definitions(${HTP_LIB} PRIVATE
     $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,HTP_DEBUG=1,NDEBUG=1>
     $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,FARF_HIGH=1,>)
 
+# Rendezvous-spin tuning knobs. Left unset the headers pick their own defaults
+# (hex-utils.h, work-queue.h); set them to sweep the pause/duty tradeoff without
+# editing sources. HEX_PAUSE_SHORT_IMM=255 is the bit-exact no-op control for the
+# pause immediate, and WORK_QUEUE_FAST_SPIN=0 is the control for the fast window.
+if (HEX_PAUSE_SHORT_IMM)
+    target_compile_definitions(${HTP_LIB} PRIVATE HEX_PAUSE_SHORT_IMM=${HEX_PAUSE_SHORT_IMM})
+endif()
+if (DEFINED WORK_QUEUE_FAST_SPIN AND NOT WORK_QUEUE_FAST_SPIN STREQUAL "")
+    target_compile_definitions(${HTP_LIB} PRIVATE WORK_QUEUE_FAST_SPIN=${WORK_QUEUE_FAST_SPIN})
+endif()
+if (DEFINED HMX_QUEUE_COND_WAKE AND NOT HMX_QUEUE_COND_WAKE STREQUAL "")
+    target_compile_definitions(${HTP_LIB} PRIVATE HMX_QUEUE_COND_WAKE=${HMX_QUEUE_COND_WAKE})
+endif()
+
 
 build_idl(htp_iface.idl ${HTP_LIB})
 

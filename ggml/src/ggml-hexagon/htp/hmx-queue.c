@@ -78,7 +78,23 @@ static void hmx_queue_thread(void * arg) {
             }
             if (--poll_cnt) { hex_pause(); continue; }
             FARF(HIGH, "hmx-queue-thread: sleeping");
-            qurt_futex_wait(&q->seqn, prev_seqn);
+
+            // Publish that we are about to sleep so hmx_queue_push can skip its futex
+            // syscall in the (overwhelmingly common) case where we are still spinning.
+            // Both accesses are seq_cst on purpose: this store must not sink below the
+            // seqn load, or a concurrent push could observe sleeping == 0 while we
+            // observe the old seqn and sleep forever. The re-check also absorbs a wake
+            // that lands between the store and futex_wait entry.
+            if (HMX_QUEUE_COND_WAKE) {
+                atomic_store(&q->sleeping, 1);
+                if (atomic_load(&q->seqn) == prev_seqn) {
+                    qurt_futex_wait(&q->seqn, prev_seqn);
+                }
+                atomic_store(&q->sleeping, 0);
+            } else {
+                qurt_futex_wait(&q->seqn, prev_seqn);
+            }
+
             poll_cnt = HMX_QUEUE_POLL_COUNT;
             continue;
         }
