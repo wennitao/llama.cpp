@@ -599,3 +599,68 @@ the sink and the diagonal block, and causal masking means adjacent query blocks 
 the same candidate pool -- but that is an argument, not a measurement, and the crossover is at
 f=0.5, not at a bar that structure alone obviously clears. Measuring `f` on real model
 activations is the deciding experiment.
+
+## The deciding measurement: real overlap, on real activations
+
+`examples/xattn-overlap` runs a real Qwen3-1.7B prefill, captures every layer's post-RoPE
+`Qcur`/`Kcur` through the eval callback, and runs the real XAttention estimator over them.
+This is the quantity the whole Bq question turned on, and it could not be obtained from the
+test harness: random Q/K give near-uniform softmax scores and essentially random top-k, which
+understates overlap badly.
+
+**2314-token prefill, Bl=64, S=16, keep = nblk/4 (25% density), all 28 layers:**
+
+```
+mean adjacent-block overlap f = 0.779   (6048 pairs)
+per-layer  min 0.744   median 0.785   max 0.827
+```
+
+Strikingly uniform across depth. Both crossovers are cleared: `Bq=128` needs f >= 0.50,
+`Bq=256` needs f >= 0.75.
+
+### The union saturates, and that is the real finding
+
+Adjacent overlap alone does not give the union for R > 2, so the tool measures `|union|`
+directly:
+
+| R | Bq | mean \|union\| | of a possible | u/k |
+|--:|--:|--:|--:|--:|
+| 2 | 128 | 10.84 | 18 | 1.20x |
+| 4 | 256 | 14.06 | 36 | 1.56x |
+| 8 | 512 | **17.36** | 72 | **1.93x** |
+
+Going R=4 -> R=8 adds only 3.3 blocks. The union is **sub-linear and saturating**, because the
+sink and recent blocks are shared by *every* query block, not merely adjacent ones. So a single
+selection covering an entire nb=512 chunk needs only about twice the blocks of an exact
+per-query-block one.
+
+### Which makes the per-query-block kernel the wrong tool
+
+Pricing that directly -- one shared selection over the whole chunk, no per-query-block
+machinery at all:
+
+| | time µs | |
+|:--|--:|:--|
+| dense (all 32 blocks) | 2078 | |
+| exact per-scorer-block, Bq=64, k=8 | 1862 | |
+| whole-chunk union, n_sel=17 | **3380** | 17 is prime -> 17 chunks |
+| **whole-chunk union, n_sel=18** | **1365** | m=6, 3 chunks |
+| whole-chunk union, n_sel=16 | 1350 | m=8, 2 chunks |
+
+Rounding the measured 17.36 **up** to 18 -- a true superset of every query block's selection --
+costs **1365 µs, which is 1.36x faster than the exact per-query-block path (1862 µs) and 1.52x
+faster than dense.** It also needs none of the per-query-block kernel machinery.
+
+The sawtooth bites hardest here: **n_sel=17 costs 2.48x more than n_sel=18**, from one extra
+block, because 17 is prime and runs 17 KV chunks.
+
+### Honest caveats
+
+- A union without a mask attends to a **superset**, so it is a *stronger* approximation than
+  XAttention specifies, not the same one. Making it exact needs the per-row mask, which costs
+  mask DMA. Whether the superset hurts or helps quality is unmeasured.
+- 17.36 is a **mean**. Sizing for the worst case, or clamping and accepting an approximation,
+  is a design decision this measurement does not make.
+- f and |union| were measured on one model, one prompt, at one density. The per-layer spread is
+  tight (0.744-0.827), which is encouraging, but a second model would be worth checking before
+  treating 1.93x as universal.

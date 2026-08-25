@@ -12031,6 +12031,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         GGML_UNUSED(nb);
     }
 
+    // Union-over-the-whole-chunk pricing. Measured on real Qwen3-1.7B activations
+    // (examples/xattn-overlap), the union of R adjacent query blocks' XAttention
+    // selections SATURATES: |union|/k is 1.20 at R=2, 1.56 at R=4, 1.93 at R=8, because
+    // the sink and recent blocks are shared by every query block rather than just
+    // adjacent ones. So one shared selection covering a whole nb=512 chunk needs only
+    // ~2x the blocks -- and needs none of the per-query-block machinery. These rows price
+    // that against the 1862 us an exact per-scorer-block selection costs.
+    for (int n_sel : { 8, 10, 12, 14, 16, 17, 18, 20 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, 2048, 512, 64, n_sel, /*mask=*/false));
+    }
+
     // Attribute the per-query-block penalty. The MAC count is identical across every
     // row here -- only the SCHEDULE changes -- so any difference is tiling cost alone.
     //
