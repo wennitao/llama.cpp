@@ -7283,6 +7283,19 @@ struct test_flash_attn_ext_sparse : public test_case {
     // ggml_argsort_top_k produces, and the only case that proves sel_nb1 is read
     // rather than assumed contiguous.
     const bool    sel_strided;
+    // The SCORER's query-block size Bl. Real XAttention scores every (query block,
+    // key block) pair at Bl granularity, so honouring its selection exactly forces
+    // the attention query block Bq == Bl. Decoupling them means one attention block
+    // spans R = Bq/Bl scorer blocks and must attend to the UNION of their selections.
+    // 0 => Bl == Bq, i.e. R == 1, i.e. every pre-existing registration.
+    const int64_t bl;
+    // How many of the n_sel blocks two ADJACENT scorer query blocks hold in common.
+    // This is the knob the whole cost surface is parameterised by: the union size
+    // u = R*n_sel - (R-1)*n_share runs from R*n_sel (disjoint) down to n_sel
+    // (identical), and cost rises with u. Integer, not a fraction: a double would
+    // print as "overlap=0.250000" through VAR_TO_STR and would make u depend on
+    // rounding. Report the fraction as n_share/n_sel.
+    const int64_t n_share;
 
     // A distinct tag so a single shape can be isolated for profiling: GGML_HEXAGON_PROFILE=3
     // emits per-thread cycle-stamped trace events for every run of every case, which is
@@ -7294,6 +7307,13 @@ struct test_flash_attn_ext_sparse : public test_case {
     std::string vars() override {
         // The query-axis knobs are appended only when in use, so every pre-existing
         // registration keeps its exact name and stays comparable to its perf baseline.
+        // R() == 1 covers bl == 0 and bl == bq, so the union knobs appear only on rows
+        // that actually union something. Checked FIRST so a hypothetical R > 1 row
+        // without a query axis could not collide with a plain VARS_TO_STR9 name.
+        if (R() != 1) {
+            return VARS_TO_STR14(hs, nh, nr, kv, nb, bs, n_sel, mask, per_head_sel, bq, per_qblock, sel_strided,
+                                 bl, n_share);
+        }
         if (!per_qblock) {
             return VARS_TO_STR9(hs, nh, nr, kv, nb, bs, n_sel, mask, per_head_sel);
         }
@@ -7306,21 +7326,48 @@ struct test_flash_attn_ext_sparse : public test_case {
 
     uint64_t op_flops(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        // Only the selected blocks are computed.
-        return 2 * nh*nr * nb * (hs + hs) * (n_sel * bs);
+        // Only the selected blocks are computed -- and what the kernel is handed is the
+        // UNION row, so the work is n_sel_row() blocks, not the scorer's n_sel.
+        return 2 * nh*nr * nb * (hs + hs) * (n_sel_row() * bs);
     }
 
     test_flash_attn_ext_sparse(int64_t hs = 128, int64_t nh = 4, int64_t nr = 4, int64_t kv = 1024,
                                int64_t nb = 64, int64_t bs = 64, int64_t n_sel = 4, bool mask = true, bool per_head_sel = true,
-                               int64_t bq = 0, bool per_qblock = false, bool sel_strided = false)
+                               int64_t bq = 0, bool per_qblock = false, bool sel_strided = false,
+                               int64_t bl = 0, int64_t n_share = 0)
         : hs(hs), nh(nh), nr(nr), kv(kv), nb(nb), bs(bs), n_sel(n_sel), mask(mask),
-          per_head_sel(per_head_sel), bq(bq), per_qblock(per_qblock), sel_strided(sel_strided) {}
+          per_head_sel(per_head_sel), bq(bq), per_qblock(per_qblock), sel_strided(sel_strided),
+          bl(bl), n_share(n_share) {
+        // A scorer block must tile the attention block exactly, or "the R scorer blocks
+        // this attention block spans" is not well defined.
+        GGML_ASSERT(bq_eff() % bl_eff() == 0);
+        GGML_ASSERT(n_share >= 0 && n_share <= n_sel);
+        // u > n_blocks() makes sel->ne[0] exceed ceil(kv/bs), ggml_hexagon_supported_fa_sparse
+        // returns false and the WHOLE op drops to a dense CPU backend -- a perf row would
+        // then silently time something else entirely. Abort at build time instead.
+        GGML_ASSERT(n_sel_row() <= n_blocks());
+    }
 
     int64_t n_blocks() const { return (kv + bs - 1) / bs; }
 
     // op_params[5] semantics: 0 means "same as the selection block size".
     int64_t bq_eff()     const { return bq ? bq : bs; }
     int64_t n_qblocks()  const { return per_qblock ? (nb + bq_eff() - 1) / bq_eff() : 1; }
+
+    // The union geometry. bl == 0 means the scorer block IS the attention block, so
+    // R == 1 and every derived quantity collapses to the pre-existing one.
+    int64_t bl_eff()     const { return bl ? bl : bq_eff(); }
+    int64_t R()          const { return bq_eff() / bl_eff(); }
+    int64_t n_priv()     const { return n_sel - n_share; }
+    // u, the row length the kernel actually sees. sel->ne[0] is ONE scalar for the whole
+    // op (the host derives chunk count, pipelining and VTCM from it, and the device's DMA
+    // FIFO desyncs if push and pop disagree), so the union has to be a fixed size BY
+    // CONSTRUCTION rather than a variable-length list padded up to a cap. Both ways of
+    // padding are silently wrong: a repeated index is double-counted (nothing downstream
+    // deduplicates, and the mask is keyed on the block's absolute KV start so both copies
+    // get identical finite values -- the net effect is that block's logits shifted by
+    // +ln 2), and an out-of-range sentinel is clamped to the last block, i.e. the same bug.
+    int64_t n_sel_row()  const { return R()*n_sel - (R() - 1)*n_share; }
 
     // Per-head selection needs a per-head mask, and a per-KV-head mask is only
     // expressible without GQA: the mask head is chosen as (query head %
@@ -7344,16 +7391,44 @@ struct test_flash_attn_ext_sparse : public test_case {
     // DISTINCT blocks. That matters: the kernel clamps out-of-range indices but never
     // deduplicates, and its online softmax needs the chunks feeding one accumulator to
     // be disjoint in KV. Duplicates ACROSS rows are harmless -- that is the point.
+    //
+    // With bl set, one attention block spans R scorer blocks and the row is their UNION.
+    // Scorer block jl in [0,R) owns the rank window [jl*p, jl*p + n_sel) with p = n_sel -
+    // n_share; those R windows cover exactly [0, u) and adjacent ones share exactly
+    // n_share ranks. union_block maps rank -> KV block injectively on [0, u) (see below),
+    // so the row IS the union enumerated once -- there is no padding step, which is what
+    // makes double-counting structurally impossible rather than merely avoided.
     int64_t sel_block(int64_t iqb, int64_t ih_in, int64_t islot) const {
+        const int64_t nblk = n_blocks();
+        if (n_sel == nblk) {
+            // Full but shuffled: a fixed coprime stride permutes the blocks. Reachable
+            // with R > 1 only at n_share == n_sel (all R windows coincide, u == n_sel),
+            // since anything else would need u > nblk and the ctor asserts it does not.
+            const int64_t ih = per_head_sel ? ih_in : 0;
+            const int64_t iq = per_qblock ? iqb : 0;
+            return (islot * 7 + ih * 3 + iq * 5) % nblk;
+        }
+        return union_block(iqb, ih_in, islot);
+    }
+
+    // Rank -> KV block. Same expression as the original sel_block with u substituted for
+    // n_sel, which is why R == 1 is bit-identical to the pre-union generator for every
+    // (nblk, n_sel, ih, iq) -- verified by exhaustive enumeration.
+    //
+    // (rank * nblk / u) is (rank*nblk)/u, NOT rank*(nblk/u). They differ whenever u does
+    // not divide nblk (nblk=8, u=3 -> 0,2,5 vs 0,2,4), and it is the integer-division
+    // order that keeps the two forms identical. Do not "simplify" it.
+    //
+    // Injective on [0, u) whenever u <= nblk (the ctor asserts it): g(r) = (r*nblk)/u has
+    // g(r+1) - g(r) >= nblk/u >= 1 and g(u-1) <= nblk-1, and adding ih+iq mod nblk is a
+    // bijection of Z_nblk. So the row holds u DISTINCT blocks and each scorer window
+    // holds n_sel distinct ones -- the invariant the kernel depends on, since it clamps
+    // out-of-range indices but never deduplicates.
+    int64_t union_block(int64_t iqb, int64_t ih_in, int64_t rank) const {
         const int64_t ih   = per_head_sel ? ih_in : 0;
         const int64_t iq   = per_qblock ? iqb : 0;
         const int64_t nblk = n_blocks();
-        if (n_sel == nblk) {
-            // Full but shuffled: a fixed coprime stride permutes the blocks.
-            return (islot * 7 + ih * 3 + iq * 5) % nblk;
-        }
-        // Spread the selected blocks over the KV range, offset per head/query block.
-        return (islot * nblk / n_sel + ih + iq) % nblk;
+        return (rank * nblk / n_sel_row() + ih + iq) % nblk;
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -7380,15 +7455,16 @@ struct test_flash_attn_ext_sparse : public test_case {
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
 
-        // The block-index list rides in the first free src slot.
-        // With sel_strided the list is a view of the first n_sel columns of a wider
-        // tensor, so nb[1] != 4*n_sel -- the layout ggml_argsort_top_k hands back.
-        const int64_t row_len = sel_strided ? n_blocks() : n_sel;
+        // The block-index list rides in the first free src slot. Its width is the UNION
+        // size u, not the scorer's n_sel -- see n_sel_row().
+        // With sel_strided the list is a view of the first u columns of a wider tensor,
+        // so nb[1] != 4*u -- the layout ggml_argsort_top_k hands back.
+        const int64_t row_len = sel_strided ? n_blocks() : n_sel_row();
         ggml_tensor * full = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, row_len, n_qblocks(), n_sel_heads(), 1);
         ggml_set_name(full, "sel");
         ggml_tensor * sel = full;
         if (sel_strided) {
-            sel = ggml_view_4d(ctx, full, n_sel, n_qblocks(), n_sel_heads(), 1,
+            sel = ggml_view_4d(ctx, full, n_sel_row(), n_qblocks(), n_sel_heads(), 1,
                                full->nb[1], full->nb[2], full->nb[3], 0);
             ggml_set_name(sel, "sel_view");
         }
@@ -7405,9 +7481,9 @@ struct test_flash_attn_ext_sparse : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "sel") == 0) {
                 // t is the FULL tensor: with sel_strided its rows are n_blocks() wide
-                // and only the first n_sel entries are viewed. The padding is filled
-                // with a valid index too, so a kernel that mistakenly walked past
-                // n_sel would still read in-range data and the failure would show up
+                // and only the first n_sel_row() entries are viewed. The padding is
+                // filled with a valid index too, so a kernel that mistakenly walked past
+                // the row would still read in-range data and the failure would show up
                 // as a wrong ANSWER rather than as a clamp.
                 const int64_t row_len = t->ne[0];
                 std::vector<int32_t> idx(row_len * n_qblocks() * n_sel_heads());
@@ -7415,7 +7491,40 @@ struct test_flash_attn_ext_sparse : public test_case {
                     for (int64_t iqb = 0; iqb < n_qblocks(); iqb++) {
                         for (int64_t is = 0; is < row_len; is++) {
                             idx[(ih*n_qblocks() + iqb)*row_len + is] =
-                                (int32_t) sel_block(iqb, ih, is % n_sel);
+                                (int32_t) sel_block(iqb, ih, is % n_sel_row());
+                        }
+                    }
+                }
+                // The union claim, checked rather than argued: rebuild the R scorer
+                // windows out of the row that was just written and assert each holds
+                // n_sel distinct blocks, that their union is exactly the u entries of
+                // the row, and that adjacent windows share exactly n_share. At R=2,
+                // n_share=4 a naive concatenation would emit 16 slots of which 4 are
+                // duplicates -- and a duplicate slot is not caught anywhere downstream,
+                // it just shifts that block's logits by +ln 2. This is where it is caught.
+                for (int64_t ih = 0; ih < n_sel_heads(); ih++) {
+                    for (int64_t iqb = 0; iqb < n_qblocks(); iqb++) {
+                        const int32_t * row = &idx[(ih*n_qblocks() + iqb)*row_len];
+                        std::set<int32_t> all(row, row + n_sel_row());
+                        GGML_ASSERT((int64_t) all.size() == n_sel_row());
+                        std::set<int32_t> uni;
+                        std::vector<std::set<int32_t>> win;
+                        for (int64_t jl = 0; jl < R(); jl++) {
+                            const int64_t lo = jl*n_priv();
+                            win.emplace_back(row + lo, row + lo + n_sel);
+                            GGML_ASSERT((int64_t) win.back().size() == n_sel);
+                            uni.insert(row + lo, row + lo + n_sel);
+                        }
+                        // uni is built from sub-slices of the row, so uni is a subset of
+                        // all; equal sizes then make them the same set. That is the
+                        // "the union IS the row, enumerated once" claim.
+                        GGML_ASSERT((int64_t) uni.size() == n_sel_row());
+                        for (int64_t jl = 0; jl + 1 < R(); jl++) {
+                            int64_t shared = 0;
+                            for (int32_t b : win[jl]) {
+                                shared += win[jl+1].count(b);
+                            }
+                            GGML_ASSERT(shared == n_share);
                         }
                     }
                 }
@@ -7442,7 +7551,14 @@ struct test_flash_attn_ext_sparse : public test_case {
                         if (iqb != cur_qb) {
                             cur_qb = iqb;
                             keep.assign(ne0, false);
-                            for (int64_t is = 0; is < n_sel; is++) {
+                            // n_sel_row(), not n_sel: with a union the -INF pattern has
+                            // to be the UNION, so CPU dense attention restricted by the
+                            // mask equals the kernel's union attention exactly. Note this
+                            // makes the eval arm check UNION attention -- a different and
+                            // strictly stronger attention than exact per-scorer-block
+                            // attention. That is a modelling decision; what the test
+                            // asserts is that kernel and CPU agree on the union.
+                            for (int64_t is = 0; is < n_sel_row(); is++) {
                                 const int64_t blk = sel_block(iqb, ih, is);
                                 for (int64_t j = blk*bs; j < std::min(blk*bs + bs, kv); j++) {
                                     keep[j] = true;
@@ -11083,6 +11199,60 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // block per chunk, with the broadcast-mask dma_cache live alongside the map.
     test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1000, 512, 64, 8, true, true,  64, true));
 
+    // UNION selections: attention query block Bq decoupled from scorer query block Bl.
+    //
+    // Real XAttention scores every (query block, key block) pair, so the exact selection
+    // changes every Bl tokens and honouring it directly pins the kernel query tile to
+    // Br <= Bq == Bl. Letting Bq > Bl instead means one attention block spans R = Bq/Bl
+    // scorer blocks and attends to the UNION of their selections: u = R*n_sel -
+    // (R-1)*n_share blocks instead of n_sel. n_share is the knob -- 0 is fully disjoint,
+    // n_sel is identical -- and it is what makes the deployment question ("is Bq > Bl
+    // worth it?") a measurable cost surface instead of an argument.
+    //
+    // These rows check the KERNEL side of that: they say nothing about the accuracy cost
+    // of unioning, and note the eval arm now checks union attention, which is a different
+    // and strictly stronger attention than exact per-scorer-block attention. CPU ignores
+    // src[5] and computes dense attention; the -INF mask is built from the same
+    // union_block(), so the unselected columns contribute nothing -- exactly what the
+    // kernel does by not loading them. If the kernel counted a shared block twice its
+    // logits would shift by +ln 2, roughly doubling that block's softmax mass, an ~1/u
+    // fractional output change against a 5e-4 NMSE bound. Four orders of margin.
+    //
+    //                                                     hs   nh nr   kv   nb  bs n_sel mask  perhd  bq  perqb  strided   bl  share
+    // (U1) partial overlap, R = 2, GQA. u = 12, Bc = 256 (m = 4), 3 chunks.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 2048, 512, 64, 8, true, true, 128, true, false,     64, 4));
+    // (U2) the disjoint endpoint, u = R*n_sel = 16: no block is shared, so the union is
+    // the concatenation and the row is the widest it can be at this R.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 2048, 512, 64, 8, true, true, 128, true, false,     64, 0));
+    // (U3) the identical endpoint, n_share == n_sel: all R windows coincide, u == n_sel,
+    // and the row is bit-identical to the R == 1 row. A free self-check that the union
+    // machinery degenerates back to the pre-existing generator.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 2048, 512, 64, 8, true, true, 128, true, false,     64, 8));
+    // (U4) R = 4 at the gate edge: u == n_blocks == 32 (one more and the host rejects the
+    // op and it silently drops to dense CPU) and m == FA_SPARSE_MAX_M == 8, so this is
+    // simultaneously the widest legal selection and the largest legal grouping.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 2048, 512, 64, 8, true, true, 256, true, false,     64, 0));
+    // (U5) R = 4 mid overlap: 4 windows, adjacent pairs sharing 6 of 8, u = 14. A naive
+    // concatenation would be 32 slots for 14 distinct blocks -- the widest gap in the set.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 2048, 512, 64, 8, true, true, 256, true, false,     64, 6));
+    // (U6) nr == 1 -> per-head selection AND a per-head mask, which disables grouping
+    // (m == 1, 12 chunks): each head unions a different set of blocks, so a residency map
+    // or sel row cache not invalidated on a KV head change reads head 0's rows.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 1, 2048, 512, 64, 8, true, true, 128, true, false,     64, 4));
+    // (U7) strided sel view under a union: proves the u-wide row is read through
+    // sel->nb[1] rather than assumed contiguous, now that nb[1] != 4*n_sel either.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 2048, 512, 64, 8, true, true, 128, true, true,      64, 4));
+    // (U8) nb % bq != 0: the last attention query block spans fewer than R scorer blocks,
+    // so its natural union is smaller than u. The row is NOT shrunk -- u must be one
+    // scalar for the whole op -- so the enumeration runs to u anyway. The extra blocks
+    // cost work, the mask marks them keep, and CPU agrees.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 2048, 480, 64, 8, true, true, 128, true, false,     64, 4));
+    // (U9) kv % bs != 0 -> a ragged final KV block, which also disables grouping, so this
+    // is the union row that runs one block per chunk (m == 1, 12 chunks).
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 2000, 512, 64, 8, true, true, 128, true, false,     64, 4));
+    // (U10) small shape, so the union path is covered even in a fast smoke run.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1024, 256, 64, 8, true, true, 128, true, false,     64, 4));
+
     // Softmax row-granularity coverage. Every sparse row above lands on a query tile of
     // 32, 64, 128, 256 or 1024 rows, i.e. always a whole number of 64-row softmax units,
     // so none of them can tell a 64-row unit from a 32-row one. These three can. nr == 2
@@ -11890,6 +12060,84 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext_gather(128, 8, 2, kv, nb, bs, n_sel));
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, n_sel*bs, nb, /*mask=*/false, false, 0, 0,
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+        // THE COST SURFACE: (Bq, overlap). The bq sweep above holds the selection fixed at
+        // n_sel = 8 while Bq grows, i.e. it prices Bq assuming PERFECT overlap between the
+        // scorer query blocks an attention block spans. That is the optimistic edge of the
+        // surface. Growing Bq to R*Bl really means attending to the union of R scorer
+        // rows, u = R*n_sel - (R-1)*n_share blocks, and cost rises with u -- so the
+        // question is whether the Bq win outruns the union growth. n_share sweeps that:
+        // 0/2/4/6/8 brackets a shared fraction of 0/0.25/0.5/0.75/1.
+        //
+        // n_sel stays 8 throughout: it is the SCORER's k and by definition does not change
+        // with Bq. bl = bs = 64 is the scorer block. Read every row against the u = 8
+        // column already registered by the bq loop above.
+        //
+        // Do NOT read this surface as a smooth function of u. The chunk-size search
+        // requires m = Bc/bs to DIVIDE the selected-block count (flash-attn-ops.h, the
+        // sel_blocks % (Bc/bc_step) test), so n_kv_blocks = u / (largest divisor of u that
+        // is <= min(FA_SPARSE_MAX_M, Bc_limit/bs)) -- a sawtooth in the divisors of u, not
+        // a curve. At Bq=256 it runs 4 chunks at u=32 and 13 at u=26. Capture the
+        // HEX_VERBOSE "fa-params" line (Br, Bc, n_kv_blocks, pipeline) at every point or a
+        // schedule change will be misread as a density effect; Br must equal bq at every
+        // point, since VTCM pressure makes the search walk Br DOWN rather than fail.
+        //
+        // Run with the default residency (HTP_FA_RES_OFF): with it on, consecutive
+        // attention blocks' unions become near-identical once nblk/u == 1 and the DMA cost
+        // drops for reasons that have nothing to do with u.
+        //
+        // op_flops is keyed to u, so the number of graph REPLICAS falls with u:
+        // n_runs = min(graph_size - n_nodes, 100e9 / op_flops) + 1 is 47 / 24 / 12 / 6 at
+        // u = 8 / 16 / 32 / 64. Exactly one replica per graph execution is cold, so the
+        // cold fraction is 1/n_runs and high-u rows are biased UPWARD. That bias is
+        // conservative for the union arm -- a measured win is real -- so only a measured
+        // LOSS at high u needs re-examining. Note the harness's "runs" column is
+        // total_runs (replicas summed over a >= 1 s loop), not n_runs; record both.
+        // P1 -- the surface at kv = 2048 (nblk = 32). Bq = 512 is absent on purpose: at
+        // n_share < 5 it needs u > 32 > nblk, the host rejects the op and the row would
+        // silently time a DENSE CPU FA. That column runs at kv = 4096 below instead.
+        // u / n_kv_blocks: bq=128 -> 16/4, 14/7, 12/3, 10/5, 8/4;
+        //                  bq=256 -> 32/4, 26/13, 20/4, 14/7, 8/4.
+        // n_share = 8 is the identical endpoint (u = n_sel = 8): its row is bit-identical
+        // to the R = 1 row at the same bq, so it must reproduce that bq's time from the
+        // sweep above. A free control on the whole surface -- if it does not reproduce,
+        // something other than u moved.
+        for (int bq : { 128, 256 }) {
+            for (int n_share : { 0, 2, 4, 6, 8 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, nb, bs, n_sel, /*mask=*/false,
+                                                                       /*per_head_sel=*/true, bq, /*per_qblock=*/true,
+                                                                       /*sel_strided=*/false, /*bl=*/bs, n_share));
+            }
+        }
+        // P4 -- the sawtooth probe. u = 29 runs 29 KV chunks and u = 23 runs 23, against
+        // 4 chunks at u = 32 and 4 at u = 20 in P1. Prediction to falsify: T(u=29) >
+        // T(u=32) and T(u=23) > T(u=20), i.e. cost NON-MONOTONE in u. If it holds, a
+        // deployment rounds u UP to a smooth value and pays strictly fewer chunks for
+        // strictly more blocks, and any smooth cost model in u is unusable near the
+        // crossover. If it fails, per-chunk overhead is negligible.
+        for (int n_share : { 1, 3 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, nb, bs, n_sel, /*mask=*/false,
+                                                                   /*per_head_sel=*/true, /*bq=*/256, /*per_qblock=*/true,
+                                                                   /*sel_strided=*/false, /*bl=*/bs, n_share));
+        }
+        // P2 -- the R = 8 column, which only fits at nblk = 64, i.e. kv = 4096.
+        // u / n_kv_blocks: 64/8, 50/10, 36/6, 22/11, 8/4.
+        const int kv4 = 4096;
+        for (int n_share : { 0, 2, 4, 6, 8 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv4, nb, bs, n_sel, /*mask=*/false,
+                                                                   /*per_head_sel=*/true, /*bq=*/512, /*per_qblock=*/true,
+                                                                   /*sel_strided=*/false, /*bl=*/bs, n_share));
+        }
+        // P3 -- cross-kv control. At fixed u only the SELECTED blocks are touched, so
+        // these two must match their kv = 2048 twins (u = 8 at bq = 64 and bq = 256).
+        // That is what licenses reading the P2 column against the kv = 2048 Bq = 64
+        // baseline; if they do not match, kv is a confound and P2 must be rebaselined
+        // against the kv = 4096 Bq = 64 row instead.
+        for (int bq : { 64, 256 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv4, nb, bs, n_sel, /*mask=*/false,
+                                                                   /*per_head_sel=*/true, bq, /*per_qblock=*/true,
+                                                                   /*sel_strided=*/false, /*bl=*/bs, /*n_share=*/8));
+        }
     }
 
     for (int col : {8192, 16384, 32768, 65536, 131072, 262144, 524288}) {

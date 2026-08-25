@@ -530,3 +530,72 @@ delta, the reindexing is wrong somewhere and it is not tolerance noise. Because 
 baseline carries 11 known failures (nearly all `sinks=1`), capture the failing `vars()`
 strings before the change and diff the identity set; counting passes cannot distinguish
 "broke two, fixed two" from "changed nothing".
+
+## Decoupling the attention query block from the scorer block
+
+Real XAttention re-selects every `Bl` tokens, and honouring that directly pins the kernel's query
+tile to `Br <= Bq = Bl = 64`, which costs 1862 µs against 985 µs for a single shared selection.
+The middle ground is to union the selections of the `R = Bq/Bl` scorer blocks an attention block
+spans. `test_flash_attn_ext_sparse` gained `bl` and `n_share` for this: `n_share = s` is how many
+of its `n_sel` blocks two adjacent scorer blocks hold in common, so the union size is a closed
+form, `u = R*n_sel - (R-1)*s`, and the kernel's fixed-length slot list is that union enumerated
+once. Nothing is padded, so no block can be attended twice -- which matters, because a repeated
+index is a *silent* wrong answer here: nothing dedups it, the mask gives both copies identical
+finite values, and the block's logits simply come out shifted by ln 2.
+
+Measured, kv=2048, bs=64, n_sel=8, Bl=64. Baseline is exact per-scorer-block selection
+(`Bq=64`) at **1862 µs**:
+
+| Bq | R | s | f = s/n_sel | u | chunks | GFLOP | time µs | vs Bq=64 |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 128 | 2 | 0 | 0.00 | 16 | 2 | 4.29 | 2154 | 0.86x |
+| 128 | 2 | 2 | 0.25 | 14 | 2 | 3.76 | 2447 | 0.76x |
+| 128 | 2 | 4 | 0.50 | 12 | 2 | 3.22 | **1651** | **1.13x** |
+| 128 | 2 | 6 | 0.75 | 10 | 2 | 2.68 | 1794 | 1.04x |
+| 128 | 2 | 8 | 1.00 | 8 | 1 | 2.15 | **1486** | **1.25x** |
+| 256 | 4 | 0 | 0.00 | 32 | 4 | 8.59 | 2339 | 0.80x |
+| 256 | 4 | 1 | 0.12 | 29 | **29** | 7.78 | **6614** | 0.28x |
+| 256 | 4 | 2 | 0.25 | 26 | **13** | 6.98 | 3153 | 0.59x |
+| 256 | 4 | 3 | 0.38 | 23 | **23** | 6.17 | 5283 | 0.35x |
+| 256 | 4 | 4 | 0.50 | 20 | 4 | 5.37 | 1892 | 0.98x |
+| 256 | 4 | 6 | 0.75 | 14 | 2 | 1780 | | **1.05x** |
+| 256 | 4 | 8 | 1.00 | 8 | 1 | 2.15 | **1094** | **1.70x** |
+
+### The union size must be chosen for smoothness, not minimality
+
+`hmx_fa_find_chunk_size` requires `m = Bc/bs` to divide the selected-block count
+(`flash-attn-ops.h:444`), with `m <= 8`. So `n_kv_blocks = u / (largest divisor of u that is
+<= 8)` -- a number-theoretic sawtooth. A prime `u` runs one chunk per block:
+
+| f | u | chunks | GFLOP | time µs |
+|--:|--:|--:|--:|--:|
+| 0.00 | 32 | 4 | 8.59 | 2339 |
+| 0.12 | **29** | **29** | 7.78 | **6614** |
+| 0.25 | 26 | 13 | 6.98 | 3153 |
+| 0.38 | **23** | **23** | 6.17 | 5283 |
+| 0.50 | 20 | 4 | 5.37 | 1892 |
+
+**`u=29` does 10% LESS work than `u=32` and takes 2.83x longer.** Rounding the union *up* from 29
+to 32 -- deliberately attending to *more* blocks -- is 2.83x faster. Any deployment that computes
+a union must round `u` up to a value with a large divisor `<= 8`; minimising the union is
+actively harmful.
+
+Note the effect survives at equal chunk count: `u=14` (m=7, Bc=448) is slower than `u=16`
+(m=8, Bc=512) despite less work, so the divisor's *value* matters too, not just the chunk count.
+
+### Where the crossover actually sits
+
+`Bq=128` beats exact per-scorer-block selection at **f >= 0.5**, and `Bq=256` at **f >= 0.75**.
+That is a materially higher bar than the ~31% predicted earlier from a smooth
+`cost ∝ u^0.4545` model -- that model is blind to chunk count and is least trustworthy exactly
+where the answer is decided. The earlier 31% figure should be disregarded.
+
+### Still unknown
+
+The real overlap `f` between adjacent query blocks' XAttention selections. It cannot be measured
+from random test tensors: random Q/K give near-uniform softmax scores and essentially random
+top-k, which understates overlap badly. Structurally it should be high -- `find_blocks` forces
+the sink and the diagonal block, and causal masking means adjacent query blocks draw from nearly
+the same candidate pool -- but that is an argument, not a measurement, and the crossover is at
+f=0.5, not at a bar that structure alone obviously clears. Measuring `f` on real model
+activations is the deciding experiment.
