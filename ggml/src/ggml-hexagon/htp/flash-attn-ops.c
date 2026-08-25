@@ -128,6 +128,26 @@ struct hmx_fa_context {
     uint32_t     mask_slot_stride; // __fp16 elements per mask double-buffer slot
     bool         mask_use_cache;   // m == 1 && broadcast: keep the dma_cache fast path
 
+    // ---- KV block residency (per-query-block sparse only; NULL disables everything) ----
+    //
+    // One VTCM slot per KV block INDEX, holding that block's raw DMA'd fp16 rows with
+    // the same row stride as the staging buffers. Direct-mapped (slot == block index),
+    // so within one (sequence, KV head) a slot is never reused for a different block:
+    // there is no eviction, no replacement policy, and no way for an in-flight job to
+    // reference a slot that is about to be rewritten.
+    __fp16 *     k_res;
+    __fp16 *     v_res;
+    size_t       k_res_slot;       // bytes per K slot = sparse_bs * size_k_row_padded
+    size_t       v_res_slot;       // bytes per V slot = sparse_bs * size_v_row_padded
+    bool         res_force_miss;   // debug: exercise the slot plumbing, never claim a hit
+    uint32_t     res_epoch_ib3;    // the (sequence, KV head) the valid bits describe
+    uint32_t     res_epoch_kv_head;
+    // Set at PUSH time, and read only by the pusher. K and V need SEPARATE bitmaps:
+    // fa_push_chunk runs its K loop first, so one shared bitmap would let the V loop
+    // see the K loop's bit and skip a transfer that never happened.
+    uint32_t     k_res_valid[FA_RES_MAX_BLOCKS / 32];
+    uint32_t     v_res_valid[FA_RES_MAX_BLOCKS / 32];
+
     // Types
     bool         is_q_fp32;
     bool         is_dst_fp32;
@@ -209,14 +229,35 @@ static inline uint32_t fa_chunk_nblk(const struct hmx_fa_context * factx, uint32
     return base < factx->n_sel ? (uint32_t) hex_smin(factx->m, factx->n_sel - base) : 0;
 }
 
-// KV row offset of the j'th selected block of chunk c, for query block qb.
+// Index of the j'th selected block of chunk c, for query block qb.
 //
-// Dense: blocks are walked in order, so chunk c starts at c * Bc. Sparse: the
-// selection list names which blocks to visit. qb picks the row of that list: with
-// a query axis every query block retrieves from its own set of KV blocks, which is
-// the whole point of per-query-block selection. sel[] is device memory the host
-// validates only by LENGTH, so the index is clamped here -- an out-of-range entry
-// must not turn into an out-of-bounds DMA source.
+// qb picks the row of the selection list: with a query axis every query block retrieves
+// from its own set of KV blocks, which is the whole point of per-query-block selection.
+// sel[] is device memory the host validates only by LENGTH, so the index is clamped
+// here -- an out-of-range entry must not turn into an out-of-bounds DMA source.
+//
+// Sparse only; the dense path has no list. Split out of fa_chunk_block_start because
+// the residency map keys on the INDEX, and dividing the row offset back down to
+// recover it is both slower and a lie about where the number came from.
+static inline uint32_t fa_chunk_block_idx(const struct hmx_fa_context * factx,
+                                          uint32_t                      c,
+                                          uint32_t                      j,
+                                          uint32_t                      qb,
+                                          uint32_t                      kv_head,
+                                          uint32_t                      ib3) {
+    const int32_t * list = (const int32_t *) ((const uint8_t *) factx->sel +
+                                              qb      * factx->sel_nb1 +
+                                              kv_head * factx->sel_nb2 +
+                                              ib3     * factx->sel_nb3);
+    uint32_t idx = (uint32_t) list[c * factx->m + j];
+    if (idx >= factx->n_blk_total) {
+        idx = factx->n_blk_total - 1;   // clamp the INDEX, never the row count: a zero
+    }                                   // row count would break n_col_tiles > 0 downstream
+    return idx;
+}
+
+// KV row offset of the j'th selected block of chunk c. Dense: blocks are walked in
+// order, so chunk c starts at c * Bc.
 static inline uint32_t fa_chunk_block_start(const struct hmx_fa_context * factx,
                                             uint32_t                      c,
                                             uint32_t                      j,
@@ -226,16 +267,14 @@ static inline uint32_t fa_chunk_block_start(const struct hmx_fa_context * factx,
     if (__builtin_expect(factx->sel == NULL, true)) {
         return c * factx->Bc;
     }
+    return fa_chunk_block_idx(factx, c, j, qb, kv_head, ib3) * factx->sparse_bs;
+}
 
-    const int32_t * list = (const int32_t *) ((const uint8_t *) factx->sel +
-                                              qb      * factx->sel_nb1 +
-                                              kv_head * factx->sel_nb2 +
-                                              ib3     * factx->sel_nb3);
-    uint32_t idx = (uint32_t) list[c * factx->m + j];
-    if (idx >= factx->n_blk_total) {
-        idx = factx->n_blk_total - 1;   // clamp the INDEX, never the row count: a zero
-    }                                   // row count would break n_col_tiles > 0 downstream
-    return idx * factx->sparse_bs;
+// Rows a block starting at KV row `start` contributes, clamped for a KV length that is
+// not a multiple of the block size.
+static inline uint32_t fa_rows_at(const struct hmx_fa_context * factx, uint32_t start, uint32_t n_kv) {
+    const uint32_t span = factx->sel ? factx->sparse_bs : factx->Bc;
+    return start < n_kv ? (uint32_t) hex_smin(span, n_kv - start) : 0;
 }
 
 // Rows contributed by the j'th block of chunk c, clamped for a KV length that is not
@@ -243,9 +282,45 @@ static inline uint32_t fa_chunk_block_start(const struct hmx_fa_context * factx,
 static inline uint32_t fa_block_rows(const struct hmx_fa_context * factx,
                                      uint32_t c, uint32_t j, uint32_t qb, uint32_t kv_head,
                                      uint32_t ib3, uint32_t n_kv) {
-    const uint32_t start = fa_chunk_block_start(factx, c, j, qb, kv_head, ib3);
-    const uint32_t span  = factx->sel ? factx->sparse_bs : factx->Bc;
-    return start < n_kv ? (uint32_t) hex_smin(span, n_kv - start) : 0;
+    return fa_rows_at(factx, fa_chunk_block_start(factx, c, j, qb, kv_head, ib3), n_kv);
+}
+
+// ---- KV block residency bookkeeping -------------------------------------------------
+//
+// The bitmaps live entirely on the PUSH side. The consumer never consults them: it
+// learns a block's VTCM address only from dma_queue_pop().dst, which carries the slot
+// address verbatim for a hit and the freshly written slot for a miss.
+
+// Returns true when this block is already staged in its slot, and marks it staged
+// either way. A second push of the same block inside one epoch therefore emits a
+// zero-work descriptor; FIFO order guarantees that descriptor is popped only after the
+// real transfer ahead of it has been waited on, so no extra synchronisation is needed.
+static inline bool fa_res_mark(uint32_t * bitmap, uint32_t idx, bool force_miss) {
+    const uint32_t w   = idx >> 5;
+    const uint32_t bit = 1u << (idx & 31);
+    const bool     hit = (bitmap[w] & bit) != 0;
+    bitmap[w] |= bit;
+    return hit && !force_miss;
+}
+
+// A residency epoch is one (sequence, KV head): slots are keyed by block index alone,
+// so they must be invalidated when the head changes.
+//
+// Cleared by the PUSHER, not at the top of the loop body. The tail prefetch stages the
+// NEXT iteration's first chunk before that iteration begins, so a clear that ran when
+// the consumer reached the new head would arrive one push too late and let those
+// descriptors claim hits against the previous head's slots.
+static inline void fa_res_begin_epoch(struct hmx_fa_context * factx, uint32_t ib3, uint32_t kv_head) {
+    if (factx->k_res == NULL) {
+        return;
+    }
+    if (factx->res_epoch_ib3 == ib3 && factx->res_epoch_kv_head == kv_head) {
+        return;
+    }
+    memset(factx->k_res_valid, 0, sizeof(factx->k_res_valid));
+    memset(factx->v_res_valid, 0, sizeof(factx->v_res_valid));
+    factx->res_epoch_ib3     = ib3;
+    factx->res_epoch_kv_head = kv_head;
 }
 
 // Total rows staged for chunk c, i.e. the KV width the kernel actually computes.
@@ -723,14 +798,27 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
 // HMX Phase args and thread logic
 // ============================================================================
 
+// A chunk's rows are tiled from `nblk` source blocks laid out consecutively at
+// `block_rows` intervals in the CHUNK's row space. nblk == 1 with block_rows ==
+// kv_rows is the pre-residency form: one contiguous staging buffer, one call, exactly
+// the tiles the single-call version produced. nblk > 1 is the residency form, where
+// each block lives in its own VTCM slot and only its source address differs.
+//
+// Splitting the destination per block is free: block b starts at chunk row
+// b*block_rows, block_rows is a multiple of the 32-row tile height, and both interleave
+// kernels derive the destination tile from row/32 and the in-tile row from row%32. So
+// tiling a block's LOCAL rows into a destination shifted by (b*block_rows/32) tiles
+// lands every element exactly where the whole-chunk call put it.
 typedef struct {
     struct hmx_fa_context * factx;
     uint32_t                kv_rows;
     size_t                  src_stride;
-    void *                  curr_k;
+    void * const *          bases;       // per-block VTCM source, taken from the DMA descriptors
+    uint32_t                nblk;
+    uint32_t                block_rows;
+    void *                  k_tiles_dst;
     uint32_t                kv_start;
     uint32_t                rows_per_t;
-    size_t                  buf_idx;
 } fa_k_int_args_t;
 
 static void fa_k_interleave_thread(unsigned int n, unsigned int i, void * data) {
@@ -746,21 +834,39 @@ static void fa_k_interleave_thread(unsigned int n, unsigned int i, void * data) 
         return;
     }
 
+    // Bytes one block's tiles occupy in the K tile buffer: DK/32 tiles per 32 rows.
+    const size_t   k_tile_run = (size_t) (factx->DK / HMX_FP16_TILE_N_COLS) * HMX_FP16_TILE_N_ELMS;
+    const uint32_t blk_rows   = args->block_rows;
+
     struct htp_thread_trace * tr = &factx->octx->ctx->trace[i];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, (uint16_t) (args->kv_start + start));
-    hmx_interleave_rows_to_tiles(factx->vtcm_k_tiles[args->buf_idx], (const __fp16 *) args->curr_k, total_rows, factx->DK,
-                             args->src_stride, start, end);
+    for (uint32_t r = start; r < end;) {
+        // Row ranges are even-aligned and blk_rows is a multiple of the tile height, so
+        // a row PAIR never straddles a block boundary -- which is what lets each block
+        // be tiled independently without changing the odd-row zero fill.
+        const uint32_t b      = (args->nblk == 1) ? 0 : (r / blk_rows);
+        const uint32_t bstart = b * blk_rows;
+        const uint32_t brows  = (uint32_t) hex_smin(blk_rows, total_rows - bstart);
+        const uint32_t r_end  = (uint32_t) hex_smin(end, bstart + brows);
+
+        __fp16 * dst = (__fp16 *) args->k_tiles_dst + (size_t) (bstart / HMX_FP16_TILE_N_ROWS) * k_tile_run;
+        hmx_interleave_rows_to_tiles(dst, (const __fp16 *) args->bases[b], brows, factx->DK,
+                                     args->src_stride, r - bstart, r_end - bstart);
+        r = r_end;
+    }
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, (uint16_t) (args->kv_start + start));
 }
 
-static void fa_phase_k_interleave(struct hmx_fa_context * factx, uint32_t kv_rows, size_t src_stride, void * curr_k, uint32_t kv_start, size_t buf_idx) {
+static void fa_phase_k_interleave(struct hmx_fa_context * factx, uint32_t kv_rows, size_t src_stride,
+                                  void * const * bases, uint32_t nblk, uint32_t block_rows,
+                                  uint32_t kv_start, void * k_tiles_dst) {
     work_queue_t wp = factx->octx->ctx->work_queue;
     uint32_t n = 1;
     if (factx->n_threads > 1 && kv_rows >= factx->n_threads * 2) {
         n = factx->n_threads;
     }
     uint32_t rows_per_t = hex_align_up(hmx_ceil_div(kv_rows, n), 2);
-    fa_k_int_args_t args = { factx, kv_rows, src_stride, curr_k, kv_start, rows_per_t, buf_idx };
+    fa_k_int_args_t args = { factx, kv_rows, src_stride, bases, nblk, block_rows, k_tiles_dst, kv_start, rows_per_t };
     if (n > 1) {
         work_queue_run(wp, fa_k_interleave_thread, &args, n);
     } else {
@@ -768,11 +874,18 @@ static void fa_phase_k_interleave(struct hmx_fa_context * factx, uint32_t kv_row
     }
 }
 
+// Same per-block source split as the K phase. The V tile layout is [dim_tile][row_tile]
+// with a dim-tile stride of n_col_tiles (the CHUNK's width in tiles), and that stride is
+// passed through untouched -- only the destination's row-tile origin is shifted per
+// block, so the chunk's V tile buffer comes out exactly as the whole-chunk call built
+// it and hmx_fa_o_update_worker needs no change at all.
 typedef struct {
     struct hmx_fa_context * factx;
     uint32_t                kv_rows;
     size_t                  src_stride;
-    void *                  v_src;
+    void * const *          bases;
+    uint32_t                nblk;
+    uint32_t                block_rows;
     void *                  v_tiles_dst;
     size_t                  n_col_tiles;
     uint32_t                kv_start;
@@ -792,19 +905,32 @@ static void fa_v_interleave_thread(unsigned int n, unsigned int i, void * data) 
         return;
     }
 
-    __fp16 * v_tiles_dst = (__fp16 *) args->v_tiles_dst;
+    const uint32_t blk_rows = args->block_rows;
 
     struct htp_thread_trace * tr = &factx->octx->ctx->trace[i];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, (uint16_t) (args->kv_start + start));
-    hmx_interleave_cols_to_tiles(v_tiles_dst, (const __fp16 *) args->v_src, total_rows, factx->DV,
-                             args->src_stride, (uint32_t) args->n_col_tiles, start, end);
+    for (uint32_t r = start; r < end;) {
+        const uint32_t b      = (args->nblk == 1) ? 0 : (r / blk_rows);
+        const uint32_t bstart = b * blk_rows;
+        const uint32_t brows  = (uint32_t) hex_smin(blk_rows, total_rows - bstart);
+        const uint32_t r_end  = (uint32_t) hex_smin(end, bstart + brows);
+
+        __fp16 * dst = (__fp16 *) args->v_tiles_dst +
+                       (size_t) (bstart / HMX_FP16_TILE_N_ROWS) * HMX_FP16_TILE_N_ELMS;
+        hmx_interleave_cols_to_tiles(dst, (const __fp16 *) args->bases[b], brows, factx->DV,
+                                     args->src_stride, (uint32_t) args->n_col_tiles,
+                                     r - bstart, r_end - bstart);
+        r = r_end;
+    }
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_V_PREP, (uint16_t) (args->kv_start + start));
 }
 
 static void fa_phase_v_interleave(struct hmx_fa_context * factx,
                                   uint32_t                kv_rows,
                                   size_t                  src_stride,
-                                  void *                  v_src,
+                                  void * const *          bases,
+                                  uint32_t                nblk,
+                                  uint32_t                block_rows,
                                   void *                  v_tiles_dst,
                                   size_t                  n_col_tiles,
                                   uint32_t                kv_start) {
@@ -814,7 +940,8 @@ static void fa_phase_v_interleave(struct hmx_fa_context * factx,
         n = factx->n_threads;
     }
     uint32_t rows_per_t = hex_align_up(hmx_ceil_div(kv_rows, n), 2);
-    fa_v_int_args_t args = { factx, kv_rows, src_stride, v_src, v_tiles_dst, n_col_tiles, kv_start, rows_per_t };
+    fa_v_int_args_t args = { factx, kv_rows, src_stride, bases, nblk, block_rows,
+                             v_tiles_dst, n_col_tiles, kv_start, rows_per_t };
     if (n > 1) {
         work_queue_run(wp, fa_v_interleave_thread, &args, n);
     } else {
@@ -1888,18 +2015,51 @@ static inline uint32_t fa_push_chunk(dma_queue * dma, const struct htp_tensor * 
     const uint32_t qb   = fa_sel_row(factx, q_start);
 
     for (uint32_t j = 0; j < nblk; ++j) {
-        const uint32_t start = fa_chunk_block_start(factx, c, j, qb, kv_head, ib3);
-        const uint32_t rows  = fa_block_rows(factx, c, j, qb, kv_head, ib3, nek1);
-        const uint8_t * src  = (const uint8_t *) k->data + start * k->nb[1] + ik2 * k->nb[2] + ik3 * k->nb[3];
-        uint8_t * dst = (uint8_t *) factx->vtcm_k_fp16[buf] + (size_t) j * bs * size_k_row_padded;
-        dma_queue_push(dma, dma_make_ptr(dst, src), size_k_row_padded, k->nb[1], size_k_row, rows);
+        uint32_t  start;
+        uint8_t * dst;
+        bool      resident = false;
+        if (factx->k_res) {
+            const uint32_t idx = fa_chunk_block_idx(factx, c, j, qb, kv_head, ib3);
+            start    = idx * factx->sparse_bs;
+            dst      = (uint8_t *) factx->k_res + (size_t) idx * factx->k_res_slot;
+            resident = fa_res_mark(factx->k_res_valid, idx, factx->res_force_miss);
+        } else {
+            start = fa_chunk_block_start(factx, c, j, qb, kv_head, ib3);
+            dst   = (uint8_t *) factx->vtcm_k_fp16[buf] + (size_t) j * bs * size_k_row_padded;
+        }
+        const uint32_t rows = fa_rows_at(factx, start, nek1);
+        const uint8_t * src = (const uint8_t *) k->data + start * k->nb[1] + ik2 * k->nb[2] + ik3 * k->nb[3];
+        if (resident) {
+            // One descriptor per block whether or not a transfer is needed. A zero-size
+            // 1D push sets done and skips dmlink, so it moves no bytes -- but it still
+            // advances push_idx and records dst, which is what keeps the pop counts one
+            // loop iteration away a function of fa_chunk_nblk alone and hands the
+            // consumer the slot address through the same channel as a real transfer.
+            dma_queue_push_single_1d(dma, dma_make_ptr(dst, src), 0);
+        } else {
+            dma_queue_push(dma, dma_make_ptr(dst, src), size_k_row_padded, k->nb[1], size_k_row, rows);
+        }
     }
     for (uint32_t j = 0; j < nblk; ++j) {
-        const uint32_t start = fa_chunk_block_start(factx, c, j, qb, kv_head, ib3);
-        const uint32_t rows  = fa_block_rows(factx, c, j, qb, kv_head, ib3, nek1);
-        const uint8_t * src  = (const uint8_t *) v->data + start * v->nb[1] + iv2 * v->nb[2] + iv3 * v->nb[3];
-        uint8_t * dst = (uint8_t *) factx->vtcm_v_fp16[buf] + (size_t) j * bs * size_v_row_padded;
-        dma_queue_push(dma, dma_make_ptr(dst, src), size_v_row_padded, v->nb[1], size_v_row, rows);
+        uint32_t  start;
+        uint8_t * dst;
+        bool      resident = false;
+        if (factx->v_res) {
+            const uint32_t idx = fa_chunk_block_idx(factx, c, j, qb, kv_head, ib3);
+            start    = idx * factx->sparse_bs;
+            dst      = (uint8_t *) factx->v_res + (size_t) idx * factx->v_res_slot;
+            resident = fa_res_mark(factx->v_res_valid, idx, factx->res_force_miss);
+        } else {
+            start = fa_chunk_block_start(factx, c, j, qb, kv_head, ib3);
+            dst   = (uint8_t *) factx->vtcm_v_fp16[buf] + (size_t) j * bs * size_v_row_padded;
+        }
+        const uint32_t rows = fa_rows_at(factx, start, nek1);
+        const uint8_t * src = (const uint8_t *) v->data + start * v->nb[1] + iv2 * v->nb[2] + iv3 * v->nb[3];
+        if (resident) {
+            dma_queue_push_single_1d(dma, dma_make_ptr(dst, src), 0);
+        } else {
+            dma_queue_push(dma, dma_make_ptr(dst, src), size_v_row_padded, v->nb[1], size_v_row, rows);
+        }
     }
 
     if (mask && push_mask) {
@@ -1949,6 +2109,19 @@ static inline void fa_pop_n(dma_queue * dma, uint32_t n) {
     }
 }
 
+// Pop a chunk's n K (or V) descriptors, recording each block's VTCM address.
+//
+// With residency the blocks land in scattered slots, so the address is knowable ONLY
+// from the descriptor -- fa_pop_n's "discard the return" form cannot serve here, and
+// neither can fa_pop_chunk_base's "first dst is the base" assumption. A hit's zero-work
+// descriptor carries the same slot address a real transfer would have, so the consumer
+// needs no hit/miss channel at all.
+static inline void fa_pop_bases(dma_queue * dma, uint32_t n, void ** bases) {
+    for (uint32_t i = 0; i < n; ++i) {
+        bases[i] = dma_queue_pop(dma).dst;
+    }
+}
+
 static inline void fa_prefetch_block(dma_queue * dma, const struct htp_tensor * k, const struct htp_tensor * v, const struct htp_tensor * mask,
                                      uint32_t b, size_t Bc, size_t size_k_row_padded, size_t size_k_row, size_t size_v_row_padded, size_t size_v_row,
                                      uint32_t ik2, uint32_t ik3, uint32_t iv2, uint32_t iv3, uint32_t q_start, uint32_t im3, uint32_t kv_head, uint32_t G,
@@ -1957,6 +2130,84 @@ static inline void fa_prefetch_block(dma_queue * dma, const struct htp_tensor * 
     fa_push_chunk(dma, k, v, mask, b, size_k_row_padded, size_k_row, size_v_row_padded, size_v_row,
                   ik2, ik3, iv2, iv3, q_start, im3, kv_head, G, m_line_bytes, n_rows_q, nek1,
                   prefetch_buf, ib3, /*push_mask=*/mask != NULL, factx);
+}
+
+// ============================================================================
+// Iteration order over (sequence, query block, KV head)
+// ============================================================================
+//
+// The nest is linearised so that producer and consumer agree BY CONSTRUCTION: the loop
+// body runs fa_iter_at(it) and the tail prefetch stages fa_iter_at(it + 1). Two
+// hand-written successor formulas that must be kept in lockstep is exactly the shape of
+// bug that cannot be caught downstream -- fa_chunk_nblk is deliberately blind to the
+// query block, a cache hit's dummy descriptor preserves mask parity, and wrong-but-real
+// K rows dotted with a real Q tile produce plausible finite numbers. No assert, no hang,
+// no NaN.
+//
+// kv_head_outer swaps which of the two inner axes varies fastest. KV block residency
+// needs the KV head OUTSIDE the query block loop, because its slots are keyed by block
+// index alone: with the head inside, a fixed head's query blocks are visited in
+// n_kv_heads-separated iterations and every slot is overwritten in between. Dense and
+// shared-selection keep kv_head_outer = false, i.e. the original order, byte for byte.
+struct fa_iter_order {
+    uint32_t n_q_blocks;
+    uint32_t n_kv_heads;
+    bool     kv_head_outer;
+};
+
+struct fa_iter {
+    uint32_t ib3;
+    uint32_t qb_idx;
+    uint32_t kv_head;
+};
+
+static inline struct fa_iter fa_iter_at(const struct fa_iter_order * o, uint32_t it) {
+    const uint32_t per_seq = o->n_q_blocks * o->n_kv_heads;
+    struct fa_iter r;
+    r.ib3 = it / per_seq;
+    const uint32_t rem = it - r.ib3 * per_seq;
+    if (o->kv_head_outer) {
+        r.kv_head = rem / o->n_q_blocks;
+        r.qb_idx  = rem - r.kv_head * o->n_q_blocks;
+    } else {
+        r.qb_idx  = rem / o->n_kv_heads;
+        r.kv_head = rem - r.qb_idx * o->n_kv_heads;
+    }
+    return r;
+}
+
+// Does any KV block appear in more than one query block's selection row?
+//
+// Residency only pays when it does, and it is not free: it forces the KV-head loop
+// outside the query-block loop, which costs a broadcast mask its dma_cache reuse across
+// heads. The eval suite deliberately builds pairwise-DISJOINT per-query-block
+// selections, so without this probe those shapes would pay the reorder for a guaranteed
+// 0% hit rate. Head 0 / sequence 0 is a representative sample, not a correctness input:
+// a wrong answer here only turns the optimisation on or off.
+static bool fa_sel_repeats_blocks(const struct hmx_fa_context * factx, uint32_t n_q_blocks) {
+    uint32_t seen[FA_RES_MAX_BLOCKS / 32];
+    memset(seen, 0, sizeof(seen));
+
+    uint32_t distinct = 0;
+    uint32_t total    = 0;
+    for (uint32_t i = 0; i < n_q_blocks; ++i) {
+        const uint32_t  qb   = fa_sel_row(factx, i * factx->Br);
+        const int32_t * list = (const int32_t *) ((const uint8_t *) factx->sel + qb * factx->sel_nb1);
+        for (uint32_t s = 0; s < factx->n_sel; ++s) {
+            uint32_t idx = (uint32_t) list[s];
+            if (idx >= factx->n_blk_total) {
+                idx = factx->n_blk_total - 1;
+            }
+            const uint32_t w   = idx >> 5;
+            const uint32_t bit = 1u << (idx & 31);
+            if (!(seen[w] & bit)) {
+                seen[w] |= bit;
+                distinct++;
+            }
+            total++;
+        }
+    }
+    return distinct < total;
 }
 
 // ============================================================================
@@ -2044,6 +2295,12 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
             factx.sparse_bs = kparams->u.hmx.sparse_bs;
             factx.n_sel     = kparams->u.hmx.n_sel;
             factx.m         = factx.sparse_bs ? (factx.Bc / factx.sparse_bs) : 1;
+            // The per-chunk block-address arrays in the KV loop are FA_SPARSE_MAX_M
+            // deep, and the staging buffers are sized for the same bound. The host
+            // caps Bc so this holds; reject rather than overrun if it ever does not.
+            if (factx.m > FA_SPARSE_MAX_M) {
+                return HTP_STATUS_NO_SUPPORT;
+            }
             factx.n_blk_total = factx.sparse_bs ? ((nek1 + factx.sparse_bs - 1) / factx.sparse_bs) : 0;
             // The unit of the query axis is the SCORER's query-block size, which has no
             // relation to the kernel's Br -- it rides in op_params[5] and reaches here
@@ -2146,11 +2403,66 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
+    // ======== KV block residency map ========
+    //
+    // Per-query-block selection re-stages the SAME KV block once per query block: the
+    // loop visits (query block, KV head) pairs, and a block that several query blocks of
+    // one head select is DMA'd once per pair. Giving every KV block index its own VTCM
+    // slot collapses that to once per head.
+    //
+    // Scoped hard to sparse + per-query-block + pipelined. The other arms are excluded
+    // on purpose, not by omission:
+    //   - shared selection: all query blocks read the same list, so the reuse the map
+    //     would exploit is already exploited; and that arm is not DMA-bound.
+    //   - dense: blocks are walked in order with no reuse across query tiles at a fixed
+    //     head, and the loop swap the map requires would destroy the broadcast mask
+    //     cache's cross-head reuse, which is the whole reason it hits there.
+    //   - non-pipelined fallback: fa_pop_chunk_base returns the FIRST descriptor's dst
+    //     as the chunk base and then reads kv_rows contiguous rows from it, which is
+    //     silently the wrong memory once the blocks are in scattered slots.
+    struct fa_iter_order iter_order;
+    iter_order.n_q_blocks    = (neq1 + Br - 1) / Br;
+    iter_order.n_kv_heads    = n_kv_heads;
+    iter_order.kv_head_outer = false;
+    {
+        const uint32_t res_mode = kparams->u.hmx.res_mode;
+        const bool     eligible =
+            res_mode != HTP_FA_RES_OFF &&
+            factx.sel != NULL && factx.sel_nb1 != 0 && factx.sparse_bs != 0 &&
+            factx.pipeline &&
+            iter_order.n_q_blocks > 1 &&
+            factx.n_blk_total > 0 && factx.n_blk_total <= FA_RES_MAX_BLOCKS &&
+            // A slot's rows are tiled from a shifted tile origin, which is only the same
+            // thing as tiling the whole chunk when a block spans whole 32-row tiles.
+            (factx.sparse_bs % HMX_FP16_TILE_N_ROWS) == 0;
+
+        struct hmx_fa_res_region R;
+        hmx_fa_res_region_build(&R, L.total_bytes, ctx->vtcm_size, eligible ? factx.n_blk_total : 0,
+                                factx.sparse_bs, size_k_row_padded, size_v_row_padded);
+
+        if (R.n_slots != 0 &&
+            (res_mode != HTP_FA_RES_AUTO || fa_sel_repeats_blocks(&factx, iter_order.n_q_blocks))) {
+            factx.k_res            = VTCM_LAYOUT_PTR(__fp16, base, R.off_k);
+            factx.v_res            = VTCM_LAYOUT_PTR(__fp16, base, R.off_v);
+            factx.k_res_slot       = R.k_slot_bytes;
+            factx.v_res_slot       = R.v_slot_bytes;
+            factx.res_force_miss   = (res_mode == HTP_FA_RES_MISS);
+            // No epoch yet: the first fa_res_begin_epoch must clear.
+            factx.res_epoch_ib3     = UINT32_MAX;
+            factx.res_epoch_kv_head = UINT32_MAX;
+            iter_order.kv_head_outer = true;
+        }
+    }
+
     // ======== DMA setup ========
     dma_queue * const dma = ctx->dma[0];
 
     const size_t n_row_tiles_g_br = g_br / HMX_FP16_TILE_N_ROWS;
     const size_t n_tiles_per_bc   = Bc / HMX_FP16_TILE_N_COLS;
+    // Rows one staged block contributes to a chunk. Only meaningful with residency, where
+    // the chunk's m blocks sit in separate slots; without it the chunk is one contiguous
+    // run and the interleave is told nblk == 1.
+    const uint32_t res_blk_rows   = factx.sparse_bs;
 
     const size_t qo_element_size = factx.is_q_fp32 ? sizeof(float) : sizeof(__fp16);
 
@@ -2166,9 +2478,19 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     hmx_fa_o_norm_job_t   on_job;
 
     // ======== Main loop ========
-    for (uint32_t ib3 = 0; ib3 < neq3; ++ib3) {
-        const uint32_t im3 = mask ? fastmodulo(ib3, mask->ne[3], &factx.src3_div3) : 0;
-        for (uint32_t q_start = 0; q_start < neq1; q_start += Br) {
+    //
+    // One linear index over (sequence, query block, KV head); fa_iter_at decides which
+    // of the inner two varies fastest. The tail prefetch at the bottom uses the SAME
+    // function on it + 1, so the successor can never drift out of step with the loop.
+    const uint32_t n_iter = neq3 * iter_order.n_q_blocks * iter_order.n_kv_heads;
+    for (uint32_t it = 0; it < n_iter; ++it) {
+        {
+            const struct fa_iter cur = fa_iter_at(&iter_order, it);
+            const uint32_t ib3     = cur.ib3;
+            const uint32_t q_start = cur.qb_idx * Br;
+            const uint32_t kv_head = cur.kv_head;
+            const uint32_t im3     = mask ? fastmodulo(ib3, mask->ne[3], &factx.src3_div3) : 0;
+
             const uint32_t n_rows_q    = hex_smin(Br, neq1 - q_start);
             const size_t   n_rows_g    = n_rows_q * G;
             const size_t   g_br_actual = hex_align_up(n_rows_g, HMX_FP16_TILE_N_ROWS);
@@ -2180,7 +2502,12 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
             // dense and for a shared (ne[1] == 1) selection.
             const uint32_t qb = fa_sel_row(&factx, q_start);
 
-            for (uint32_t kv_head = 0; kv_head < n_kv_heads; ++kv_head) {
+            // Trace tag. Both inner axes are in it, because with the KV head outside the
+            // query block loop a bare q_start recurs once per head and the phases become
+            // impossible to attribute in a trace.
+            const uint16_t iter_tag = (uint16_t) (kv_head * iter_order.n_q_blocks + cur.qb_idx);
+
+            {
                 const uint32_t ik2 = kv_head;
                 const uint32_t ik3 = fastdiv(ib3, &kparams->broadcast_rk3);
                 const uint32_t iv2 = kv_head;
@@ -2194,13 +2521,14 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                 // 1. Push Q and KV DMAs for the very first iteration.
                 // Subsequent iterations are enqueued early at the end of the previous iteration.
-                if (ib3 == 0 && q_start == 0 && kv_head == 0) {
+                if (it == 0) {
                     const uint8_t * q_ptr = (const uint8_t *) q->data;
                     const size_t q_row_bytes = q_transposed ? n_rows_q * q_row_bytes_trans_factor : q_row_bytes_untransposed;
                     const size_t n_rows      = q_transposed ? factx.G : n_rows_q;
                     dma_queue_push(dma, dma_make_ptr(factx.vtcm_q_dma, q_ptr), q_row_bytes, hex_smax(q_src_stride, q_row_bytes), q_row_bytes, n_rows);
 
                     if (factx.n_kv_blocks > 0) {
+                        fa_res_begin_epoch(&factx, ib3, kv_head);
                         fa_push_chunk(dma, k, v, mask, 0, size_k_row_padded, size_k_row, size_v_row_padded, size_v_row,
                                       ik2, ik3, iv2, iv3, q_start, im3, kv_head, G, m_line_bytes, n_rows_q, nek1,
                                       0, ib3, /*push_mask=*/(factx.pipeline && mask), &factx);
@@ -2219,9 +2547,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                 // ---- KV block loop with DMA double-buffering ----
                 size_t buf_idx = 0;
 
-                htp_trace_event_start(tr_hvx, HTP_TRACE_EVT_HVX_A_PREP, (uint16_t) q_start);
+                htp_trace_event_start(tr_hvx, HTP_TRACE_EVT_HVX_A_PREP, iter_tag);
                 fa_compute_slopes(&factx, kv_head, n_rows_g);
-                htp_trace_event_stop(tr_hvx, HTP_TRACE_EVT_HVX_A_PREP, (uint16_t) q_start);
+                htp_trace_event_stop(tr_hvx, HTP_TRACE_EVT_HVX_A_PREP, iter_tag);
 
                 const size_t k_src_stride = size_k_row_padded / sizeof(__fp16);
                 const size_t v_src_stride = size_v_row_padded / sizeof(__fp16);
@@ -2240,9 +2568,18 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                     }
 
                     // Prep and start QK-dot(0)
-                    fa_pop_n(dma, fa_chunk_nblk(&factx, 0));
-                    void * curr_k0 = factx.vtcm_k_fp16[0];
-                    fa_phase_k_interleave(&factx, blk0_rows, k_src_stride, curr_k0, blk0_start, 0);
+                    //
+                    // The chunk's per-block VTCM addresses come from the descriptors,
+                    // never from the double-buffer index: with residency they are
+                    // scattered slots, and without it they are exactly
+                    // vtcm_k_fp16[buf] + j*bs*stride, so bases[0] is the old base.
+                    void * k_bases[FA_SPARSE_MAX_M];
+                    const uint32_t nblk0 = fa_chunk_nblk(&factx, 0);
+                    fa_pop_bases(dma, nblk0, k_bases);
+                    fa_phase_k_interleave(&factx, blk0_rows, k_src_stride, k_bases,
+                                          factx.k_res ? nblk0 : 1,
+                                          factx.k_res ? res_blk_rows : blk0_rows,
+                                          blk0_start, factx.vtcm_k_tiles[0]);
 
                     qk_job[0].q_tiles        = factx.vtcm_q_tiles;
                     qk_job[0].k_tiles        = factx.vtcm_k_tiles[0];
@@ -2260,9 +2597,13 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         const size_t   n_col_tiles = hmx_ceil_div(kv_rows, HMX_FP16_TILE_N_COLS);
 
                         // ---- 1. Pop and run V-prep for current block ----
-                        fa_pop_n(dma, fa_chunk_nblk(&factx, kv_blk));
-                        void * curr_v = factx.vtcm_v_fp16[buf_idx];
-                        fa_phase_v_interleave(&factx, kv_rows, v_src_stride, curr_v, factx.vtcm_v_tiles[buf_idx], n_tiles_per_bc, kv_start);
+                        void * v_bases[FA_SPARSE_MAX_M];
+                        const uint32_t cur_nblk = fa_chunk_nblk(&factx, kv_blk);
+                        fa_pop_bases(dma, cur_nblk, v_bases);
+                        fa_phase_v_interleave(&factx, kv_rows, v_src_stride, v_bases,
+                                              factx.v_res ? cur_nblk : 1,
+                                              factx.v_res ? res_blk_rows : kv_rows,
+                                              factx.vtcm_v_tiles[buf_idx], n_tiles_per_bc, kv_start);
 
                         // ---- 2. Pop and run mask-prep for current block ----
                         __fp16 * current_mask_vtcm = NULL;
@@ -2307,9 +2648,13 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                             const uint32_t next_rows  = fa_chunk_rows(&factx, kv_blk + 1, qb, kv_head, ib3, nek1);
                             const size_t   next_buf   = 1 - buf_idx;
 
-                            fa_pop_n(dma, fa_chunk_nblk(&factx, kv_blk + 1));
-                            void * next_k = factx.vtcm_k_fp16[next_buf];
-                            fa_phase_k_interleave(&factx, next_rows, k_src_stride, next_k, next_start, next_buf);
+                            void * next_k_bases[FA_SPARSE_MAX_M];
+                            const uint32_t next_nblk = fa_chunk_nblk(&factx, kv_blk + 1);
+                            fa_pop_bases(dma, next_nblk, next_k_bases);
+                            fa_phase_k_interleave(&factx, next_rows, k_src_stride, next_k_bases,
+                                                  factx.k_res ? next_nblk : 1,
+                                                  factx.k_res ? res_blk_rows : next_rows,
+                                                  next_start, factx.vtcm_k_tiles[next_buf]);
 
                             qk_job[next_buf].q_tiles        = factx.vtcm_q_tiles;
                             qk_job[next_buf].k_tiles        = factx.vtcm_k_tiles[next_buf];
@@ -2385,9 +2730,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         hmx_queue_push(hmx_q, hmx_queue_make_desc(hmx_fa_o_update_worker, &ou_job[0]));
 
                         // Overlapped: run HVX build diag inv L while HMX is busy executing the update
-                        htp_trace_event_start(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) q_start);
+                        htp_trace_event_start(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, iter_tag);
                         fa_build_d_diag_inv_l(&factx, n_row_tiles, n_row_tiles_g_br);
-                        htp_trace_event_stop(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) q_start);
+                        htp_trace_event_stop(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, iter_tag);
                         hmx_queue_pop(hmx_q);
 
                         hex_swap_ptr((void **) &o_tile_curr, (void **) &o_tile_prev);
@@ -2438,9 +2783,13 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                             }
                         }
 
-                        // Wait for current K DMA and interleave
+                        // Wait for current K DMA and interleave. The fallback path never
+                        // runs with residency (fa_pop_chunk_base assumes the chunk's
+                        // blocks are contiguous from the first descriptor's dst), so the
+                        // chunk is always one contiguous run: nblk == 1.
                         void * curr_k = fa_pop_chunk_base(dma, cur_nblk);
-                        fa_phase_k_interleave(&factx, kv_rows, k_src_stride, curr_k, kv_start, 0);
+                        fa_phase_k_interleave(&factx, kv_rows, k_src_stride, &curr_k, 1, kv_rows,
+                                              kv_start, factx.vtcm_k_tiles[0]);
 
                         {
                             qk_job.q_tiles        = factx.vtcm_q_tiles;
@@ -2458,7 +2807,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                         // Wait for current V DMA and interleave
                         void * curr_v = fa_pop_chunk_base(dma, cur_nblk);
-                        fa_phase_v_interleave(&factx, kv_rows, v_src_stride, curr_v, factx.vtcm_v_tiles[0], n_tiles_per_bc, kv_start);
+                        fa_phase_v_interleave(&factx, kv_rows, v_src_stride, &curr_v, 1, kv_rows,
+                                              factx.vtcm_v_tiles[0], n_tiles_per_bc, kv_start);
 
                         // ---- Phase 3: softmax + build_D ----
                         __fp16 * current_mask_vtcm = NULL;
@@ -2510,9 +2860,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                             hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_fa_o_update_worker, &ou_job));
                             if (kv_blk + 1 == factx.n_kv_blocks) {
                                 // Overlapped: run HVX build diag inv L while HMX is busy executing the update
-                                htp_trace_event_start(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) q_start);
+                                htp_trace_event_start(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, iter_tag);
                                 fa_build_d_diag_inv_l(&factx, n_row_tiles, n_row_tiles_g_br);
-                                htp_trace_event_stop(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) q_start);
+                                htp_trace_event_stop(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, iter_tag);
                             }
                             hmx_queue_pop(ctx->hmx_queue);
 
@@ -2523,19 +2873,14 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                     }
                 }
 
-                // Enqueue DMAs for the next iteration early so they overlap with O-PROC
-                uint32_t next_kv_head = kv_head + 1;
-                uint32_t next_q_start = q_start;
-                uint32_t next_ib3     = ib3;
-                if (next_kv_head >= n_kv_heads) {
-                    next_kv_head = 0;
-                    next_q_start = q_start + Br;
-                    if (next_q_start >= neq1) {
-                        next_q_start = 0;
-                        next_ib3     = ib3 + 1;
-                    }
-                }
-                bool has_next = (next_ib3 < neq3);
+                // Enqueue DMAs for the next iteration early so they overlap with O-PROC.
+                // The successor is the SAME decomposition the loop itself runs, one index
+                // later -- never a hand-rolled copy of the nesting order.
+                const struct fa_iter nxt = fa_iter_at(&iter_order, it + 1);
+                const uint32_t next_kv_head = nxt.kv_head;
+                const uint32_t next_q_start = nxt.qb_idx * Br;
+                const uint32_t next_ib3     = nxt.ib3;
+                const bool     has_next     = (next_ib3 < neq3);
 
                 if (has_next) {
                     const uint32_t next_n_rows_q = hex_smin(Br, neq1 - next_q_start);
@@ -2564,6 +2909,11 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         if (mask && next_ib3 != ib3) {
                             next_im3 = fastmodulo(next_ib3, mask->ne[3], &factx.src3_div3);
                         }
+                        // Residency slots are keyed by block index alone, so they belong
+                        // to one (sequence, KV head). Retire the epoch HERE, where the
+                        // push crosses into the next head -- the consumer reaches that
+                        // head one iteration later, which is one push too late.
+                        fa_res_begin_epoch(&factx, next_ib3, next_kv_head);
                         fa_push_chunk(dma, k, v, mask, 0, size_k_row_padded, size_k_row, size_v_row_padded, size_v_row,
                                       next_ik2, next_ik3, next_iv2, next_iv3, next_q_start, next_im3,
                                       next_kv_head, G, m_line_bytes, next_n_rows_q, nek1,

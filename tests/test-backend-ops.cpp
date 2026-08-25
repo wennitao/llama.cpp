@@ -11050,6 +11050,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 1, 1024, 256, 64, 4, true, true,  64, true, /*sel_strided=*/true));
     test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1024, 256, 64, 4, true, true,  64, true, /*sel_strided=*/true));
 
+    // OVERLAPPING per-query-block selections. Every row above has n_sel == nblk/NBq, so
+    // sel_block's +iqb term makes the query blocks' selections pairwise DISJOINT and no
+    // KV block is ever selected twice. That is deliberate (it is what proves the kernel
+    // reads the query axis), but it means none of them stages the same block twice --
+    // so none of them exercises the KV block residency map, which exists precisely to
+    // collapse repeated staging. Here n_sel > nblk/NBq, so sel_block's period in iqb is
+    // nblk/n_sel < NBq: the query blocks' selections repeat, and the KV head's union is
+    // smaller than the sum of its rows.
+    //
+    //                                                     hs   nh nr  kv    nb  bs n_sel mask  perhd  bq  perqb
+    // (A) 4x reuse (union 16 blocks vs 8x8 = 64 stagings per head), GQA, broadcast mask.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1024, 512, 64, 8, true, true,  64, true));
+    // (B) nr == 1 -> PER-HEAD selection and a per-head mask, so each head's union of
+    // blocks differs. The only row that catches a residency map that is not invalidated
+    // when the KV head changes: head n would silently read head 0's K/V rows, which are
+    // real numbers of a plausible magnitude and produce no NaN and no assert.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 1, 1024, 512, 64, 8, true, true,  64, true));
+    // (C) The profiled geometry (kv = 2048, Bc = 128, m = 2, 4 chunks), made checkable:
+    // 2x reuse over a 32-block union.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 2048, 512, 64, 8, true, true,  64, true));
+    // (D) nb = 480 -> a ragged final query tile (8 tiles of 64, 64, ..., 32 rows) while
+    // blocks are being reused: the partial tile's mask/Q descriptors are the ones the
+    // cross-iteration prefetch sizes, and under this ordering it recurs once per head
+    // instead of once per sequence.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1024, 480, 64, 8, true, true,  64, true));
+    // (E) Strided sel view under reuse: proves the residency map's block index comes
+    // from the same sel->nb[1]-honouring read as the DMA source, not from a second one.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1024, 512, 64, 8, true, true,  64, true, /*sel_strided=*/true));
+    // (F) kv = 1000 -> a ragged FINAL KV block under reuse. It also disables grouping
+    // (nek1 % bs != 0), so this is the only overlapping row that runs m == 1, i.e. one
+    // block per chunk, with the broadcast-mask dma_cache live alongside the map.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1000, 512, 64, 8, true, true,  64, true));
+
     // Softmax row-granularity coverage. Every sparse row above lands on a query tile of
     // 32, 64, 128, 256 or 1024 rows, i.e. always a whole number of 64-row softmax units,
     // so none of them can tell a 64-row unit from a 32-row one. These three can. nr == 2

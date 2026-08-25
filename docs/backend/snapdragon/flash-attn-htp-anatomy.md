@@ -767,17 +767,38 @@ arithmetic -- runs 13.6% busy in the best case and 8.4% under a per-query-block 
 **Optimising the HMX path further is pointless.** That is worth stating plainly because the
 instinct on an NPU is to chase the matrix unit.
 
-**2. The per-query-block case is close to DMA-bound.** DMA covers 75.4% of wall. Since DMA time is
-essentially incompressible at a fixed access pattern, the ceiling from making *every* HVX and HMX
-stall vanish is:
+> **CORRECTION.** Finding 2 below is WRONG and the conclusion drawn from it was wrong.
+> The "DMA union coverage" figure is not DMA occupancy. `htp_trace_event_start` for
+> `HTP_TRACE_EVT_DMA` fires when a descriptor is **pushed** (`dma-queue.h:167`, `:226`) and
+> `stop` when it is **popped** (`:258`, `:274`). The pipeline pushes a chunk one iteration
+> ahead of consuming it, so that interval spans a whole loop iteration of compute. It
+> measures **descriptor lifetime in the queue -- pipeline latency -- not transfer time**.
+> A 75% "coverage" is what a healthy prefetch pipeline looks like and says nothing about
+> DRAM bandwidth. See "What the per-query-block path is actually bound by" below for the
+> corrected analysis, which was obtained by excluding DMA and summing only genuine busy
+> intervals.
 
-| | wall | DMA floor | max speedup |
+**2. The per-query-block case is close to DMA-bound.** DMA covers 75.4% of wall, and DMA busy grows
+**2.21x** from shared to per-query-block -- K/V re-staging, partly hidden by the 8-deep descriptor
+pipeline but not nearly hidden enough.
+
+| | wall | DMA union coverage | wall/DMA |
 |:--|--:|--:|--:|
-| shared | 2 076 075 | 1 372 286 | **1.51x** |
-| per-query-block | 4 020 839 | 3 031 713 | **1.33x** |
+| shared | 2 076 075 | 1 372 286 | 1.51x |
+| per-query-block | 4 020 839 | 3 031 713 | 1.33x |
 
-DMA busy grows **2.21x** from shared to per-query-block -- the 8x K/V re-staging, partly hidden by
-the 8-deep descriptor pipeline but not nearly hidden enough.
+**That ratio is not a speedup ceiling, and an earlier revision of this document wrongly presented it
+as one.** The metric is the union of push -> pop intervals (`dma-queue.h:167` starts at push,
+`:258` stops at pop), so a descriptor that finished long ago still counts as busy until the
+consumer gets round to popping it. 3 031 713 is therefore an *upper* bound on true DMA engine
+time, not a lower bound on wall. It stays a good relative signal -- the 2.21x growth is real and
+is what motivated the residency map below -- but it cannot be quoted as a floor.
+
+The same property means the metric will **under-report** any fix that removes transfers without
+removing descriptors: the KV block residency map keeps one descriptor per block and makes the
+redundant ones zero-work (`flash-attn-ops.c`, `fa_push_chunk`), and a zero-work descriptor still
+emits a full push -> pop interval. Measure it with wall clock or an explicit byte counter, or give
+zero-work descriptors a distinct trace id first.
 
 **3. The 4-thread ceiling is visible directly.** Under the per-query-block selection, `HVX_SFM_FA`
 appears on threads 0-3 and is entirely absent from threads 4 and 5. That is
@@ -786,14 +807,43 @@ granularity change did what it claimed while also showing why it could not reach
 
 ### What this redirects
 
-The softmax work (64-row -> 32-row granularity) bought a real 1.45x, but the profile says the
-remaining headroom on that axis is capped at 1.33x and shrinking -- **DMA, not softmax, is now the
-binding constraint for per-query-block attention.**
+The softmax work (64-row -> 32-row granularity) bought a real 1.45x, but the profile says
+**DMA, not softmax, is now the binding constraint for per-query-block attention** -- it is
+outstanding for 75.4% of wall, against softmax's 38-39% on four of six threads.
 
-That makes union staging the correct next lever, and for a reason stronger than the earlier
-cost-model argument: it stages each selected block **once** instead of NBq times, attacking the
-75% DMA coverage directly, *and* it keeps Br large so all 6 softmax threads stay fed. It is the
-only proposal on the table that addresses both terms at once.
+An earlier revision proposed *union staging* as the next lever -- widen Br back to 512 and attend
+each query tile to the union of its query blocks' selections. **That is a regression as stated.**
+The union over NBq query blocks is `nblk/n_sel` times larger than one block's selection (4x for
+every registered `bs=64` row), so a Br=512 tile would attend 32 blocks where it now attends 8:
+softmax and HMX work grow 4x, taking softmax from ~1.55M cycles to ~6M and the wall past the
+current 4.02M. Keeping Br large is not free -- it is paid for in compute.
+
+What is actually implemented instead is a **KV block residency map**: one VTCM slot per KV block
+index, so a block that several query blocks of one head select is DMA'd once per head instead of
+once per query block. It takes the DMA half of the union-staging idea without the compute blow-up.
+The slots hold raw DMA'd rows rather than HMX tiles, so the scatter-transpose still runs on a hit
+and neither HMX kernel changes; the map is carved residually from VTCM the chosen (Br, Bc) left
+over, so no shape's tiling moves. It requires the KV-head loop OUTSIDE the query-block loop, which
+is why the nest is linearised through `fa_iter_at` (`flash-attn-ops.c`) -- dense and
+shared-selection keep the original order.
+
+The reuse it can recover is bounded by the selection itself, and the eval/perf generator's is
+modest: `sel_block` (`tests/test-backend-ops.cpp:7357`) adds `iqb` modulo `nblk` with stride
+`nblk/n_sel = 4`, so the selection set has period 4 in the query block while NBq = 8 -- **2.0x on
+K/V bytes at the profiled shape, 1.67x on total DMA bytes including Q, not the 8x that "NBq
+re-stagings" suggests.** Per-query-block genuinely touches 4x more of the KV than shared selection
+does; that part is the algorithm, and no cache removes it. Production XAttention selections (sink
++ local window + a few global blocks) should overlap more across adjacent query blocks, but that
+is an assumption -- do not quote a production number without measuring a real selection.
+
+After this, the next binding constraint is the blocking HVX chain on the orchestrating thread:
+softmax, K-prep, V-prep and O-proc are all synchronous `work_queue_run` calls, together ~55% of the
+current wall, and residency does not touch any of them. The levers after that, in order:
+(a) softmax throughput, stuck on 4 of 6 threads by `ceil(n_rows_g/32)` at Br=64, which needs
+softmax granularity decoupled from `g_br`; (b) caching HMX *tiles* rather than raw rows, worth the
+K/V-prep on a hit, at the cost of restructuring `hmx_fa_o_update_tile` -- V tiles are strided by
+the chunk's `Bc/32`, and the `d_diag x o_rc` rescale is issued unconditionally before the P.V
+accumulation, so a naive per-block split double-applies it.
 
 ### Reproducing
 
@@ -810,3 +860,65 @@ The dump is ordered thread 0..10 within each batch, so a truncated capture silen
 threads -- segment on `profile-op OPBATCH` and use one complete batch. Pair `start`/`stop` by
 (thread, event, info); nested intervals need a stack, and DMA needs union coverage rather than a
 sum.
+
+
+## What the per-query-block path is actually bound by
+
+Re-derived after the correction above, excluding `DMA` events entirely and summing only
+intervals that are genuine unit-busy time. Same shape, device b4bd0901.
+
+| | shared (Br=512) | per-query-block (Bq=64) |
+|:--|--:|--:|
+| wall | 2 067 119 cyc | 4 062 305 cyc |
+| total unit-busy (7 units) | 8 588 785 | 10 332 553 |
+| **machine utilisation** | **59%** | **36%** |
+
+**Per-query-block does 1.20x the work in 1.97x the time. It is stalled 64% of the time.**
+It is not throughput-bound on any unit -- not DMA, not softmax, not HMX.
+
+Per phase (busy cycles, and the number of intervals they are spread over):
+
+| phase | busy shared -> per-qb | | intervals shared -> per-qb | |
+|:--|--:|--:|--:|--:|
+| `HVX_SFM_FA` | 6 142 263 -> 6 133 483 | **1.0x** | 192 -> 1024 | 5.3x |
+| `HVX_K_PREP` | 191 104 -> 1 340 051 | 7.0x | 192 -> 1536 | 8.0x |
+| `HVX_V_PREP` | 76 778 -> 571 050 | 7.4x | 192 -> 1536 | 8.0x |
+| `HMX_COMP` | 282 346 -> 302 623 | 1.1x | 72 -> 576 | 8.0x |
+| `HVX_O_PROC` | 1 210 817 -> 1 132 172 | 0.9x | 56 -> 448 | 8.0x |
+
+Softmax busy is **identical** -- same FLOPs, simply spread over 5.3x as many intervals.
+Every phase's interval count multiplies by exactly 8, the query-block count. The K/V
+scatter-transpose genuinely grows 7x (the re-staging is real), but at ~1.9 M cycles spread
+over six threads that is only ~6% of wall.
+
+**The cost is 8x more pipeline iterations, each paying its own fixed latency, with the
+machine idle in between.** Fewer, larger iterations is the only thing that addresses it --
+which means a larger `Br`, which is exactly what a per-query-block selection forbids
+directly. Union staging with per-row mask carving keeps `Br` large and is therefore the
+only proposal on the table that attacks the actual constraint.
+
+### The KV block residency cache: correct, and worth nothing
+
+Built and measured (`GGML_HEXAGON_FA_KV_RESIDENCY`, 0 off / 1 auto / 2 force-on /
+3 force-miss). It is correct -- `FLASH_ATTN_EXT_SPARSE` passes 36/36 in all four modes --
+and it demonstrably engages: with it on, the loop order swaps to `kv_head` outer and
+consecutive query blocks stage different blocks, visible in the `HVX_K_PREP` trace tags
+(`0 512 1024 1536 | 0 512 1024 1536` off, versus `0 512 1024 1536 | 64 576 1088 1600` on).
+
+It changes nothing measurable:
+
+| kv | residency off | force-on |
+|--:|--:|--:|
+| 512 | 1747.8 | 1747.4 |
+| 1024 | 1910.1 | 1914.5 |
+| 2048 | 2144.0 | 2135.7 |
+| 4096 | 2905.3 | 2863.3 |
+
+DMA busy is identical to within 0.02% (3 075 459 vs 3 076 180 cycles). That is the expected
+result once finding 2 is corrected: the cache saves KV **DMA bytes**, and DMA bytes were
+never the constraint. It is **defaulted OFF** -- AUTO would still swap the loop order for
+no gain.
+
+Kept rather than reverted because it is correct, gated, and the loop linearisation it
+introduced (`fa_iter_at`, `kv_head_outer`) is what any future union-staging work needs. But
+it should not be enabled, and it should be deleted if union staging does not end up wanting it.

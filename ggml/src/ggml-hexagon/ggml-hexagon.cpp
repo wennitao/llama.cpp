@@ -72,6 +72,14 @@ static int    opt_hostbuf = 1; // hostbuf ON by default
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
+// KV block residency map in the sparse HMX flash-attention kernel; see enum
+// htp_fa_res_mode. Default AUTO. Exposed so the feature can be A/B'd on one binary --
+// without that the perf comparison needs two builds and stops being trustworthy.
+// Default OFF, not AUTO. The feature is correct (36/36 across all four modes) but
+// measured zero gain: it saves KV DMA bytes, and DMA bytes are not what the
+// per-query-block path is bound by. See flash-attn-htp-anatomy.md. AUTO would still
+// swap the loop order for nothing, so it is not a safe default.
+static int    opt_fa_kv_residency = HTP_FA_RES_OFF;
 
 // Default PMU events, if profiling with PMU (mode=2) is enabled
 // See https://docs.qualcomm.com/doc/80-N2040-60/topic/pmu-events.html
@@ -2129,6 +2137,9 @@ static bool ggml_hexagon_precompute_flash_attn_params(
             // Only meaningful with a query axis; the shared-selection path leaves it 0
             // so the device keeps taking row 0 for every query block, as before.
             kparams->u.hmx.sel_bq    = (uint16_t) br_align;
+            // The device still decides: it needs the VTCM the chosen (Br, Bc) left over,
+            // and the selection itself, neither of which is known here.
+            kparams->u.hmx.res_mode  = (uint16_t) opt_fa_kv_residency;
             kparams->u.hmx.mask_broadcast = (mask != nullptr && mask->ne[2] == 1) ? 1 : 0;
             kparams->u.hmx.div_G = init_fastdiv_values(G);
             if (mask) {
@@ -4703,6 +4714,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_nhmx     = getenv("GGML_HEXAGON_NHMX");
     const char * str_mm_select = getenv("GGML_HEXAGON_MM_SELECT");
     const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
+    const char * str_fa_kvres = getenv("GGML_HEXAGON_FA_KV_RESIDENCY");
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
     const char * str_vmem     = getenv("GGML_HEXAGON_VMEM");
@@ -4754,6 +4766,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_nhmx      = str_nhmx     ? atoi(str_nhmx)                         : (str_use_hmx ? atoi(str_use_hmx) : opt_nhmx);
     opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
+    opt_fa_kv_residency = str_fa_kvres ? atoi(str_fa_kvres)               : opt_fa_kv_residency;
     opt_ndev      = str_ndev     ? strtoul(str_ndev, NULL, 0)             : opt_ndev;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf)                      : opt_hostbuf;
     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;

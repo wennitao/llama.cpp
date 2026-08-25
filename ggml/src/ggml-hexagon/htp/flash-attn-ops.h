@@ -23,6 +23,20 @@ extern "C" {
 #define HVX_FA_DMA_CACHE_SIZE  128
 #define HMX_FA_DMA_CACHE_SIZE  4
 
+// Upper bound on the KV block count a residency map can cover. Bounds the two
+// push-side bitmaps carried in hmx_fa_context (FA_RES_MAX_BLOCKS/8 bytes each).
+// At the usual sparse_bs of 64 this is a KV length of 32768.
+#define FA_RES_MAX_BLOCKS      512
+
+// How the device treats the KV block residency map. Rides in kernel params so the
+// same binary can be A/B'd; 0 is OFF so a host that never sets it keeps the old path.
+enum htp_fa_res_mode {
+    HTP_FA_RES_OFF  = 0,  // never build the map
+    HTP_FA_RES_AUTO = 1,  // build it when the selection actually repeats blocks
+    HTP_FA_RES_ON   = 2,  // build it whenever it fits, skipping the duplication probe
+    HTP_FA_RES_MISS = 3   // debug: keep the slot plumbing, never claim a hit
+};
+
 
 #define HTP_FA_M_INITIAL_VAL  -10000.0f
 
@@ -77,7 +91,7 @@ struct htp_fa_kernel_params {
             // the SCORER's block size, not the kernel's Br -- the kernel picks row
             // q_start/sel_bq. 0 = shared selection (sel->ne[1] == 1), the legacy layout.
             uint16_t sel_bq;
-            uint16_t _reserved;
+            uint16_t res_mode;           // enum htp_fa_res_mode (KV block residency)
             int32_t  mask_broadcast;
             int32_t  pipeline;
             struct fastdiv_values div_G;
@@ -252,6 +266,62 @@ static inline size_t hmx_fa_compute_vtcm_usage(size_t gqa_factor, size_t DK, siz
     struct hmx_fa_vtcm_layout L;
     hmx_fa_vtcm_layout_build(&L, gqa_factor, DK, DV, Br, Bc, n_threads, pipeline, is_q_fp32, mask_per_head);
     return L.total_bytes;
+}
+
+// Optional KV block residency region: one dedicated slot per SELECTED KV block, so a
+// block that several query blocks of the same KV head select is DMA'd once per head
+// instead of once per query block. The slots hold raw DMA'd fp16 rows with exactly the
+// staging buffers' row stride -- not HMX tiles -- so nothing downstream of the
+// scatter-transpose changes.
+//
+// Deliberately NOT part of hmx_fa_vtcm_layout_build / hmx_fa_compute_vtcm_usage. The
+// (Br, Bc) search and the host's admissibility test must stay bit-identical to what
+// they were without residency, so this region is carved RESIDUALLY out of whatever
+// VTCM the chosen tiling happened to leave over. If it does not fit, n_slots comes
+// back 0, the feature turns itself off, and every code path is the one that ran
+// before -- which is what keeps a shape that cannot afford the map from silently
+// getting a different tiling.
+#define FA_RES_ALIGN  2048   // symmetry with the HMX tile regions; 128 is the hard floor
+#define FA_RES_SLACK  4096   // keep a page clear of the VTCM end
+
+struct hmx_fa_res_region {
+    size_t off_k;
+    size_t off_v;
+    size_t k_slot_bytes;   // sparse_bs * hex_round_up(DK * 2, 128)
+    size_t v_slot_bytes;   // sparse_bs * hex_round_up(DV * 2, 128)
+    size_t n_slots;        // 0 = disabled / does not fit
+};
+
+static inline void hmx_fa_res_region_build(struct hmx_fa_res_region * R,
+                                           size_t layout_total,
+                                           size_t vtcm_budget,
+                                           size_t n_blocks,
+                                           size_t bs,
+                                           size_t k_row_padded,
+                                           size_t v_row_padded) {
+    R->off_k        = 0;
+    R->off_v        = 0;
+    R->k_slot_bytes = bs * k_row_padded;
+    R->v_slot_bytes = bs * v_row_padded;
+    R->n_slots      = 0;
+
+    const size_t slot = R->k_slot_bytes + R->v_slot_bytes;
+    const size_t off  = hex_align_up(layout_total, FA_RES_ALIGN);
+
+    if (n_blocks == 0 || slot == 0 || off + FA_RES_SLACK >= vtcm_budget) {
+        return;
+    }
+
+    // All-or-nothing: a partially resident map would mix slot addresses with staging
+    // addresses in one chunk, and that mixed path has no test coverage yet.
+    const size_t free_bytes = vtcm_budget - off - FA_RES_SLACK;
+    if (free_bytes / slot < n_blocks) {
+        return;
+    }
+
+    R->off_k   = off;
+    R->off_v   = off + n_blocks * R->k_slot_bytes;
+    R->n_slots = n_blocks;
 }
 
 #define FA_HVX_BLOCK_SIZE 64
