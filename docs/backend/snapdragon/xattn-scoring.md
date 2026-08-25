@@ -397,3 +397,58 @@ At `Lk=2048` with the reversal gone: matmul 534 (68%), epilogue 257 (32%). The m
 is only 32 rows at `Lq=512, S=16`, so it is tall-skinny and starved, the same shape pathology
 the original stand-in had. Raising `S` makes it worse, not better (`Nq` shrinks); `S=8` gets
 926 GFLOP/s but loses overall on 2x the FLOPs.
+
+## Relocating the reversal to CPU: measured, and it loses
+
+The scorer splits cleanly into work each unit is good at -- HTP wins the reduced matmul 3.7x
+(233 vs 862 µs), CPU wins the antidiagonal reversal 2.5x (107 vs 272 µs, both 8-threaded and
+bandwidth-bound). That looks like an obvious split, so `examples/xattn-split` was built to
+measure it: every tensor allocated in ONE hexagon rpcmem region, the two backends dispatched by
+hand, so placement is proven by construction rather than by scheduler debug output.
+
+**It loses, and not narrowly.** Device 87b3a4aa, Lq=512, S=16, min of 20 whole-graph iterations:
+
+| Lk | all-HTP | A: cpu(rev) then htp(rest) | | overlap ceiling* | correct pipeline | |
+|--:|--:|--:|--:|--:|--:|--:|
+| 512 | 993 | 1560 | **0.64x** | 593 | 1470 | 0.68x |
+| 1024 | 1254 | 1765 | **0.71x** | 1148 | 2457 | 0.51x |
+| 2048 | 1697 | 2629 | **0.65x** | 1397 | 2753 | 0.62x |
+
+\* dependency deliberately broken, so its results are garbage -- an upper bound only.
+
+NMSE of both the split and the pipeline against the all-HTP result is **0.0**, so the algebra and
+the CPU/DSP coherency are both correct. This is purely a performance result.
+
+### Why: the CPU cannot cheaply compute over rpcmem
+
+The zero-copy premise was that hexagon buffers are host memory -- `rpcmem_alloc2` with
+`RPCMEM_HEAP_ID_SYSTEM`, `buffer_type_is_host` returns true -- so the CPU can work over them with
+no boundary copy. It can, correctly. It just cannot do it *fast*:
+
+| CPU reversal, identical graph | time | |
+|:--|--:|--:|
+| over malloc'd memory | **105 µs** | baseline |
+| over hexagon rpcmem, HTP idle | **242 µs** | 2.3x |
+| over hexagon rpcmem, after HTP has executed on it | **793-1068 µs** | 7.5-10x |
+
+Two effects stack: rpcmem is intrinsically slower for CPU access than ordinary memory, and it
+degrades a further 3-4x once the DSP has run over the same region. The second effect is the one
+that kills it, and it is invisible to any benchmark that measures the CPU in isolation -- which
+is exactly how the original 107 µs figure was obtained.
+
+At 793-1068 µs the CPU is no longer faster than HTP's 272 µs at this op; it is 3-4x slower. The
+premise of the whole split evaporates.
+
+The alternative -- allocate on CPU and copy across the boundary -- was priced before building:
+`q_antidiag` is 4.19 MB, so the copy moves 8.39 MB single-threaded and needs >50 GB/s to fit
+inside the 165 µs of headroom, against ~10-20 GB/s realistic single-core. That route loses too,
+by 3-5x.
+
+### What this means more generally
+
+This is the second heterogeneous-pipeline idea in this work to die on measurement -- the first
+was offloading the block gather, priced at a 1.02-1.11x ceiling. Both died for the same
+underlying reason: **on this platform the cost of sharing a buffer between CPU and DSP exceeds
+the compute being offloaded.** Any future split should be gated on the R1 measurement in
+`examples/xattn-split` -- CPU-over-rpcmem versus CPU-over-malloc, taken *after* the DSP has run --
+before any implementation work. The harness prints STOP on its own when that ratio is bad.

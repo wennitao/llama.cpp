@@ -271,6 +271,14 @@ build: 6a8cf8914 (6733)
       `GGML_HEXAGON_OPSTAGE=0x1 llama-completion ...` - Ops are enqueued to the NPU but dma & compute are disabled
       `GGML_HEXAGON_OPSTAGE=0x3 llama-completion ...` - Full queuing and processing of Ops (default)
 
+- `GGML_HEXAGON_ASYNC=0`
+  Controls whether `graph_compute` waits for the NPU. The default is 0, i.e. it waits.
+  With `1`, `graph_compute` only submits the op batch and the wait moves to `synchronize`,
+  which is what `ggml_backend_graph_compute_async` expects. That lets a caller run CPU work
+  between the submit and the wait -- see `llama-xattn-split`. It does NOT make
+  `ggml_backend_sched` overlap anything: sched synchronizes at every backend transition.
+  Only enable it if you drive the backends yourself and keep every Hexagon call on one thread.
+
 - `GGML_HEXAGON_OPFILTER=regex`
   Allows filtering (disabling) Ops that match the regex pattern:
 

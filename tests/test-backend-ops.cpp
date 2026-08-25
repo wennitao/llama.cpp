@@ -7657,7 +7657,14 @@ struct test_flash_attn_ext_gather_rows : public test_case {
             return c;
         }
 
-        // stage 3: gather straight to F16, collapsing GET_ROWS+CPY into one op. ggml_get_rows
+        // stage 3: gather straight to F16, collapsing GET_ROWS+CPY into one op.
+        //
+        // MUST NOT be run on a backend whose GET_ROWS writes F32. ggml-cpu's
+        // get_rows_f16 does exactly that (ggml_cpu_fp16_to_fp32 into a float* dst,
+        // ggml/src/ggml-cpu/ops.cpp:4925), and this destination is F16-typed, i.e. half
+        // the size it would need -- so `perf -b CPU` overflows the heap here rather than
+        // merely producing a wrong number. It is safe on ggml-hexagon, whose F16->F16
+        // GET_ROWS writes F16. ggml_get_rows
         // hardcodes a F32 return ("TODO: implement non F32 return" in ggml.c), so the node is
         // built by hand -- exactly the graph a fused or type-taking get_rows would emit.
         if (stage == 3) {
@@ -7936,7 +7943,15 @@ struct test_xattn_score : public test_case {
     // so in a runtime the permutation becomes a cache-write cost amortised across chunks
     // rather than a per-chunk one. Measured at Lq=512 the Q-side reversal is a flat
     // ~262 us, which is 25-43% of the whole scoring pass.
-    const int     rev_k;   // 0 = reverse Q, 1 = reverse K portably, 2 = reverse K direct to F16
+    // 0 = reverse Q, 1 = reverse K. A third variant gathered K straight to F16 (which
+    // ggml-hexagon's F16->F16 GET_ROWS supports) and measured 1.8-2.2x faster than the
+    // portable form -- but it is UNSAFE to express here: ggml_get_rows hardcodes an F32
+    // result, and ggml-cpu's get_rows_f16 writes F32 into the destination
+    // (ggml_cpu_fp16_to_fp32 into a float*, ops.cpp:4925). An F16-typed destination is
+    // half the required size, so that node overflows the heap on any backend that writes
+    // F32 -- reproduced as "double free or corruption" under `perf -b CPU`. Realising it
+    // needs a type-taking get_rows in ggml, not a hand-built node.
+    const int     rev_k;
     const int     stage; // 0 attn_sum, 1 reduced matmul, 2 the reversal,
                          // 3 row-mass invariant, 4 stage 1 timed whole-graph
 
@@ -8041,23 +8056,7 @@ struct test_xattn_score : public test_case {
         // becomes a cache-write cost amortised over all chunks instead of a per-chunk one.
         ggml_tensor * qperm = q;
         ggml_tensor * kperm = k;
-        if (rev_k == 2) {
-            // ggml_get_rows hardcodes an F32 result ("TODO: implement non F32 return" in
-            // ggml.c), so the portable form below pays a cast back to F16. Build the node
-            // by hand instead -- exactly the graph a type-taking get_rows would emit, and
-            // the shape ggml-hexagon's F16->F16 GET_ROWS accepts.
-            //
-            // PERF ONLY: ggml-cpu's get_rows_f16 writes F32 (ggml_cpu_fp16_to_fp32 into a
-            // float* dst, ops.cpp:4925), so the CPU reference miscomputes this node and an
-            // eval row would fail on the harness rather than on the kernel. rev_k=1
-            // validates the identical algebra portably; this only measures its speed.
-            ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, Lk, Hkv, 1);
-            g->op     = GGML_OP_GET_ROWS;
-            g->src[0] = k;
-            g->src[1] = idx;
-            ggml_set_name(g, "k_antidiag");
-            kperm = g;
-        } else if (rev_k == 1) {
+        if (rev_k == 1) {
             kperm = ggml_cast(ctx, ggml_get_rows(ctx, k, idx), GGML_TYPE_F16);
             ggml_set_name(kperm, "k_antidiag");
         } else {
@@ -11949,10 +11948,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_xattn_score(128, 16, 8, 512, kv, S, 64, stage));
             }
             // same shapes with the reversal moved to K
-            for (int rk : { 1, 2 }) {
-                for (int stage : { 2, 0 }) {
-                    test_cases.emplace_back(new test_xattn_score(128, 16, 8, 512, kv, S, 64, stage, rk));
-                }
+            for (int stage : { 2, 0 }) {
+                test_cases.emplace_back(new test_xattn_score(128, 16, 8, 512, kv, S, 64, stage, /*rev_k=*/1));
             }
         }
     }
