@@ -740,3 +740,73 @@ const uint32_t kv_rows = fa_chunk_rows(&factx, kv_blk, kv_head, ib3, nek1);
 - The `hmx_fa_vtcm_layout` struct comment says `m_buf_slot_bytes` is `align_up(Br * m_line_bytes, 4096)` while the code uses 256 (`htp/flash-attn-ops.h:132` vs `:172`). Harmless at the shapes above, where the value is already 4096-aligned.
 - FA never uses `HMX_LOAD_MPY_DEEP_F16`, even though `q_tiles + r*dot_stride` and `k_tiles + c*dot_stride` are contiguous runs exactly as the matmul kernels require for it (`htp/hmx-mm-kernels-tiled.h:613-627`). Whether that is a deliberate constraint (`:deep` may require an explicit `mxclracc`, which FA does not issue, and may interact with the D·O_prev seed packet) or simply an unexploited optimisation is not determinable from source or the commits checked.
 - `worker-pool.h` no longer exists; `work-queue.h:34-36` provides `worker_pool_run_func` as a `#define` alias for `work_queue_run`, so the two names in the tree are the same function.
+## Compute-unit occupancy, measured
+
+`GGML_HEXAGON_PROFILE=3` emits per-thread cycle-stamped trace events (`htp_trace_event_start/stop`,
+`hex-profile.h:46-62`) rendered by `ggml_hexagon_dump_trace_events`
+(`ggml-hexagon.cpp:194-213`). Scoping it to a single shape gives a full picture of which unit is
+actually busy. Device 87b3a4aa (SM8750, 6 HVX threads + 1 HMX), kv=2048, nb=512, bs=64, n_sel=8
+(25% density). Thread 10 is the dedicated HMX thread.
+
+| | shared selection (Br=512) | per-query-block (Bq=64, Br=64) |
+|:--|--:|--:|
+| wall | 2 076 075 cyc (1216 µs) | 4 020 839 cyc (2354 µs) |
+| **HMX busy** | **13.6%** | **8.4%** |
+| softmax (`HVX_SFM_FA`) | 55-56% on 5 threads, 19% on the 6th | 38-39% on **4 threads**, 0% on two |
+| `HVX_O_PROC` | ~10% | ~5% |
+| `HVX_K_PREP` | ~2% | ~6% |
+| **DMA union coverage** | **66.1%** | **75.4%** |
+
+DMA is issued with up to **8 descriptors in flight**, so the naive sum of its intervals exceeds
+100% of wall; the figures above are union coverage, which is the meaningful number.
+
+### Three findings
+
+**1. HMX is idle ~90% of the time.** The matrix unit -- the part doing the actual attention
+arithmetic -- runs 13.6% busy in the best case and 8.4% under a per-query-block selection.
+**Optimising the HMX path further is pointless.** That is worth stating plainly because the
+instinct on an NPU is to chase the matrix unit.
+
+**2. The per-query-block case is close to DMA-bound.** DMA covers 75.4% of wall. Since DMA time is
+essentially incompressible at a fixed access pattern, the ceiling from making *every* HVX and HMX
+stall vanish is:
+
+| | wall | DMA floor | max speedup |
+|:--|--:|--:|--:|
+| shared | 2 076 075 | 1 372 286 | **1.51x** |
+| per-query-block | 4 020 839 | 3 031 713 | **1.33x** |
+
+DMA busy grows **2.21x** from shared to per-query-block -- the 8x K/V re-staging, partly hidden by
+the 8-deep descriptor pipeline but not nearly hidden enough.
+
+**3. The 4-thread ceiling is visible directly.** Under the per-query-block selection, `HVX_SFM_FA`
+appears on threads 0-3 and is entirely absent from threads 4 and 5. That is
+`ceil(n_rows_g/32) = ceil(128/32) = 4` units, exactly as predicted, and it confirms the 32-row
+granularity change did what it claimed while also showing why it could not reach 6.
+
+### What this redirects
+
+The softmax work (64-row -> 32-row granularity) bought a real 1.45x, but the profile says the
+remaining headroom on that axis is capped at 1.33x and shrinking -- **DMA, not softmax, is now the
+binding constraint for per-query-block attention.**
+
+That makes union staging the correct next lever, and for a reason stronger than the earlier
+cost-model argument: it stages each selected block **once** instead of NBq times, attacking the
+75% DMA coverage directly, *and* it keeps Br large so all 6 softmax threads stay fed. It is the
+only proposal on the table that addresses both terms at once.
+
+### Reproducing
+
+```sh
+# Tag the shapes of interest so the trace can be scoped -- the full sweep emits ~18M lines.
+# The two FA_SPARSE_PROF perf rows already carry that tag.
+D=/data/local/tmp/llama.cpp
+adb shell "cd $D && GGML_HEXAGON_PROFILE=3 GGML_HEXAGON_VERBOSE=1 \
+  ADSP_LIBRARY_PATH=$D/lib LD_LIBRARY_PATH=./lib \
+  ./bin/test-backend-ops perf -b HTP0 -o FA_SPARSE_PROF" > trace.txt 2>&1
+```
+
+The dump is ordered thread 0..10 within each batch, so a truncated capture silently loses whole
+threads -- segment on `profile-op OPBATCH` and use one complete batch. Pair `start`/`stop` by
+(thread, event, info); nested intervals need a stack, and DMA needs union coverage rather than a
+sum.

@@ -7284,7 +7284,12 @@ struct test_flash_attn_ext_sparse : public test_case {
     // rather than assumed contiguous.
     const bool    sel_strided;
 
-    std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_EXT_SPARSE"; }
+    // A distinct tag so a single shape can be isolated for profiling: GGML_HEXAGON_PROFILE=3
+    // emits per-thread cycle-stamped trace events for every run of every case, which is
+    // millions of lines across the full sweep and unparseable. Tagging two rows lets the
+    // trace be scoped to exactly the comparison of interest.
+    bool prof = false;
+    std::string op_desc(ggml_tensor *) override { return prof ? "FA_SPARSE_PROF" : "FLASH_ATTN_EXT_SPARSE"; }
 
     std::string vars() override {
         // The query-axis knobs are appended only when in use, so every pre-existing
@@ -11779,6 +11784,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext_gather_rows(128, 8, 2, kv, nb, bs, n_sel, /*stage=*/2, GGML_TYPE_F16));
         test_cases.emplace_back(new test_flash_attn_ext_gather_rows(128, 8, 2, kv, nb, bs, n_sel, /*stage=*/1, GGML_TYPE_F32));
         test_cases.emplace_back(new test_flash_attn_ext_gather_rows(128, 8, 2, kv, nb, bs, n_sel, /*stage=*/3, GGML_TYPE_F16));
+    }
+
+    // Two profiling rows, tagged so GGML_HEXAGON_PROFILE=3 can be scoped to them: the
+    // shared-selection baseline and the per-query-block case, same shape, so the trace
+    // shows exactly which phase the per-query-block penalty lands in.
+    {
+        auto * a = new test_flash_attn_ext_sparse(128, 8, 2, 2048, 512, 64, 8, /*mask=*/false);
+        a->prof = true;
+        test_cases.emplace_back(a);
+        auto * b = new test_flash_attn_ext_sparse(128, 8, 2, 2048, 512, 64, 8, /*mask=*/false,
+                                                  /*per_head_sel=*/true, /*bq=*/64, /*per_qblock=*/true);
+        b->prof = true;
+        test_cases.emplace_back(b);
     }
 
     // Scattered-read FA vs contiguous FA, both PER QUERY BLOCK, gather excluded.
