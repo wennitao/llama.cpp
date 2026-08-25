@@ -10963,6 +10963,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
 
+    // Softmax row-granularity coverage. Everything else in this matrix produces query
+    // tiles whose row count is either a multiple of 32 or smaller than 32, so nothing
+    // exercises a partial 32-row softmax unit that is not also the whole tile. G=3 does
+    // both at once: the first tile is n_rows_g = 3*121 = 363 (12 units, so odd unit
+    // indices exist) and the tail tile is 39 -- odd AND wider than one unit, the only
+    // shape here where the hex_align_up(n_rows_g, 2) row-pair break fires inside a
+    // SECOND unit. 32 % 3 != 0 additionally means consecutive units start on different
+    // ALiBi slopes, so max_bias = 8 turns a mis-indexed slope load into a wrong answer;
+    // it also routes the case to the generic softmax rather than a specialization.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {3, 1}, 512, 134, true, false, 8.0f, 0.0f,
+                                                    GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
     // dense-allocated (non-view) quant K/V at batch >= 64, in cache and native layouts
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
@@ -11032,6 +11044,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // case that proves the kernel reads sel->nb[1] instead of assuming contiguity.
     test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 1, 1024, 256, 64, 4, true, true,  64, true, /*sel_strided=*/true));
     test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1024, 256, 64, 4, true, true,  64, true, /*sel_strided=*/true));
+
+    // Softmax row-granularity coverage. Every sparse row above lands on a query tile of
+    // 32, 64, 128, 256 or 1024 rows, i.e. always a whole number of 64-row softmax units,
+    // so none of them can tell a 64-row unit from a 32-row one. These three can. nr == 2
+    // is also the exact GQA factor the per-query-block path is starved at (bq forces
+    // Br = 64, so n_rows_g = 128 = two 64-row units on a six-thread machine), and no
+    // sparse case used it before.
+    //                                                     hs   nh nr  kv    nb  bs n_sel mask  perhd  bq  perqb
+    // nb = 176 -> query tiles of 128, 128, 96 rows. The 96-row tile is three 32-row
+    // units: an ODD unit count, so the last unit has no 64-row partner and a unit index
+    // scaled by the wrong factor shows up as a 32-row band rather than as noise.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 2, 1024, 176, 64, 4, true, true,  64, true));
+    // nb = 177 -> a final tile of 98 rows: a PARTIAL last unit with 2 live rows of 32,
+    // where the pad lanes must stay an identity update (D diagonal 1.0, l unchanged).
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 2, 1024, 177, 64, 4, true, true,  64, true));
+    // nr == 1 puts a NON-broadcast per-head mask on a partial unit (tiles of 64, 64, 48)
+    // via the generic softmax, and is the only sparse shape this granularity takes from
+    // one softmax thread to two.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 1, 1024, 176, 64, 4, true, true,  64, true));
 
     // Query-subsampling top-k scoring (the XAttention stand-in). These were previously
     // registered only in the perf list, so `test -o QSUB_BLOCK_SCORES` reported 0/0 and
@@ -11642,6 +11673,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_xattn_score(128, 16, 8, kv, kv, S, 64, stage));
             }
         }
+        // The shape a chunked prefill actually scores: one nb=512 query chunk against
+        // every key so far, NOT the square Lq=Lk above. This is the row that pairs with
+        // the FLASH_ATTN_EXT_SPARSE sweep (nb=512, 25% density) for an end-to-end total;
+        // comparing against the square rows would overstate scoring by up to 4x at
+        // kv=2048, which is exactly the mismatched-shape error this file has fallen for
+        // before.
+        for (int S : { 8, 16 }) {
+            test_cases.emplace_back(new test_xattn_score(128, 16, 8, 512, kv, S, 64, /*stage=*/0));
+        }
+    }
+    // kv=4096 too: scoring is linear in Lk at fixed Lq, while 25%-density attention is
+    // sublinear (it tiles better as kv grows), so this is where the end-to-end balance
+    // shifts. Extrapolating from kv=2048 would guess at exactly that.
+    for (int S : { 8, 16 }) {
+        test_cases.emplace_back(new test_xattn_score(128, 16, 8, 512, 4096, S, 64, /*stage=*/0));
     }
 
     // Direct like-for-like with mllm's NPU attention figure: Sq=Skv=1024, 25% density,
@@ -11733,6 +11779,35 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext_gather_rows(128, 8, 2, kv, nb, bs, n_sel, /*stage=*/2, GGML_TYPE_F16));
         test_cases.emplace_back(new test_flash_attn_ext_gather_rows(128, 8, 2, kv, nb, bs, n_sel, /*stage=*/1, GGML_TYPE_F32));
         test_cases.emplace_back(new test_flash_attn_ext_gather_rows(128, 8, 2, kv, nb, bs, n_sel, /*stage=*/3, GGML_TYPE_F16));
+    }
+
+    // Scattered-read FA vs contiguous FA, both PER QUERY BLOCK, gather excluded.
+    //
+    // The in-kernel arm (test_flash_attn_ext_sparse, per_qblock) never materialises
+    // anything: the selection is a DMA source offset, so block j is read straight from
+    // the full K/V tensor at row sel[qb][j]*bs (flash-attn-ops.c:1902). The question is
+    // whether that scattered read costs more than attending to an already-contiguous
+    // buffer at the same shape.
+    //
+    // The contiguous counterpart is NOT one dense FA over nb=512 -- with a per-query-block
+    // selection each query block has its OWN gathered buffer, so it is NBq = nb/Bq
+    // independent dense FAs of (Bq queries x n_sel*bs keys). The gather itself is excluded
+    // on purpose: these rows price the attention kernel alone.
+    //
+    // FLOP parity: sparse does nb * (n_sel*bs) query-key pairs per head; the contiguous
+    // side does NBq * Bq * (n_sel*bs) = nb * (n_sel*bs). Identical.
+    //
+    // Note both sides are forced into small query tiles -- the contiguous FA sees only
+    // Bq=64 queries, so it hits the same ceil(G*Br/64) softmax-thread limit the in-kernel
+    // arm does. The tiling penalty is a property of per-query-block attention, not of
+    // scattered reads, and this pairing is what shows that.
+    for (int kv : { 512, 1024, 2048, 4096 }) {
+        const int bs = 64, nb = 512, bq = 64;
+        const int n_sel = (kv / bs) / 4;          // 25% density
+        const int kv_g  = n_sel * bs;             // rows in one query block's buffer
+        // one query block's dense FA; multiply by nb/bq to get the arm's total
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, kv_g, bq, /*mask=*/false));
+        GGML_UNUSED(nb);
     }
 
     // Attribute the per-query-block penalty. The MAC count is identical across every

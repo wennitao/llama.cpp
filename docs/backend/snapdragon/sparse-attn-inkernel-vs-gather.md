@@ -427,14 +427,106 @@ Same `q_blocks = 8` in both. The only difference is thread count. So:
 - **K/V re-staging costs 1.46x**
 - **Softmax starvation costs a further 2.06x**, and is the dominant term
 
-### What this implies for the fix
+### The fix: 32-row softmax units
 
-The union-staging workaround attacks (a), the smaller half. The bigger win is to stop the
-softmax phase partitioning over query rows. It currently splits `n_rows_g` into 64-row
-vectors; at small `Br` there are not enough to go round. Partitioning over the KV/column
-axis instead -- per-thread partial max and sum, then a cheap combine -- would hold 6
-threads at any `Br` and should take 3.00x down to about 1.46x without giving up
-per-query-block selection at all.
+`fa_softmax_impl` split the query rows into **64-row** units, because the online-softmax
+state is lane-packed one value per row and a 64-row group was treated as indivisible. It
+is not. Every object it touches is already 32-row granular:
 
-That is a change to how one phase is parallelised, not to the algorithm or the data
-layout, and it is independent of everything else in this document.
+- `vtcm_m_vec` / `vtcm_l_vec` are **f32**, so one 128-byte vector holds 32 rows. The
+  64-row unit read them as a `[i*2+0]`, `[i*2+1]` pair.
+- The rescale matrix `D` is a 32x32 HMX tile, and `d_tile_scatter_offsets`
+  (`hmx-fa-kernels.h:15`) has exactly 32 live entries. A 64-row unit scattered twice,
+  the second time after `Q6_V_vror_VR(v_exp_m_diff, 64)` -- 64 *bytes*, i.e. 32 fp16
+  lanes -- to bring rows 32..63 down.
+- `fa_build_d_diag_inv_l` (`:1611`) already walks `vtcm_l_vec` one vector per 32 rows.
+
+So the units were halved (`flash-attn-ops.c:1193` and `:1631`, which must move together)
+and the paired indexing collapsed to a single vector. `n_row_vec_cnt` now equals
+`n_row_tiles` exactly, the `r_vec_off < 32` branch in the innermost row loop is gone, and
+one of the two `vscatter`s is gone with it.
+
+**The output is bit-identical.** Row `r` maps to (`m`/`l` vector `r/32`, lane `r%32`) and
+to D tile `r/32` under *both* schemes, and every operation between the load and the store
+is lane-wise. What changes is only which thread does the work.
+
+Only the fp16 accumulators (`rowmax_acc_v`, `rowsum_acc_v`, the slope vector) now half-fill
+-- 32 of their 64 lanes -- which is exactly what a partial 64-row unit did already.
+
+One real hazard, and it is silent. The ALiBi slopes are loaded with `hvx_vmem`, an
+**aligned** load (`hvx-base.h:12`); at fp16 a 32-row stride is 64 bytes, so odd units would
+be misaligned, and Hexagon's `vmem` masks the low 7 address bits rather than faulting -- it
+would return the wrong 128 bytes with no NaN and no crash. `hvx_vmemu` is not the fix
+either: at unit `u` it reads `[u*64, u*64+128)`, and `off_slopes` is the **last** VTCM
+allocation with `total_bytes = off` (`flash-attn-ops.h:236`), so for an even unit count
+that runs 64 bytes past a layout the device accepts at exactly `vtcm_size`. The kernel
+instead loads the enclosing 128-byte block (`r_vec_idx & ~1`, provably in bounds for both
+parities since `slopes_size = align_up(g_br*2, 128)` and `g_br` is 32-aligned) and folds
+the odd-unit half into the per-row `vror`, whose amount stays under 128 bytes.
+
+### Why not the key-axis split
+
+The earlier version of this section recommended partitioning the softmax over the KV
+column axis. That was priced against the wrong width. The softmax sees one **chunk**, not
+the whole selection: at kv=2048/bs=64/n_sel=8 the search picks `Bc = 128`, i.e. **two**
+64-column groups, not eight. At two groups a column split alone reaches the same 4-of-6
+utilisation that 32-row units reach, and combining the two adds nothing
+(`8/(6x2)` is the same 67%). It would cost per-thread partial `m`/`l`, a hand-rolled
+barrier inside one `work_queue_run`, a sinks term that must be applied exactly once
+against the *final* `m`, and a per-(row, column-group) rescale that is not a diagonal on
+either side of `P.V` -- `hmx_fa_o_update_tile` (`hmx-fa-kernels.h:119`) takes one `d_diag`
+for all column tiles. Zero marginal gain for all of that.
+
+Two other candidates were also rejected: parallelising over kv_head (there is one HMX unit
+-- `main.c:640` -- and `work_queue_run_async` publishes exactly one task, so it cannot
+nest); and staging the union of the query blocks' selections and carving it with the mask
+(zero kernel change, but this benchmark's selection is deliberately near-disjoint, so the
+union is 2-4x more KV columns, and it forces the mask on).
+
+### What it should be worth
+
+Softmax phase time is proportional to (rounds) x (rows per unit). Correcting one number in
+the table above first: the `G=8` control does **not** run 6 threads. `n_rows_g = 512` is 8
+units of 64; `n_use = min(6, 8) = 6` but `vecs_per_t = ceil(8/6) = 2`, so threads 0-3 take
+two units each and threads 4-5 hit the `vec_start >= n_row_vec_cnt` early return at
+`:1204`. It runs **4 busy threads, 2 rounds**. That does not change the attribution -- it
+is the per-row cost that matters:
+
+| config | before (64-row) | after (32-row) | rows of work per row |
+|:--|--:|--:|--:|
+| `G=2, Br=64` (`n_rows_g=128`) | 2 units, 2 busy, 1 round = 64 | 4 units, 4 busy, 1 round = 32 | 0.50 -> **0.25** |
+| `G=8, Br=64` control (`n_rows_g=512`) | 8 units, 4 busy, 2 rounds = 128 | 16 units, 6 busy, 3 rounds = 96 | 0.25 -> 0.1875 |
+| shared selection (`n_rows_g=1024`) | 16 units, 6 busy, 3 rounds = 192 | 32 units, 6 busy, 6 rounds = 192 | 0.1875 -> **0.1875** |
+
+**The phase gets exactly 2.00x at the target shape**, which is also the ceiling: 32 rows is
+the D-tile atom, so `n_rows_g = 128` has only 4 atoms and 6-of-6 is unreachable. Sweeping
+12000 `(n_rows_g, n_threads)` pairs with a makespan model that honours the early break,
+4864 improve and **none regress**.
+
+The prediction this makes is falsifiable: `G=2, Bq=64` moves to the same 0.25 rows-per-row
+as the `G=8` control, so the **3.00x row should fall onto the control's band (~1.46x)**,
+leaving K/V re-staging as the whole residual. Note the control speeds up too (0.25 ->
+0.1875), so compare per-row softmax cost, not raw ratios against a moving control. The
+shared-selection row has an identical makespan before and after, which makes it a clean
+control for "did anything regress".
+
+The **host cost model was deliberately left alone.** `hmx_fa_find_chunk_size` still prices
+the softmax at 64 rows (`flash-attn-ops.h:383`). Updating it changes 4129 of 17160 dense
+`(D, G, nb, kv)` tilings at T=6/8 MiB -- e.g. `D=64 G=2 nb=512 kv=2048` moves from
+`(Br=512, Bc=512)` to `(288, 704)` -- and buys nothing here, because `br_align` caps `Br`
+at `bq` *before* the cost model runs (`flash-attn-ops.h:324`), so every sparse
+**per-query-block** configuration in the sweep above keeps its `(Br, Bc)` either way. The
+one row that would move is the *shared-selection* baseline at `G=8`, `(288,128) ->
+(264,128)` -- i.e. updating the host model would perturb the control the 1.46x is measured
+against. Shipping the kernel change alone gets the full 2x with zero tiling risk.
+
+### Not yet measured
+
+Everything in this section is derived from the real chunk-size search and the real dispatch
+arithmetic, compiled and run on the host. **No device run has been made.** Specifically
+unverified: the 2.00x itself, the 3.00x -> ~1.46x prediction, and the bit-identity claim.
+Bit-identity is the one to treat as a hard gate -- if any existing case shows *any* NMSE
+delta, the reindexing is wrong somewhere and it is not tolerance noise. Because the
+baseline carries 11 known failures (nearly all `sinks=1`), capture the failing `vars()`
+strings before the change and diff the identity set; counting passes cannot distinguish
+"broke two, fixed two" from "changed nothing".

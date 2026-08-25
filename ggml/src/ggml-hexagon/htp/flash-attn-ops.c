@@ -1190,7 +1190,7 @@ static inline void fa_softmax_impl(
     const size_t Bc             = args->Bc;
     const size_t G              = args->G;
     const size_t n_tiles_per_bc = args->n_tiles_per_bc;
-    const size_t n_row_vec_cnt  = hmx_ceil_div(n_rows_g, 64);
+    const size_t n_row_vec_cnt  = hmx_ceil_div(n_rows_g, 32);
     const uint32_t im3          = has_mask ? fastmodulo(args->ib3, args->mask->ne[3], &factx->src3_div3) : 0;
 
     size_t vec_start = 0;
@@ -1206,7 +1206,7 @@ static inline void fa_softmax_impl(
     }
 
     struct htp_thread_trace * tr = &factx->octx->ctx->trace[i];
-    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_SFM, (uint16_t) (args->q_start * G + vec_start * 64));
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_SFM, (uint16_t) (args->q_start * G + vec_start * 32));
 
     // Per-thread row scratch: thread i uses bufs at offset i * 2 * stride
     const size_t row_buf_stride = factx->row_buf_stride;
@@ -1218,16 +1218,21 @@ static inline void fa_softmax_impl(
     for (size_t r_vec_idx = vec_start; r_vec_idx < vec_end; ++r_vec_idx) {
         HVX_Vector rowmax_acc_v = v_neg_inf;
         HVX_Vector rowsum_acc_v = Q6_V_vzero();
-        HVX_Vector m_prev_v0    = factx->vtcm_m_vec[r_vec_idx * 2 + 0];
-        HVX_Vector m_prev_v1    = factx->vtcm_m_vec[r_vec_idx * 2 + 1];
+        HVX_Vector m_prev_v0    = factx->vtcm_m_vec[r_vec_idx];
 
+        // A 32-row unit starts 64 B into the fp16 slopes array on odd units, but
+        // hvx_vmem is an ALIGNED load, and hvx_vmemu would read 64 B past the end of
+        // vtcm_slopes -- the last VTCM allocation, which may end exactly at
+        // ctx->vtcm_size. Load the enclosing 128 B block (always in bounds) and fold
+        // the odd-unit half into the per-row rotate below.
         HVX_Vector v_slopes = Q6_V_vzero();
         if (has_alibi) {
-            v_slopes = hvx_vmem(args->slopes + r_vec_idx * 64);
+            v_slopes = hvx_vmem(args->slopes + (r_vec_idx & ~(size_t) 1) * 32);
         }
+        const uint32_t slope_lane0 = (uint32_t) (r_vec_idx & 1) * 32;
 
-        for (uint32_t r_vec_off = 0; r_vec_off < 64; r_vec_off += 2) {
-            uint32_t r = r_vec_idx * 64 + r_vec_off;
+        for (uint32_t r_vec_off = 0; r_vec_off < 32; r_vec_off += 2) {
+            uint32_t r = r_vec_idx * 32 + r_vec_off;
             if (r >= hex_align_up(n_rows_g, 2)) {
                 break;
             }
@@ -1293,8 +1298,8 @@ static inline void fa_softmax_impl(
             HVX_Vector v_slope0 = Q6_V_vzero();
             HVX_Vector v_slope1 = Q6_V_vzero();
             if (has_alibi) {
-                v_slope0 = hvx_vec_repl_f16(Q6_V_vror_VR(v_slopes, r_vec_off * 2));
-                v_slope1 = (r + 1 < n_rows_g) ? hvx_vec_repl_f16(Q6_V_vror_VR(v_slopes, (r_vec_off + 1) * 2)) : Q6_V_vzero();
+                v_slope0 = hvx_vec_repl_f16(Q6_V_vror_VR(v_slopes, (slope_lane0 + r_vec_off) * 2));
+                v_slope1 = (r + 1 < n_rows_g) ? hvx_vec_repl_f16(Q6_V_vror_VR(v_slopes, (slope_lane0 + r_vec_off + 1) * 2)) : Q6_V_vzero();
             }
 
             const HVX_Vector v_threshold = Q6_Vh_vsplat_R(0xcc00);  // fp16 -16.0
@@ -1391,21 +1396,14 @@ static inline void fa_softmax_impl(
             v_s_rowmax1 = hvx_vec_reduce_max_f16(v_s_rowmax1);
 
             // Splat m_prev[r], m_prev[r+1] from the float per-row accumulators and convert to fp16 vectors
+            // One 32-lane f32 vector now covers the whole unit, so the r_vec_off >= 32
+            // arm is unreachable and m_prev_v1 no longer exists.
             HVX_Vector v_m_prev0, v_m_prev1;
-            if (r_vec_off < 32) {
+            {
                 HVX_Vector v0 = hvx_vec_repl_f32(Q6_V_vror_VR(m_prev_v0, r_vec_off * 4));
                 v_m_prev0 = hvx_vec_f32_to_f16(v0, v0);
                 if (r + 1 < n_rows_g) {
                     HVX_Vector v1 = hvx_vec_repl_f32(Q6_V_vror_VR(m_prev_v0, (r_vec_off + 1) * 4));
-                    v_m_prev1 = hvx_vec_f32_to_f16(v1, v1);
-                } else {
-                    v_m_prev1 = Q6_V_vzero();
-                }
-            } else {
-                HVX_Vector v0 = hvx_vec_repl_f32(Q6_V_vror_VR(m_prev_v1, (r_vec_off - 32) * 4));
-                v_m_prev0 = hvx_vec_f32_to_f16(v0, v0);
-                if (r + 1 < n_rows_g) {
-                    HVX_Vector v1 = hvx_vec_repl_f32(Q6_V_vror_VR(m_prev_v1, (r_vec_off + 1 - 32) * 4));
                     v_m_prev1 = hvx_vec_f32_to_f16(v1, v1);
                 } else {
                     v_m_prev1 = Q6_V_vzero();
@@ -1510,47 +1508,40 @@ static inline void fa_softmax_impl(
         }
 
         // Inline fa_ml_update_and_build_d for this vector (lock-free and in parallel)
+        // Only fp16 lanes 0..31 of the accumulators are live at 32-row granularity, so
+        // every f32 "hi" half below is padding and is dropped. Feeding v_m_diff0 twice
+        // to hvx_vec_f32_to_f16 keeps the pack lane-wise and leaves lanes 0..31 -- the
+        // ones the D scatter and the l update read -- bit-identical to today's.
         HVX_VectorPair rowmax_acc_pair    = hvx_vec_f16_to_f32(rowmax_acc_v);
         HVX_Vector     v_rowmax_acc_f32_0 = Q6_V_lo_W(rowmax_acc_pair);
-        HVX_Vector     v_rowmax_acc_f32_1 = Q6_V_hi_W(rowmax_acc_pair);
 
         HVX_Vector v_m_curr0 = Q6_Vsf_vmax_VsfVsf(m_prev_v0, v_rowmax_acc_f32_0);
-        HVX_Vector v_m_curr1 = Q6_Vsf_vmax_VsfVsf(m_prev_v1, v_rowmax_acc_f32_1);
 
         HVX_Vector v_m_diff0 = HVX_OP_SUB_F32(m_prev_v0, v_m_curr0);
-        HVX_Vector v_m_diff1 = HVX_OP_SUB_F32(m_prev_v1, v_m_curr1);
 
-        HVX_Vector v_m_diff_f16   = hvx_vec_f32_to_f16(v_m_diff0, v_m_diff1);
+        HVX_Vector v_m_diff_f16   = hvx_vec_f32_to_f16(v_m_diff0, v_m_diff0);
         HVX_Vector exp_m_diff_f16 = hvx_vec_exp2_f16(v_m_diff_f16);
 
         HVX_VectorPair exp_m_diff_pair = hvx_vec_f16_to_f32(exp_m_diff_f16);
         HVX_Vector exp_m_diff0 = Q6_V_lo_W(exp_m_diff_pair);
-        HVX_Vector exp_m_diff1 = Q6_V_hi_W(exp_m_diff_pair);
 
         HVX_VectorPair rowsum_acc_pair = hvx_vec_f16_to_f32(rowsum_acc_v);
         HVX_Vector     v_rowsum_acc_f32_0 = Q6_V_lo_W(rowsum_acc_pair);
-        HVX_Vector     v_rowsum_acc_f32_1 = Q6_V_hi_W(rowsum_acc_pair);
 
         HVX_Vector v_l_curr0;
-        HVX_Vector v_l_curr1;
         if (args->is_first_block && factx->sinks != NULL) {
             // First KV block with sinks: m_prev holds the seeded sink value (not -inf),
             // so exp_m_diff = exp2(sink - m_curr) is the sink's contribution to the
             // denominator. l_prev is 0 here, so add exp_m_diff directly instead of
             // multiplying the (uninitialized) l_prev term.
             v_l_curr0 = HVX_OP_ADD_F32(exp_m_diff0, v_rowsum_acc_f32_0);
-            v_l_curr1 = HVX_OP_ADD_F32(exp_m_diff1, v_rowsum_acc_f32_1);
         } else {
-            HVX_Vector l_prev_v0 = factx->vtcm_l_vec[r_vec_idx * 2 + 0];
-            HVX_Vector l_prev_v1 = factx->vtcm_l_vec[r_vec_idx * 2 + 1];
+            HVX_Vector l_prev_v0 = factx->vtcm_l_vec[r_vec_idx];
             v_l_curr0 = HVX_OP_ADD_F32(HVX_OP_MUL_F32(l_prev_v0, exp_m_diff0), v_rowsum_acc_f32_0);
-            v_l_curr1 = HVX_OP_ADD_F32(HVX_OP_MUL_F32(l_prev_v1, exp_m_diff1), v_rowsum_acc_f32_1);
         }
 
-        factx->vtcm_m_vec[r_vec_idx * 2 + 0] = v_m_curr0;
-        factx->vtcm_m_vec[r_vec_idx * 2 + 1] = v_m_curr1;
-        factx->vtcm_l_vec[r_vec_idx * 2 + 0] = v_l_curr0;
-        factx->vtcm_l_vec[r_vec_idx * 2 + 1] = v_l_curr1;
+        factx->vtcm_m_vec[r_vec_idx] = v_m_curr0;
+        factx->vtcm_l_vec[r_vec_idx] = v_l_curr0;
 
         // Build diagonal tile D = diag(exp(m_diff))
         const HVX_Vector     v_offsets = *(const HVX_Vector *) d_tile_scatter_offsets;
@@ -1559,21 +1550,15 @@ static inline void fa_softmax_impl(
 
         __fp16 * const d_tiles_out = factx->vtcm_d_tiles[args->buf_idx];
 
-        size_t t0 = r_vec_idx * 2;
-        if (t0 < args->n_row_tiles) {
-            const HVX_Vector v_content = v_exp_m_diff;
-            __fp16 *         out_base  = d_tiles_out + t0 * HMX_FP16_TILE_N_ELMS;
-            Q6_vscatter_QRMVhV(q_32_mask, (size_t) out_base, HMX_FP16_TILE_SIZE - 1, v_offsets, v_content);
-        }
-
-        size_t t1 = r_vec_idx * 2 + 1;
-        if (t1 < args->n_row_tiles) {
-            const HVX_Vector v_content = Q6_V_vror_VR(v_exp_m_diff, 64);
-            __fp16 *         out_base  = d_tiles_out + t1 * HMX_FP16_TILE_N_ELMS;
-            Q6_vscatter_QRMVhV(q_32_mask, (size_t) out_base, HMX_FP16_TILE_SIZE - 1, v_offsets, v_content);
+        // n_row_vec_cnt == ceil(n_rows_g/32) == n_row_tiles, so a unit maps 1:1 onto a
+        // D tile and the second scatter (with its 64-BYTE = 32-lane ror) disappears.
+        // The bound check is kept as belt and braces.
+        if (r_vec_idx < args->n_row_tiles) {
+            __fp16 * out_base = d_tiles_out + r_vec_idx * HMX_FP16_TILE_N_ELMS;
+            Q6_vscatter_QRMVhV(q_32_mask, (size_t) out_base, HMX_FP16_TILE_SIZE - 1, v_offsets, v_exp_m_diff);
         }
     }
-    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_SFM, (uint16_t) (args->q_start * G + vec_start * 64));
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_SFM, (uint16_t) (args->q_start * G + vec_start * 32));
 }
 
 static void fa_softmax_thread_nomask(unsigned int n, unsigned int i, void * data) {
@@ -1643,7 +1628,7 @@ static void fa_phase_softmax_and_build_d(struct hmx_fa_context * factx,
                                          size_t                  n_row_tiles,
                                          size_t                  n_row_tiles_g_br) {
     work_queue_t wp = factx->octx->ctx->work_queue;
-    const size_t n_row_vec_cnt = hmx_ceil_div(sargs->n_rows_g, 64);
+    const size_t n_row_vec_cnt = hmx_ceil_div(sargs->n_rows_g, 32);
 
     worker_callback_t softmax_fn = fa_softmax_thread;
     if (sargs->mask == NULL && factx->logit_softcap == 0.0f && !sargs->has_alibi) {
@@ -1656,7 +1641,13 @@ static void fa_phase_softmax_and_build_d(struct hmx_fa_context * factx,
         }
     }
 
-    if (factx->n_threads > 1 && n_row_vec_cnt >= 2) {
+    // Fork on the same work threshold as the 64-row scheme did, not the same unit
+    // count. Halving the granularity doubled n_row_vec_cnt, so a bare ">= 2" would
+    // newly fork the band n_rows_g in [33,64] -- one old unit's worth of work -- and
+    // pay a fork/join per KV block for it. No shape in the perf suite lands in that
+    // band, so the trade is unmeasured; keep the old behaviour there and let the
+    // change be strictly "same threads or more".
+    if (factx->n_threads > 1 && n_row_vec_cnt >= 3) {
         uint32_t n_use = (uint32_t) hex_smin((size_t) factx->n_threads, n_row_vec_cnt);
         sargs->thread_div = init_fastdiv_values(n_use);
         work_queue_run(wp, softmax_fn, sargs, n_use);
