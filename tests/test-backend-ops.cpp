@@ -13255,6 +13255,65 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // ---------------------------------------------------------------------------------
+    // THE ATTENTION KERNEL ALONE, kv = 512 -> 4096, scoring excluded entirely.
+    //
+    // Every row here is REPLICATED-timed, so there is no per-call constant on either
+    // side and nothing has to be subtracted or modelled -- this is the cleanest
+    // comparison available in this work. The E - S difference in the context-length
+    // curve above measures the same thing indirectly and should agree; if it does not,
+    // the difference-of-whole-graph-rows method is what is wrong.
+    //
+    // Four rows per (kv, nb, density):
+    //   IDEAL   dense FA at kv_eff = u*bs, i.e. what the selected KV would cost if it
+    //           were simply a shorter contiguous cache. This is the ceiling: no gather,
+    //           no index indirection, no per-query-block constraint. SPARSE/IDEAL is the
+    //           price of sparsity itself, and it is the number that says whether the
+    //           kernel is done.
+    //   SHARED  one selection for the whole chunk (sel->ne[1] == 1). The easy case.
+    //   PQB128  per-query-block selection at bq = 128
+    //   PQB64   per-query-block selection at bq = 64 -- the faithful XAttention shape,
+    //           and the one that pins Br to 64 and starves the softmax phase.
+    // Dense at the FULL kv is registered by the context-length block above at the same
+    // shapes, so DENSE/SPARSE is read across the two blocks.
+    //
+    // Densities 50% (u = NBk/2) and 25% (u = NBk/4). u stays a power of two at every
+    // point, so no row sits on the chunk-count sawtooth (flash-attn-ops.h:444) and the
+    // curve is not measuring a divisor accident. u < FA_MIN_KV_BLOCKS is skipped rather
+    // than clamped, because a clamped row would silently be a different configuration.
+    //
+    // The floor rows come first: dense FA at kv far below anything useful. Dense at
+    // kv=256 and kv=512 measured within 1% of each other while differing 2x in FLOPs,
+    // which says the kernel is latency-bound at short KV and that no amount of sparsity
+    // can win there. These pin where that floor actually is.
+    for (int kv : { 64, 128, 256 }) {
+        for (int nb : { 512, 2048 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, kv, nb, /*mask=*/false, false, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+    for (int kv : { 512, 1024, 2048, 4096 }) {
+        const int nblk = kv / 64;
+        for (int nb : { 512, 2048 }) {
+            if (nb > kv) {
+                continue;                      // Lq <= Lk
+            }
+            for (int frac : { 2, 4 }) {
+                const int u = nblk / frac;
+                if (u < 3) {
+                    continue;                  // FA_MIN_KV_BLOCKS
+                }
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, u*64, nb, /*mask=*/false, false, 0, 0,
+                                                                GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+                test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, nb, 64, u, /*mask=*/false));
+                for (int bq : { 128, 64 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, nb, 64, u, /*mask=*/false,
+                                                                           /*per_head_sel=*/true, bq, /*per_qblock=*/true));
+                }
+            }
+        }
+    }
+
     // Attribute the per-query-block penalty. The MAC count is identical across every
     // row here -- only the SCHEDULE changes -- so any difference is tiling cost alone.
     //

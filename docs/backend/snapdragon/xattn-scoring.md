@@ -735,3 +735,85 @@ end-to-end cost. `try_fuse_xattn_score` was written to remove exactly this and m
 masked softmax (`ggml-hexagon.cpp:3823`) and real XAttention's softmax carries the reduced
 causal mask. Teaching the fusion to accept a mask is the highest-value remaining item,
 and it is worth roughly 12-15% of the end-to-end pass.
+
+### The attention kernel alone
+
+Scoring excluded entirely. Every number below is a **replicated** row on both sides, so
+there is no per-call constant anywhere in this table and nothing is subtracted or
+modelled. It is the cleanest comparison in this work, and it is the one that says
+whether the kernel itself is finished.
+
+`IDEAL` is dense FA at `kv_eff = u*64` -- what the selected KV would cost if it were
+simply a shorter contiguous cache: no index list, no indirection, no query-block
+constraint. `ceil = DENSE/IDEAL` is therefore the most any block-sparse kernel can
+achieve at that density, and `%ceil` is how much of it the kernel gets.
+
+`shared` = one selection for the whole chunk. `bq=128`/`bq=64` = per-query-block
+selection at that query-block size; **bq=64 is the faithful XAttention shape**.
+
+| kv | nb | u | density | DENSE | IDEAL | ceil | shared | | bq=128 | | bq=64 | | %ceil sh | %ceil 64 |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 512 | 512 | 4 | 50% | 933 | 930 | 1.00x | 922 | 1.01x | 1370 | 0.68x | 1697 | 0.55x | 101% | 55% |
+| 1024 | 512 | 8 | 50% | 1247 | 933 | 1.34x | 988 | 1.26x | 1486 | 0.84x | 1873 | 0.67x | 95% | 50% |
+| 2048 | 512 | 16 | 50% | 2082 | 1247 | 1.67x | 1365 | 1.52x | 2153 | 0.97x | 2618 | 0.80x | 91% | 48% |
+| 4096 | 512 | 32 | 50% | 4295 | 2082 | 2.06x | 2100 | 2.04x | 3312 | 1.30x | 4131 | 1.04x | 99% | 50% |
+| 2048 | 2048 | 16 | 50% | 8796 | 4989 | 1.76x | 5181 | 1.70x | 8856 | 0.99x | 10718 | 0.82x | 96% | 47% |
+| 4096 | 2048 | 32 | 50% | 16302 | 8796 | 1.85x | 8654 | 1.88x | 13483 | 1.21x | 16834 | 0.97x | 102% | 52% |
+| 1024 | 512 | 4 | 25% | 1247 | 930 | 1.34x | 935 | 1.33x | - | - | 1683 | 0.74x | 99% | 55% |
+| 2048 | 512 | 8 | 25% | 2082 | 933 | 2.23x | 985 | 2.11x | 1490 | 1.40x | 1875 | 1.11x | 95% | 50% |
+| 4096 | 512 | 16 | 25% | 4295 | 1247 | 3.44x | 1358 | 3.16x | 2153 | 2.00x | 2627 | 1.63x | 92% | 47% |
+| 2048 | 2048 | 8 | 25% | 8796 | 3549 | 2.48x | 3690 | 2.38x | 6142 | 1.43x | 7704 | 1.14x | 96% | 46% |
+| 4096 | 2048 | 16 | 25% | 16302 | 4989 | 3.27x | 5243 | 3.11x | 8870 | 1.84x | 10696 | 1.52x | 95% | 47% |
+
+**1. Block-sparse indexing is free.** With a shared selection the kernel runs at
+**91-102% of the contiguous-dense ceiling** at every one of the eleven points -- twice
+slightly *above* it, which is within run-to-run spread. The `src[5]` index list is
+consumed as a DMA source offset and never materialises a gather, and this table is the
+price of that design: nothing. There is no remaining work in the indexing path.
+
+**2. Per-query-block selection costs a flat ~1.95x, and that is the entire problem.**
+
+| | bq=128 | bq=64 |
+|:--|--:|--:|
+| tax over shared, all 10 points | 1.49-1.71x | 1.84-2.09x |
+
+It does not move with context length, density, or chunk size -- it is a pure scheduling
+tax, exactly as the earlier attribution said (rendezvous stall 43%, softmax thread loss
+32%, extra K/V staging 17%). At `bq=64` the kernel gets **46-55% of ceiling** everywhere.
+Recovering that factor of two is worth more than any other single item in this project:
+it is worth as much as halving the density, and it costs no accuracy at all.
+
+**3. The ceiling is lower than the FLOP ratio, because the dense kernel has a
+Q-proportional floor.** Dense FA at `nb=512` measures 930 µs at `kv=256` and 933 µs at
+`kv=512` -- 2x the KV work for 0.4% more time. At `nb=2048` the same floor is ~3378 µs.
+Normalised that is ~1.7 µs per query token, and it is irreducible: it is Q staging, the
+softmax/output pass and the writeback, none of which sparsity touches. So 50% density
+buys 1.00x at kv=512 and only 2.06x at kv=4096, never the 2x the FLOP count suggests at
+short context. Choosing density against this table rather than against the FLOP ratio is
+the difference between a real 3.4x ceiling (25% at kv=4096) and an imagined 4x.
+
+Below `kv=256` it gets worse, not better: `kv=128` costs 1360 µs and `kv=64` costs 1266,
+both *slower* than `kv=256`, because `FA_MIN_KV_BLOCKS 3` and the chunk-count rule leave
+no legal tiling. Nothing is to be gained by selecting fewer than ~4 blocks.
+
+### What this means for the end-to-end table
+
+The `XATTN_E2E` arm above is registered with `R = Lq/Bl`, i.e. `Bq = Lq`: **one selection
+for the whole chunk**, which is the `shared` column here. Cross-checking the two methods,
+`E - S` against a directly measured replicated row, they agree to 2-9% (2% at the large
+shapes, 9% at kv=512), which independently validates the difference-of-whole-graph-rows
+method used throughout this doc.
+
+But it also means the end-to-end figures are the optimistic case. Composing this table's
+`bq` tax with the measured selection cost, at kv=4096 / Lq=2048 / 25% density:
+
+| bq | selection | attention | total | vs dense (15962) |
+|--:|--:|--:|--:|--:|
+| Lq (=2048) | 7518 | 5153 | 12671 | **1.26x** |
+| 128 | ~7518 | 8870 | ~16388 | ~0.97x |
+| 64 | ~7518 | 10696 | ~18214 | ~0.88x |
+
+So the 1.26x end-to-end result depends on a query block as large as the whole prefill
+chunk. Whether a selection that coarse is acceptable is an accuracy question, currently
+deferred; the measured union saturation (u/k = 1.20/1.56/1.93 at R = 2/4/8) is evidence
+that it might be, but that was measured to R=8 and `Bq = Lq` at Lq=2048 is R=32.
