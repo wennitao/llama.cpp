@@ -557,24 +557,67 @@ measuring how efficiently HMX multiplies — mllm says so itself for this experi
 is pure scheduling"), while using the same metric two paragraphs later to conclude the BQ
 effect is "pure HMX utilisation, not arithmetic".
 
-The inconsistency is in the metric, not the measurement. `TF/s = FLOPs / wall`, and every
-cell holds FLOPs fixed, so TF/s **is** inverted wall time. It establishes that the spread is
-not arithmetic *volume*; it cannot locate where the time went. Every other mllm experiment
-has the same confound: their "decomposition tax" (M=256/64-batch vs M=1024/16-batch, 1.92× at
-equal FLOPs) varies M and entry count together, exactly like the BQ sweep does.
+The inconsistency is in the metric. `TF/s = FLOPs / wall`, and every cell holds FLOPs fixed,
+so TF/s **is** inverted wall time. It establishes that the spread is not arithmetic *volume*;
+it cannot locate where the time went.
 
-So the honest statement is: **mllm's data cannot discriminate the two mechanisms, and its one
-control that holds M and entry count fixed shows a 2.7× swing from scheduling alone.** The
-trace here can discriminate, because it separates busy cycles from wall: `HMX_COMP` busy
-rises 1.1× — the unit is not doing more work, it is being fed less often — while fully-idle
-time goes 7.6% → 33.9% across 113 → 1090 gaps of unchanged mean size.
+### Three corrections to the paragraph above
 
-Worth noting the two labels may be closer than they read. "Small-M HMX floor" is ambiguous
-between *"HMX multiplies inefficiently at small M"* (a specific claim, unsupported by their
-data and refuted by our 1.1×) and *"HMX idles because a small-M job does not cover the
-per-job overhead"* (our finding, in different words). Practically both point the same way —
-make BQ bigger. The distinction only matters for whether barrier-elimination work inside the
-kernel is worth doing, which is priced separately at a ~1.2× ceiling.
+**1. mllm does have a decoupled control, and it shows a real small-`M` effect.** Claiming
+otherwise was wrong. `tests/qnn/GemmLatencyTest.cpp:1331-1339` registers `MSweep_B1_M{64…2048}`
+("B=1, vary M alone… isolates 'small M' from 'batched'") and `B16Sweep_M{64,256,2048}`
+("B fixed at 16… isolates 'batched' from 'small M' the other way"). At fixed `B=16`, fp16
+throughput falls `M=2048` 3264 → `M=64` 1239 GFLOP/s. `M` is causal with the entry count
+held fixed. The reverse axis runs *against* a naive per-entry-cost law: at fixed `M=64`,
+raising `B` 1 → 512 **improves** throughput 138 → 2435 GFLOP/s. Their conclusion, in their
+words: *"Batching is the mitigation, not the disease"*
+(`blocksparse_structural_limit.md:214-219`).
+
+**2. mllm has already superseded its own small-`M` reading — with a third mechanism.**
+`blocksparse_structural_limit.md:185-190` stamps that section *"Superseded by §7b… `M` was a
+red herring; **operator fusion** is the real lever"*, and :248-249 files *"Batched rank-3
+MatMul doesn't reach HMX"* under **refuted hypotheses**. The decisive datum is §7b: at an
+identical `M=512`, a standalone un-fusable matmul node cannot exceed **267 FLOP/cyc**;
+dense, sliding-window and rank-2 all run 2670–3484 in the real graph; **rank-3 batched sits
+at 256 — exactly on the un-fused ceiling.** QNN's HTP fusion matcher covers the conventional
+per-head rank-2 attention shape and does not fuse the rank-3 batched shape, which then
+executes as three separate ops with a 33.5 MB score tensor round-tripping DDR. That names the
+cause of the 2.7× rank effect better than "scheduling" did — and it is still not HMX
+arithmetic, so the refutation above stands, but the mechanism belongs to mllm, not to us.
+They also state plainly: *"all HMX/HVX statements in this doc are inferred from
+`units = cycles/wall`, never directly observed"* (:260-261).
+
+**3. In mllm's real graph the `BQ` lever INVERTS, for a reason that does not apply here.**
+`BQ=64` 111.9 ms → `BQ=256` 140.0 ms (4 layers); 713.7 → 1006.2 ms at 28 layers, Sq=2048
+(§6). Their explanation: the in-graph rate is pinned at 278–435 FLOP/cyc for *every* `BQ`, so
+enlarging `M` never improves it, and all the hardware had was **parallelism across the
+`nqb = Sq/BQ` batch items spread over the 6 HVX threads** — raising `BQ` deletes items without
+improving the rate, and occupancy falls 4.32 → 3.57. That is the GPU-shaped dependency
+(query blocks *are* the parallelism), the opposite of this kernel, where query tiles are a
+serial loop and parallelism lives inside a tile. It is a direct warning that "keep `Br` large"
+is a property of *this* kernel's structure, not of the silicon.
+
+### Where that leaves the disagreement
+
+Narrower than the headline on either side. Both stacks measure a real query-block effect of
+the same magnitude that the MAC count is blind to; both call it plumbing. What neither has is
+a direct attribution in the disputed regime — mllm says so itself, and the trace here, though
+it does separate busy from wall (`HMX_COMP` busy 1.1×, idle 7.6% → 33.9% over 113 → 1090 gaps
+of unchanged mean size), has an unattributed residual: **the fixed per-handoff cost this
+analysis named was found, fixed at source, and returned only 1.09–1.11×** — kv=2048 went
+2144 → 1926 µs against a shared 988 µs, i.e. 2.17× → 1.95×. Roughly 90% of the penalty
+survived removing the thing it was attributed to. `flash-attn-htp-anatomy.md:985-987`
+reassigns that residual to "the other phases' fork/join barriers… the same
+fixed-latency-times-count structure one level down", which is inference of exactly the kind
+this section charges mllm's TF/s with.
+
+The defensible joint claim: **the matrix unit is not the constraint on either stack; the
+per-query-block plumbing is** — re-transposing and re-packing the same K/V once per query
+block on ours, un-fused rank-3 ops round-tripping scores to DDR on theirs. The implied fix is
+to share key sets across query blocks, which is what union staging does, rather than "grow
+`M`" as such. And it is fp16-only: mllm measures the small-`M` collapse at 9–10× in
+uint16×uint8 against 2.4× in fp16, warning that *"fp16 micro-benchmarks do not predict this
+graph"*.
 
 Two further findings from the same mllm document are worth carrying:
 
