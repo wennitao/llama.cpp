@@ -503,13 +503,54 @@ the identity set — counting passes cannot distinguish "broke two, fixed two" f
 
 ## Expectation setting
 
-mllm's end-to-end verdict on the same class of design was **negative**: with both paths
-correct on one device, dense beat block-sparse + XAttention by 1.2–1.34× at `Sq` = 512 and
-1024, with a crossover only at `Sq ≥ 2048`. What beat them was not the scoring FLOPs — it
-was the per-query-block structure forcing attention out of one fused graph into many small
-dispatches. That is exactly the structure a faithful implementation has. Landing scoring
-alone is therefore not timidity; it is the only step whose value does not depend on that
-unresolved question.
+mllm's end-to-end verdict on the same class of design was **negative**: dense beat
+block-sparse + XAttention by 1.2–1.34× at `Sq` = 512 and 1024, with a crossover only at
+`Sq ≥ 2048`.
+
+> **CORRECTION.** That reading is superseded inside mllm's own repo. It was measured on a
+> **rank-4** `[Hq, num_qb, BQ, *]` batch layout; folding it to a flat rank-3
+> `[Hq·num_qb, BQ, *]` is worth ~2.7× at every BQ and flips the verdict — block-sparse then
+> beats dense at Sq=1024 even at the shipped BQ=64 (1.12×), and by 2.16× at BQ=256
+> (`mllm/docs/qnn_backend/blocksparse_tiling_latency_sq1024.md` §1). Their words: "a layout
+> artifact, not a fundamental property."
+
+What survives the correction — and independently corroborates the per-query-block tax
+measured here — is the **BQ effect itself**, which is orthogonal to the layout and appears
+at full strength in both. At fixed 25% density and Sq=1024, every cell computing the same
+2.147 GFLOP:
+
+| BQ | rank-4 | rank-3 |
+|--:|--:|--:|
+| 32 | 9.18 ms | 3.41 ms |
+| 64 | 6.48 | **2.37** |
+| 128 | 3.96 | 1.55 |
+| 256 | 3.25 | **1.23** |
+
+BQ 32→256 is 2.82× in rank-4 and 2.77× in rank-3. For the pair that matches our sweep,
+**BQ=64 vs BQ=256 is 1.93× in rank-3** (1.99× in rank-4) against the **1.84–2.09×** measured
+here at `bq=64` versus a chunk-wide selection — two independent stacks, within a few percent.
+
+The mechanisms attributed do **not** yet agree. mllm calls it "pure HMX utilisation" and a
+"small-M HMX floor", but its TF/s figures are wall-derived at fixed FLOPs, so they restate
+the wall-time ratio rather than measure occupancy. The trace here measures occupancy
+directly and finds `HMX_COMP` busy flat at 1.1× while every phase's interval count
+multiplies by 8 (`flash-attn-htp-anatomy.md`). Both stacks see the same magnitude and label
+it differently; that is unresolved, and it matters, because the two labels imply different
+fixes.
+
+Two further findings from the same mllm document are worth carrying:
+
+- **Their union measurement corroborates ours.** Cross-query-block Jaccard ≈0.92, and a
+  BQ=256 super-block needs the union of its 8 sub-blocks' picks = 14.4 of 32 blocks
+  (~45–48% density), "right at the 50% latency break-even… the window opens at Sq≥4096."
+  Measured here: overlap f = 0.78, union saturating at 1.20/1.56/1.93× for R = 2/4/8, and
+  break-even at kv ≈ 2048–4096.
+- **Their production path inverts the conclusion.** In the real W4A16 AOT graph the 2.7×
+  does not transfer and a *bigger* batch is slower: G=4 (B=64) = 76 ms, G=8 = 90 ms, G=16
+  (full flat) = 109 ms, because per-op QDQ intermediates enlarge the working set and VTCM
+  spills. **Every figure in this document is fp16.** If this work is ever quantised, "keep
+  `Br` large" — the entire basis of the union proposal — may not survive, and that should be
+  re-measured before committing to it.
 
 ## Optimising the scorer: the reversal is the wrong operand
 
