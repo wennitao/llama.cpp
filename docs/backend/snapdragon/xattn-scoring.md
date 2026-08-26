@@ -817,3 +817,63 @@ So the 1.26x end-to-end result depends on a query block as large as the whole pr
 chunk. Whether a selection that coarse is acceptable is an accuracy question, currently
 deferred; the measured union saturation (u/k = 1.20/1.56/1.93 at R = 2/4/8) is evidence
 that it might be, but that was measured to R=8 and `Bq = Lq` at Lq=2048 is R=32.
+
+## Fixed 25% sparsity, kv = 512 -> 4096
+
+One density, the whole stack, every context length. `u = NBk/4` = 2/4/8/16, `S=16`,
+`Hq=16`, `Hkv=8`, `d=128`, mask off. `C` is derived at each shape from its own
+`FLASH_ATTN_EXT_WG` / `FLASH_ATTN_EXT` pair rather than carried over.
+
+| kv | Lq | u | kv_eff | C | dense | ideal | ceil | shared | D/sh | %ceil | bq=128 | bq=64 | D/64 | sel | e2e | D/E | sel% |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 512 | 512 | 2 | 128 | 618 | 921 | 1356 | 0.68x* | 1362 | 0.68x | 100% | 1511 | 1707 | 0.54x | 925 | 2375 | **0.39x** | 39% |
+| 1024 | 512 | 4 | 256 | 626 | 1221 | 915 | 1.33x | 927 | 1.32x | 99% | 1364 | 1686 | 0.72x | 1144 | 2144 | **0.57x** | 53% |
+| 1024 | 1024 | 4 | 256 | 585 | 2430 | 1715 | 1.42x | 1719 | 100% | 2830 | 3496 | 0.69x | 1968 | 3761 | **0.65x** | 52% |
+| 2048 | 512 | 8 | 512 | 629 | 2025 | 921 | 2.20x | 973 | 2.08x | 95% | 1474 | 1859 | 1.09x | 1573 | 2638 | **0.77x** | 60% |
+| 2048 | 2048 | 8 | 512 | 694 | 8562 | 3496 | 2.45x | 3632 | 2.36x | 96% | 6109 | 7663 | 1.12x | 4611 | 8271 | **1.04x** | 56% |
+| 4096 | 512 | 16 | 1024 | 664 | 4184 | 1219 | 3.43x | 1324 | 3.16x | 92% | 2128 | 2587 | 1.62x | 2503 | 3918 | **1.07x** | 64% |
+| 4096 | 2048 | 16 | 1024 | 751 | 15850 | 4877 | 3.25x | 5056 | 3.14x | 96% | 8745 | 10668 | 1.49x | 7477 | 12534 | **1.26x** | 60% |
+
+`ceil = dense/ideal` is what this FA kernel reaches at `kv_eff` on this backend, and it is
+a ceiling **only where both sides get the same thread count**. `%ceil = ideal/shared`.
+`e2e` uses `Bq = Lq`, i.e. the `shared` column.
+
+### * The kv=512 row's ceiling is an artifact, and the artifact is the real finding
+
+`kv_eff = 128` is the only point in the table below `FA_MIN_KV_BLOCKS * 64 = 192`. The
+chunk-size search does **not** reject it -- `flash-attn-ops.h:405` relaxes `Bc_search` to
+`align_down(kv_len, 64)` when `can_pipeline` is false, and the op runs on HMX (the
+`fa-params` line is emitted only on search success):
+
+```
+kv_eff  128 : Br 512 Bc 128 n_kv_blocks 1 n_threads 1 pipeline 0   <- kv=512, u=2
+kv_eff  256 : Br 512 Bc  64 n_kv_blocks 4 n_threads 6 pipeline 1
+kv_eff 1024 : Br 512 Bc 256 n_kv_blocks 4 n_threads 6 pipeline 1
+```
+
+What degrades is threading, not kernel selection: `n_kv_blocks = 1` makes
+`ggml-hexagon.cpp:2139` set `n_threads = 1` and `:2142` set `pipeline = 0`. So the 0.68x
+divides a **6-thread** dense numerator by a **1-thread** denominator. It is not a limit of
+block sparsity, and it is beatable by doing *more* work -- in the same log, same op, same
+shape:
+
+| kv=512, nb=512, bs=64 | selected KV | measured |
+|:--|--:|--:|
+| `n_sel=4` (50%) | 256 | **919-924 µs** |
+| `n_sel=2` (25%) | 128 | 1364-1366 µs |
+
+**Halving the density makes the kernel 1.48x slower.** The dense sweep shows the same
+cliff and shows it is not monotone either: kv=64 -> 1266, kv=128 -> 1358, **kv=192 -> 738**,
+kv=256 -> 921, kv=320 -> 757 µs. The floor at `nb=512` is ~740 µs, and everything below
+3 KV blocks is on the wrong side of it.
+
+The design consequence outranks the row it came from: **density cannot be a constant.**
+A selection budget must be `max(fraction * NBk, ~4 blocks)`, because below ~4 blocks of 64
+the kernel loses all six threads and the pipeline, and selecting less costs more. The
+actionable fix is the `n_threads`/`pipeline` coupling at `ggml-hexagon.cpp:2139` --
+parallelising over the query axis when `n_kv_blocks < 3` -- not `hmx_fa_find_chunk_size`,
+whose dense bound `flash-attn-ops.h:417-419` documents as deliberately not loosened.
+
+Rows 2-7 all have `kv_eff >= 256` (4+ blocks, 6 threads) and their `ceil` values stand.
+Row 1's end-to-end verdict also stands: even with the kernel fixed, 925 µs of selection
+against 921 µs of dense keeps it a loss.

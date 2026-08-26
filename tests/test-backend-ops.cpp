@@ -13314,6 +13314,51 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // ---------------------------------------------------------------------------------
+    // FIXED 25% SPARSITY, kv = 512 -> 4096. One density, the full stack, every context
+    // length -- the sweep the 50% table above should be read against.
+    //
+    // u = NBk/4 is 2/4/8/16. At kv=512 that is u=2, i.e. kv_eff=128, which is BELOW
+    // FA_MIN_KV_BLOCKS (flash-attn-ops.h:349): the op is still accepted -- nothing in
+    // ggml_hexagon_supported_fa_sparse rejects it -- but hmx_fa_find_chunk_size cannot
+    // keep >= 3 chunks, so the kernel drops off the pipelined path onto the m == 1
+    // fallback. Dense measured 1360 µs at kv=128 against 930 µs at kv=256, i.e. HALF the
+    // work for 46% MORE time, so this row is expected to be a loss and is registered
+    // precisely so the shape of the loss is on record rather than assumed.
+    //
+    // Seven rows per (kv, Lq), adjacent so drift is shared:
+    //   D       dense, replicated                       FLASH_ATTN_EXT
+    //   D_wg    dense, whole-graph                      FLASH_ATTN_EXT_WG
+    //   IDEAL   dense at kv_eff = u*64, replicated      FLASH_ATTN_EXT
+    //   SP      sparse kernel, shared selection         FLASH_ATTN_EXT_SPARSE
+    //   SP128   sparse kernel, bq = 128                 FLASH_ATTN_EXT_SPARSE
+    //   SP64    sparse kernel, bq = 64                  FLASH_ATTN_EXT_SPARSE
+    //   E, S    end-to-end and selection-only           XATTN_E2E / XATTN_SELECT
+    // D_wg - D gives C at this shape, so E and S are de-overheaded against a constant
+    // measured here rather than one carried over from another sweep.
+    for (int kv : { 512, 1024, 2048, 4096 }) {
+        const int u      = kv / 64 / 4;
+        const int lq_big = kv < 2048 ? kv : 2048;
+        const int lqs[2] = { 512, lq_big };
+        const int n_lq   = lq_big == 512 ? 1 : 2;
+        for (int i = 0; i < n_lq; i++) {
+            const int lq = lqs[i];
+            test_cases.emplace_back(new test_flash_attn_ext   (128, 128, 8, {2, 1}, kv, lq, /*mask=*/false, false, 0, 0,
+                                                               GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_flash_attn_ext_wg(128, 128, 8, {2, 1}, kv, lq, /*mask=*/false, false, 0, 0,
+                                                               GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_flash_attn_ext   (128, 128, 8, {2, 1}, u*64, lq, /*mask=*/false, false, 0, 0,
+                                                               GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, lq, 64, u, /*mask=*/false));
+            for (int bq : { 128, 64 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, lq, 64, u, /*mask=*/false,
+                                                                       /*per_head_sel=*/true, bq, /*per_qblock=*/true));
+            }
+            test_cases.emplace_back(new test_xattn_e2e   (128, 16, 8, lq, kv, 16, 64, /*R=*/lq/64, u));
+            test_cases.emplace_back(new test_xattn_select(128, 16, 8, lq, kv, 16, 64, /*R=*/lq/64, u, /*stage=*/2));
+        }
+    }
+
     // Attribute the per-query-block penalty. The MAC count is identical across every
     // row here -- only the SCHEDULE changes -- so any difference is tiling cost alone.
     //
