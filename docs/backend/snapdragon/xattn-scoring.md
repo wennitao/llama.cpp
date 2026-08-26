@@ -255,32 +255,189 @@ The reduction is **forced, not chosen**: the kernel stages one K/V chunk per
 `(sequence, query block, kv_head)` and multiplies all `G = Hq/Hkv` query heads against it
 in a single `g_br = align_up(G·Br, 32)` row tile. Honouring a per-Q-head selection would
 mean `G` separate stagings per query block, i.e. discarding the GQA amortisation the tile
-exists for. Of the candidate policies only SUM (equivalently MEAN — a uniform positive
-scale is order-preserving within a row) is expressible in ggml: there is no row-max-value
-op (`SUM_ROWS`/`CUMSUM`/`MEAN`/`ARGMAX` only, and `ARGMAX` returns an index), and a union
-of per-head top-k has data-dependent length, which is the same stream-compaction blocker
-as `find_blocks` and violates fixed `n_sel`. The SUM chain, for the record:
+exists for.
+
+> **Correction (superseded).** An earlier version of this section claimed that "of the
+> candidate policies only SUM is expressible in ggml". That is wrong, and the policy it
+> forced was the wrong one. **MAX is expressible, and MAX is what the kernel's addressing
+> actually calls for.** The implemented pipeline is described in
+> [the section below](#from-scores-to-a-selection-implemented).
+
+The reduction is forced because `sel` is read as
+`sel + qb*sel_nb1 + kv_head*sel_nb2 + ib3*sel_nb3`, then `list[c*m + j]`
+(`htp/flash-attn-ops.c:242-256`) — there is **no query-head term**. One list therefore
+serves all `G` query heads of a KV head, and the object it has to name is the *union* of
+the `G` per-head top-k sets. SUM (equivalently MEAN — a uniform positive scale is
+order-preserving within a row) ranks by *average* demand, which is a different and worse
+surrogate for that union: a block taking half of one head's mass and nothing from the
+other `G-1` loses to a block taking a tenth from each, yet dropping the first costs that
+head half its attention while dropping the second costs every head a tenth. The marginal
+*cost* of keeping a block is identical either way — it is staged once and shared — so
+ranking by max is ranking by the worst per-head loss avoided, which is the metric
+XAttention's own recall is defined on.
+
+Max is well-posed rather than dominated by whichever row happens to be largest because
+every `(head, query block)` row of `attn_sum` sums to exactly `P = Bl/S` — the invariant
+`XATTN_ROWSUM` checks against the analytic constant — so all `Hq*NBq` rows sit on one
+common scale.
+
+What is true is that ggml has no *op* for it: the reductions are `SUM`/`SUM_ROWS`/
+`CUMSUM`/`MEAN`/`ARGMAX` (`ggml.h:497-501`, and `ARGMAX` returns an index),
+`GGML_OP_POOL_MAX` has no case in hexagon's `supports_op`, and its unary switch has no
+`RELU` or `ABS` (`ggml-hexagon.cpp:4471-4487`), so `relu(a-b)+b` and
+`0.5(a+b+|a-b|)` both split the graph. But it does have `CLAMP`, and
 
 ```c
-a4  = ggml_reshape_4d(ctx, attn_sum, NBk, NBq, G, Hkv);   // free view; h = kv_head*G + g
-ap  = ggml_permute   (ctx, a4, 1, 2, 0, 3);               // [G, NBk, NBq, Hkv]
-ac  = ggml_cont      (ctx, ap);                           // LOAD-BEARING: hexagon argsort
-                                                          // has no contiguity gate and
-                                                          // addresses rows as data + r*nb[1]
-ah  = ggml_sum_rows  (ctx, ac);                           // [1, NBk, NBq, Hkv]
-as  = ggml_reshape_3d(ctx, ah, NBk, NBq, Hkv);
-sel = ggml_argsort_top_k(ctx, as, n_sel);                 // I32 [n_sel, NBq, Hkv, 1]
-fa->src[5] = sel; fa->op_params[4] = Bl; fa->op_params[5] = Bl;
+max(a, b) == ggml_add(ctx, ggml_clamp(ctx, ggml_sub(ctx, a, b), 0.0f, FLT_MAX), b)
 ```
 
-`ggml_top_k` is not usable — `GGML_OP_TOP_K` has no case in the hexagon `supports_op`
-switch, so it would split the graph. This chain is **untested here**: it can never be
-NMSE-checked against CPU (CPU flash attention ignores `src[5]` and computes dense
-attention), and argsort tie-breaking differences flip ranks. Note also that argsort over a
-full `NBk` row hands an early query block *future* key blocks as soon as `n_sel` exceeds
-its causally-allowed count — the scorer's reduced causal mask only drives those scores to
-`-1e30f`, it does not remove them from the ranking. Only the FA mask `src[3]` stops them
-being attended.
+is three HTP-resident nodes (`SUB` `:3649`, `CLAMP` `:3665`, `ADD` `:3651`). A
+`log2(G)`-step halving tree over `ne3` then reduces the head axis. Note `ggml_clamp` is
+unconditionally **in-place** (`ggml.c:4443-4457` builds its result with
+`ggml_view_tensor`, with a `TODO` admitting it), so the `CLAMP` node aliases the `SUB`
+output — safe here only because that output is dead the instant it is clamped.
+
+`ggml_top_k` is still not usable — `GGML_OP_TOP_K` has no case in the hexagon
+`supports_op` switch, so it would split the graph; `ggml_argsort_top_k` is
+`ggml_argsort` plus a strided view and stays on device.
+
+Note that argsort over a full `NBk` row hands an early query block *future* key blocks as
+soon as `u` exceeds its causally-allowed count — the scorer's reduced causal mask only
+drives those scores to `-1e30f`, it does not remove them from the ranking. Only the FA
+mask `src[3]` stops them being attended, and the `bias` leaf described below is what keeps
+them out of the top-`u` in the first place.
+
+## From scores to a selection, implemented
+
+`tests/test-backend-ops.cpp` now carries the full chain: `xattn_build_selection()` builds
+`attn_sum -> mh -> mr -> +bias -> argsort -> sel` and `test_xattn_e2e` hands `sel` to
+`ggml_flash_attn_ext` through `src[5]` as a **computed node**, not a leaf.
+
+```
+attn_sum  F32 [NBk, NBq_s, Hq]           (test_xattn_score stage 0, rev_k = 0)
+stage A   max over the G query heads     -> mh  [NBk, NBq_s, Hkv, 1]
+stage B   max over the R scorer blocks   -> mr  [NBk, NBq_a, Hkv, 1]   (R = Bq/Bl)
+stage C   + bias, argsort DESC, view u   -> sel I32 [u, NBq_a, Hkv, 1], nb[0] = 4
+```
+
+Both reduces split their axis as `(fast = the thing being reduced)`, which makes the
+reshape free: the query-head index is the fast half of `Hq` (the kernel takes head
+`kv_head*G + j`, `htp/flash-attn-ops.c:2887`) and the scorer block index is the fast half
+of `NBq_s` (`a_s = a_a*R + jl`). `G` and `R` must be powers of two, which costs nothing
+real: `br_unit = ceil(32/G)` must divide `Bq`, and for `G ∈ {3,5,6,7}` it gives 11/7/6/5,
+none of which divides 64 or 128, so those `G` already cannot run per-query-block sparse FA
+at all.
+
+A contiguous argsort source is **load-bearing**, and the bias `ADD` is what supplies it —
+its dst is freshly allocated, which is the only reason no explicit `ggml_cont` sits there.
+`ggml_hexagon_supported_argsort` checks only F32-in / I32-out / `ne0 <= 16K`
+(`:3369-3389`) while both device kernels address row `r` as `data + r*nb[1]` over the
+flattened `ne1*ne2*ne3`, so a permuted or strided source is silently **mis-sorted rather
+than rejected**. Do not restructure the chain so the argsort's source becomes a view.
+
+`NBk = 16` (e.g. `Lk = 2048, Bl = 128`) misses the HVX bitonic dispatch table
+`{32,64,128,256,512,1024}` and takes the scalar quicksort — still on device, still no
+graph split, and a scalar sort of 16 floats across `NBq_a * Hkv` rows is noise next to the
+FA op. Do **not** extend the table (a new bitonic network is easy to get subtly wrong and
+argsort has no contiguity gate to fail closed against), and do **not** pad the row: a pad
+column would produce an index `>= NBk`, which the FA kernel clamps to `NBk-1`, i.e. a
+silent duplicate.
+
+### The `bias` leaf is not test scaffolding
+
+`bias` is `F32 [NBk, NBq_a, 1, 1]`, broadcast over the KV-head axis by
+`ggml_can_repeat`. It carries three deployment jobs:
+
+1. `-BIG` on causally impossible blocks (`b >= (Lk-Lq)/Bl + (a+1)*R`). Masked cells are
+   **present** in the ranking, not absent: HTP's scorer softmax clamps its exponent at
+   `-88`, so a `-1e30` logit becomes `~6e-39` — subnormal, effectively zero, but sortable;
+   CPU gives exactly `0`. Either way the future-block tail is a mass of near-exact ties,
+   and without this term a real block with genuinely small mass can lose its slot to one.
+2. `+BIG` on block 0 (the sink) and on the last causally available block (the diagonal).
+   This is what the reference's `find_blocks` does unconditionally, and it is what
+   guarantees no query row's mask comes out all `-INF` — the FA kernel's `-inf` sentinel
+   is a *finite* `-65504` and a fully-masked FIRST chunk gives every column
+   `p = exp2(0) = 1`, inflating `l` by the chunk width until a later real chunk rescales it.
+3. A strictly decreasing ramp `-eps*b` (`eps = 1e-5`), far above the `~1e-39` masked floor
+   and far below any real score separation, so the residual ordering is deterministic and
+   identical on both backends and ties break sink-ward.
+
+### Choosing `u`
+
+`hmx_fa_find_chunk_size` requires `m = Bc/bs` to divide `sel->ne[0]`, with `m <= 8`
+(`htp/flash-attn-ops.h:440-446`), so the achievable chunk counts are exactly
+`{u/m : m | u, m <= 8}`. A **prime `u` collapses that set to `{u}`** — one chunk per
+block. Measured with a leaf selection, `u=17` costs 2.48x `u=18` and `u=29` does 10% less
+work than `u=32` while taking 2.83x longer. **Choose `u ≡ 0 (mod 8)`**, which leaves
+`m ∈ {1,2,4,8}` all legal. Note the search does *not* simply take the largest legal `Bc`:
+its cost model prices thread loss (`actual_threads` collapses to 1 below 3 KV blocks), so
+at `G=2, Br=64` four chunks beats two. Never predict `Bc`/`Br` — read them from
+`HEX_VERBOSE`.
+
+Two further couplings: `kv_effective = sel->ne[0] * bs` drives the entire chunk-size
+search (`ggml-hexagon.cpp:2094`), so **a `u` sweep is not a one-variable experiment** —
+`Br`, `Bc`, thread count, pipelining and VTCM all move together; and `u > NBk` silently
+drops the whole FA op to a dense CPU backend (`:2271`), which would time something else
+entirely.
+
+### When a query block has fewer than `u` causally available blocks
+
+`n_avail(a) = (Lk-Lq)/Bl + (a+1)*R`. Per-query-block clamping is **impossible**: `n_sel`
+is one `uint16_t` for the whole op, and `fa_chunk_nblk` deliberately does not take the
+query block, because the untagged DMA FIFO's push and pop sites need not see the same one
+(`htp/flash-attn-ops.c:217-231`). A computed `sel` must be fixed-width *by construction* —
+and padding is no escape either, since an out-of-range index is clamped to
+`n_blk_total-1`, i.e. becomes a duplicate.
+
+It binds more narrowly than it looks. At the primary shape (`Lq=512, Lk=2048, Bl=64,
+R=8`) the offset term is `1536/64 = 24`, so `n_avail(0) = 32 = NBk` and there is no
+shortage at all. It binds only when `Lk ≈ Lq` — the first ubatch of a prefill — which is
+exactly when `NBk` is small and sparsity has nothing to offer anyway.
+
+When it does bind, the disposition is quiet degradation, not failure: the `-BIG` term
+makes the selection prefer every real block over every future one, the `+BIG` sink term
+guarantees at least two causally valid blocks per row, and the residual slots go to future
+blocks that `src[3]` fully masks. **Every eval arm is registered outside this regime**
+(`u <= n_avail(0)`, asserted at `initialize_tensors`); an arm inside it would be checking
+undefined tie-break behaviour.
+
+### Correctness: four arms, and what the conjunction does *not* prove
+
+`ggml-cpu`'s flash attention reads no `src[5]` at all, so a CPU reference computes
+**dense** attention — which is exactly why the QSUB stage-0 arm is perf-only at 0/3. Each
+arm below says how it closes that gap.
+
+| arm | `-o` | what it decides |
+|---|---|---|
+| 0 | `XATTN_MERGE` | the merged score vs CPU by NMSE, no argsort, zero tie exposure. Plus a structural invariant checked on each backend *alone*: `mr` is `> 0` exactly on the causally reachable blocks. |
+| 0b | `XATTN_MERGE_MASS` | `sum_rows(mh)` against the analytic constant `P` on **both** backends (sharp only at `G == 1`; above that the invariant is the band `[P, G*P]`). |
+| 1 | `XATTN_SELECT` | the full argsort, checked as a SET. Planted rows check both backends against an analytically known set; unplanted rows check the only thing decidable without a plant — that the device's own prefix is a true top-`u` of the device's own scores. Registered at `NBk = 32` **and** `NBk = 16`, which are two entirely different device implementations (HVX bitonic vs scalar quicksort, `htp/argsort-ops.c:487-508`). |
+| 2 | `XATTN_E2E` (`plant=0`, `u = NBk`) | sparse attention over *all* blocks is dense attention, so a dense CPU reference agrees for **any** permutation the argsort emits. Tie-immune, end-to-end, and the only arm that runs the fully shared graph. Also the first exercise of `sel->ne[2] == Hkv` with `nr > 1`. |
+| 3 | `XATTN_E2E` (`plant=1`) | the deployable density, ranked by the real scorer, with the `-INF` mask built from the analytically known set. `G == 1`, because a per-KV-head mask is only expressible when `nr == 1`. |
+
+The plant rigs `Q[:, l, hq] = sqrt(d)·e_dir` (`dir = (l/Bl)·Hq + hq`) and makes `K`
+constant within a key block, so the reduced dot is `S·sqrt(d)·g[b][dir]` and
+`soft_max_ext`'s `1/(sqrt(d)·S)` scale turns it into exactly `g[b][dir]`: the
+`(scorer query block, key block, query head)` logit matrix is directly programmable and
+`attn_sum` is a closed form. `g` is a geometric ramp of total range `1e4`, so adjacent
+ranks are separated by 1.35x at `NBk = 32` — three orders of magnitude above any backend
+disagreement, which is what makes the winning SET independent of tie-breaking. The
+construction *asserts* its own margin at `initialize_tensors` time and aborts rather than
+ship a flaky row.
+
+Verified locally, CPU-only, by breaking each reduce and confirming the arm goes red:
+maxing the KV-head axis instead of the query-head axis, and maxing the query-block axis
+instead of the scorer-block axis, are both caught by `XATTN_SELECT` with `plant=1`.
+
+**Not proved by any of them:** whether the selection is any *good* (recall, perplexity,
+needle-in-haystack are unreachable from `test-backend-ops`); index-for-index agreement
+under unplanted scores (undecidable — rank is discontinuous, the two backends' scores
+differ, and all three sort implementations are unstable); the antidiagonal reversal in the
+planted arm (`K` is constant within a block, so the reversal is invisible there — stages 0
+and 2 of `XATTN_SCORE` cover it); the estimator's own correctness (the reduced causal mask
+deliberately admits `floor(S/2)` non-causal products per diagonal tile); or the measured
+*perf* configuration, which is maskless while every eval arm carries a mask or runs at
+full density.
 
 ## Reproduce
 
@@ -296,7 +453,28 @@ adb shell "$R ./bin/test-backend-ops test -b HTP0 -o XATTN_ROWSUM"      # stage 
 adb shell "$R ./bin/test-backend-ops perf -b HTP0 -o XATTN_SCORE_MM"    # stage 1, replicated
 adb shell "$R ./bin/test-backend-ops perf -b HTP0 -o XATTN_REVERSE"     # stage 2, GET_ROWS
 adb shell "$R ./bin/test-backend-ops perf -b HTP0 -o XATTN_SCORE_MM_WG" # stage 4, per-call constant
+
+# scores -> selection -> sparse FA. Run in this order: XATTN_MERGE first, because it is
+# the cheapest confirmation that the max tree runs on HTP at all (the in-place CLAMP
+# aliases its source, which no other in-tree graph does on this backend).
+adb shell "$R ./bin/test-backend-ops test -b HTP0 -o XATTN_MERGE"       # arm 0
+adb shell "$R ./bin/test-backend-ops test -b HTP0 -o XATTN_MERGE_MASS"  # arm 0b
+adb shell "$R ./bin/test-backend-ops test -b HTP0 -o XATTN_SELECT"      # arm 1, both argsorts
+adb shell "$R ./bin/test-backend-ops test -b HTP0 -o XATTN_E2E"         # arms 2 and 3
+
+# the D / P / P' / E / S sweep. GGML_HEXAGON_VERBOSE on every row: without
+# Br / Bc / n_kv_blocks / n_threads / pipeline / vtcm the u sweep is uninterpretable,
+# because kv_effective = u*bs changes the whole kernel configuration.
+adb shell "$R GGML_HEXAGON_VERBOSE=1 ./bin/test-backend-ops perf -b HTP0"
 ```
+
+Judge every correctness run by failing-case **class**, never by count: the count churns
++-16 run to run and this device's A/A gate shows up to 21% timing drift. The ledger to
+hold is `FLASH_ATTN_EXT` ~2166-2183/2196 with **all** failures `sinks=1`,
+`FLASH_ATTN_EXT_SPARSE 46/46`, `XATTN_SCORE 8/8`, `FLASH_ATTN_EXT_GATHER 2/2`,
+`QSUB_BLOCK_SCORES 3/3`. Capture the failing `vars()` strings before and after and diff
+the identity set — counting passes cannot distinguish "broke two, fixed two" from
+"changed nothing".
 
 ## Open questions
 
@@ -336,18 +514,26 @@ unresolved question.
 ## Optimising the scorer: the reversal is the wrong operand
 
 Profiled at the shape a chunked prefill actually scores -- `Lq=512` against every key so far,
-not the square `Lq=Lk` used earlier. That changes the picture completely (S=16,
-replicated-equivalent µs):
+not the square `Lq=Lk` used earlier. That changes the picture completely (S=16, whole-graph
+minus the measured C = 620 µs per-call constant; matmul and reversal are replicated rows):
 
 | Lk | total | matmul | **reversal** | epilogue |
 |--:|--:|--:|--:|--:|
-| 512 | 620 | 233 (38%) | **264 (43%)** | 123 (20%) |
-| 1024 | 779 | 329 (42%) | **264 (34%)** | 187 (24%) |
-| 2048 | 1052 | 534 (51%) | **261 (25%)** | 257 (24%) |
+| 512 | 702 | 233 (33%) | **261 (37%)** | 208 (30%) |
+| 1024 | 863 | 332 (38%) | 262 (30%) | 269 (31%) |
+| 2048 | 1355 | 533 (39%) | 276 (20%) | **546 (40%)** |
+| 4096 | 2366 | 931 (39%) | 262 (11%) | **1173 (50%)** |
 
-The antidiagonal reversal -- `ggml_get_rows(q, antidiag_idx)` -- is a flat ~262 µs and the
-LARGEST term at short context. The epilogue is only 20-24% here, not the 61-74% measured on
-the square shape, because `Lq` is pinned so the epilogue's `Nq` axis never grows.
+The antidiagonal reversal -- `ggml_get_rows(q, antidiag_idx)` -- is a flat ~262 µs, so it is
+the largest single term at `Lk=512` and irrelevant by `Lk=4096`. The matmul holds a steady
+~39%. The epilogue (softmax + both `sum_rows`) is the term that grows, and past `Lk=2048` it
+is the largest.
+
+> This table was previously published with the totals divided by the 1.605 slope, which
+> understated the epilogue at every row (123/187/257 instead of 208/269/546) and made the
+> reversal look like the dominant cost throughout. The slope does not exist at these scales;
+> see `xattn-block-selection.md`, "CORRECTION: the 1.605 slope does not exist at scale". The
+> matmul and reversal columns were always replicated rows and are unchanged.
 
 Also worth recording: **`try_fuse_xattn_score` can never fire on this graph.** It rejects any
 softmax with a mask (`ggml-hexagon.cpp`, `sm->src[1] != nullptr`) and the real scorer passes a
@@ -475,3 +661,77 @@ underlying reason: **on this platform the cost of sharing a buffer between CPU a
 the compute being offloaded.** Any future split should be gated on the R1 measurement in
 `examples/xattn-split` -- CPU-over-rpcmem versus CPU-over-malloc, taken *after* the DSP has run --
 before any implementation work. The harness prints STOP on its own when that ratio is bad.
+
+## The context-length curve, 512 to 4096
+
+The first table in this work where every column is a directly measured quantity at a
+matched shape, with the per-call constant handled by subtraction rather than by a fit.
+
+Configuration: `d=128`, `Hq=16`, `Hkv=8` (G=2), `S=16`, `Bl=64`, density held at **50%**
+(`u = NBk/2` = 4/8/16/32), `R = Lq/Bl` so `Bq = Lq` -- one selection for the whole chunk.
+`FLASH_ATTN_EXT` (dense) is a replicated row; `XATTN_E2E` and `XATTN_SELECT` are
+whole-graph and have C = 620 µs subtracted. Dense is quoted as `D_wg - C` so both sides
+sit on the same basis. `attn = E - S`, in which C cancels exactly.
+
+| kv | Lq | u | dense | sparse e2e | selection | attention | **D/E** | D/attn | sel share |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 512 | 512 | 4 | 919 | 1929 | 921 | 1008 | **0.48x** | 0.91x | 48% |
+| 1024 | 512 | 8 | 1218 | 2207 | 1144 | 1063 | **0.55x** | 1.15x | 52% |
+| 1024 | 1024 | 8 | 2388 | 3802 | 1927 | 1875 | **0.63x** | 1.27x | 51% |
+| 2048 | 512 | 16 | 2001 | 3003 | 1548 | 1455 | **0.67x** | 1.37x | 52% |
+| 2048 | 2048 | 16 | 8628 | 9726 | 4647 | 5079 | **0.89x** | 1.70x | 48% |
+| 4096 | 512 | 32 | 4216 | 4712 | 2560 | 2152 | **0.89x** | 1.96x | 54% |
+| 4096 | 2048 | 32 | 15962 | 15949 | 7518 | 8431 | **1.00x** | 1.89x | 47% |
+
+At 25% density (`u=16`) at kv=4096, which the measured union saturation supports:
+
+| kv | Lq | u | dense | sparse e2e | selection | attention | **D/E** | D/attn |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 4096 | 512 | 16 | 4216 | 3947 | 2560 | 1387 | **1.07x** | 3.04x |
+| 4096 | 2048 | 16 | 15962 | 12671 | 7518 | 5153 | **1.26x** | 3.10x |
+
+Three things this settles:
+
+1. **The attention kernel is not the problem.** `D/attn` reaches 1.9x at 50% density and
+   3.1x at 25% -- at 50% density 1.9x is already past the 2.0x the FLOP count allows once
+   the per-query-block tiling penalty is paid, and it improves monotonically with kv.
+2. **Selection costs about half the pass at every context length**, 47-54%, and the share
+   is remarkably flat. It is the whole reason `D/E` is below 1 for most of the table.
+3. **Break-even is at kv=4096 for 50% density and kv~2048-4096 for 25%.** Below that,
+   dense wins end-to-end. This matches mllm's own crossover at `Sq >= 2048`.
+
+### Where the selection time goes
+
+Nested differences from the stage ladder (`XATTN_REVERSE` and `XATTN_SCORE_MM` replicated;
+`XATTN_SCORE`, `XATTN_MERGE`, `XATTN_SELECT` whole-graph, C subtracted once at the
+innermost step and cancelling in every difference above it):
+
+| kv | Lq | reversal | matmul | softmax+sum | head/block merge | argsort | total |
+|--:|--:|--:|--:|--:|--:|--:|--:|
+| 512 | 512 | 261 | 233 | 204 | 142 | 81 | 921 |
+| 1024 | 512 | 262 | 332 | 264 | 277 | 9 | 1144 |
+| 1024 | 1024 | 558 | 489 | 638 | 221 | 20 | 1927 |
+| 2048 | 512 | 276 | 533 | 541 | 178 | 20 | 1548 |
+| 2048 | 2048 | 1053 | 992 | 2294 | 351 | -44 | 4647 |
+| 4096 | 512 | 262 | 931 | 1168 | 162 | 37 | 2560 |
+| 4096 | 2048 | 1071 | 1455 | 4674 | 357 | -39 | 7518 |
+
+- **`softmax + sum_rows` is the largest term** at every shape past kv=512, and at the
+  largest shape it is **3.2x the matmul**. The matmul is 19-32% of selection and never
+  the bottleneck -- which is what the fusion work already implied and this now prices
+  end-to-end.
+- The **reversal** is flat ~262 µs at `Lq=512` regardless of `Lk` (it touches only Q) and
+  ~1060 µs at `Lq=2048`; it scales with `Lq` alone.
+- **argsort is free**, 0-81 µs, and at the two largest shapes it measures slightly
+  negative, i.e. below run-to-run noise. The `find_blocks` threshold that XAttention uses
+  was replaced by a fixed top-k for simplicity, and this says nothing was lost by it.
+- **head/block merge** (Hq->Hkv max, then the R-block max) is 150-360 µs and roughly
+  independent of everything.
+
+So the one thing worth optimising in the selection leg is the softmax + reduction
+epilogue: it is ~50% of selection, which is ~50% of the pass, i.e. ~25% of the whole
+end-to-end cost. `try_fuse_xattn_score` was written to remove exactly this and measured
+1.12-1.58x on the stand-in, but it **cannot fire on the real scorer** -- it rejects any
+masked softmax (`ggml-hexagon.cpp:3823`) and real XAttention's softmax carries the reduced
+causal mask. Teaching the fusion to accept a mask is the highest-value remaining item,
+and it is worth roughly 12-15% of the end-to-end pass.

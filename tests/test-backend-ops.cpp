@@ -25,6 +25,7 @@
 #include <array>
 #include <cfloat>
 #include <cinttypes>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -7198,6 +7199,28 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// Dense FA timed WHOLE-GRAPH: byte-identical to test_flash_attn_ext, one
+// ggml_backend_graph_compute per unit of work instead of a replicated tail. It exists
+// to pair with an ordinary replicated row at the SAME shape, because every multi-node
+// arm here (XATTN_E2E, XATTN_SELECT) is forced to n_runs=1 (:1602) and so carries a
+// per-call cost that a replicated FLASH_ATTN_EXT row does not.
+//
+// The published correction for that is a fit -- whole = 1.605 x replicated + 307 us
+// (docs/backend/snapdragon/xattn-block-selection.md:382) -- measured over replicated
+// times of 80-450 us. The E rows below sit at 700-10000 us, 2-20x outside that range,
+// and the 1.605 is a SLOPE, so extrapolating it is not a rounding error: at 8 ms it
+// would claim 4.8 ms of pure timing artifact. The slope's mechanism (a replicated run
+// overlaps successive iterations, a single run cannot) has no reason to stay
+// multiplicative once one iteration is far longer than the pipeline it can overlap.
+// So measure the pair directly at the shapes in question rather than extrapolating.
+struct test_flash_attn_ext_wg : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_EXT_WG"; }
+
+    bool perf_whole_graph() override { return true; }
+};
+
 // Block-sparse flash attention via a KV block-index list (hexagon HTP).
 //
 // The op is a normal FLASH_ATTN_EXT carrying an extra src[5]: an I32 list of KV
@@ -7887,6 +7910,38 @@ struct test_flash_attn_ext_qsubsample_topk : public test_case {
     }
 };
 
+// The two constant leaves the XAttention scoring graph needs. Factored out so the
+// selection pipeline further down builds them EXACTLY the way test_xattn_score does:
+// if the two arms ever disagreed about the antidiagonal permutation or the reduced
+// causal mask they would silently be testing two different estimators.
+
+// idx[l] = (l/S)*S + (S-1 - l%S), repeated for every head -- the antidiagonal
+// involution. Must be written explicitly: the default fill is random, and a garbage
+// I32 index makes CPU abort on GGML_ASSERT(i01 < ne01) while hexagon silently skips
+// the row and leaves the output uninitialized.
+static void xattn_fill_idx(ggml_tensor * t, int64_t L, int64_t H, int64_t S) {
+    std::vector<int32_t> perm(L * H);
+    for (int64_t h = 0; h < H; h++) {
+        for (int64_t l = 0; l < L; l++) {
+            perm[h*L + l] = (int32_t) ((l/S)*S + (S - 1 - l%S));
+        }
+    }
+    ggml_backend_tensor_set(t, perm.data(), 0, perm.size()*sizeof(int32_t));
+}
+
+// rk <= rq + (Nk - Nq): the offset is the reduced-grid form of the reference's
+// k_block_num - q_block_num, i.e. how chunked prefill (Lk > Lq) is handled.
+static void xattn_fill_cmask(ggml_tensor * t, int64_t Nk, int64_t Nq) {
+    const int64_t off = Nk - Nq;
+    std::vector<float> m(Nk * Nq);
+    for (int64_t rq = 0; rq < Nq; rq++) {
+        for (int64_t rk = 0; rk < Nk; rk++) {
+            m[rq*Nk + rk] = (rk <= rq + off) ? 0.0f : -1e30f;
+        }
+    }
+    ggml_backend_tensor_set(t, m.data(), 0, m.size()*sizeof(float));
+}
+
 // XAttention block-selection scoring, faithfully (Xu et al., ICML 2025,
 // "XAttention: Block Sparse Attention with Antidiagonal Scoring", arXiv:2503.16428;
 // reference implementation github.com/mit-han-lab/x-attention).
@@ -8131,36 +8186,923 @@ struct test_xattn_score : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "xattn_idx") == 0) {
-                // Must be written explicitly: the default fill is random, and a
-                // garbage I32 index makes CPU abort on GGML_ASSERT(i01 < ne01) while
-                // hexagon silently skips the row and leaves the output uninitialized.
-                // whichever operand carries the reversal -- the permutation itself is
-                // the same involution either way, only its length and head count differ
-                const int64_t PL = rev_k ? Lk  : Lq;
-                const int64_t PH = rev_k ? Hkv : Hq;
-                std::vector<int32_t> perm(PL * PH);
-                for (int64_t h = 0; h < PH; h++) {
-                    for (int64_t l = 0; l < PL; l++) {
-                        perm[h*PL + l] = (int32_t) ((l/S)*S + (S - 1 - l%S));
-                    }
-                }
-                ggml_backend_tensor_set(t, perm.data(), 0, perm.size()*sizeof(int32_t));
+                // sized for whichever operand carries the reversal -- the permutation
+                // itself is the same involution either way, only its length and head
+                // count differ
+                xattn_fill_idx(t, rev_k ? Lk : Lq, rev_k ? Hkv : Hq, S);
             } else if (strcmp(t->name, "xattn_cmask") == 0) {
-                // rk <= rq + (Nk - Nq): the offset is the reduced-grid form of the
-                // reference's k_block_num - q_block_num, i.e. how chunked prefill
-                // (Lk > Lq) is handled.
-                const int64_t nk = Nk(), nq = Nq(), off = Nk() - Nq();
-                std::vector<float> m(nk * nq);
-                for (int64_t rq = 0; rq < nq; rq++) {
-                    for (int64_t rk = 0; rk < nk; rk++) {
-                        m[rq*nk + rk] = (rk <= rq + off) ? 0.0f : -1e30f;
-                    }
-                }
-                ggml_backend_tensor_set(t, m.data(), 0, m.size()*sizeof(float));
+                xattn_fill_cmask(t, Nk(), Nq());
             } else {
                 init_tensor_uniform(t);
             }
         }
+    }
+};
+
+// ===========================================================================
+// Real XAttention scores -> a COMPUTED block selection -> block-sparse FA.
+//
+// test_xattn_score above stops at attn_sum [NBk, NBq_s, Hq] because the paper's
+// find_blocks emits a VARIABLE-length list and no ggml tensor has a variable length.
+// The rule implemented here is the one that IS expressible: a FIXED top-u taken after
+// two max reduces. Both reduces are forced by the kernel's addressing, not chosen:
+//
+//  * Hq -> Hkv. sel is read as sel + qb*sel_nb1 + kv_head*sel_nb2 + ib3*sel_nb3, then
+//    list[c*m + j] (htp/flash-attn-ops.c:242-256) -- there is NO query-head term. One
+//    list serves all G query heads of a KV head, staged once into a single
+//    align_up(G*Br, 32) row tile (ggml-hexagon.cpp:2143). So the object the kernel
+//    needs is the UNION of the G per-head top-u sets, and MAX is its score-space
+//    surrogate. SUM is not: a block taking half of one head's mass and nothing from
+//    the other G-1 loses to a block taking a tenth from each -- yet dropping the first
+//    costs that head half its attention while dropping the second costs every head a
+//    tenth. The marginal COST of keeping a block is identical either way (it is staged
+//    once and shared), so ranking by max is ranking by the worst per-head loss avoided.
+//
+//  * R = Bq/Bl scorer query blocks -> one attention query block. Same argument: one
+//    list per attention query block, so it needs the union of the R scorer blocks'
+//    selections. A set-union of R top-u lists has a variable size; max-then-top-u has
+//    a fixed one and approximates the same thing.
+//
+// Max is well-posed here rather than dominated by whichever row happens to be largest,
+// because every (head, query block) row of attn_sum sums to exactly P = Bl/S -- the
+// invariant XATTN_ROWSUM checks against the analytic constant. All Hq*NBq_s rows sit
+// on one common scale.
+//
+// This supersedes docs/backend/snapdragon/xattn-scoring.md's "only SUM is
+// expressible". ggml has no elementwise max and no max-reduce (ggml.h:497-501 lists
+// SUM/SUM_ROWS/CUMSUM/MEAN/ARGMAX as the only reductions), GGML_OP_POOL_MAX has no
+// case in hexagon's supports_op, and its unary switch has no RELU or ABS -- but it
+// does have CLAMP, and max(a,b) = b + clamp(a-b, 0, FLT_MAX) is three HTP-resident
+// nodes (SUB :3649, CLAMP :3665, ADD :3651).
+// ===========================================================================
+
+// Geometry of one selection pipeline. Every field is a graph-build-time constant.
+struct xattn_geom {
+    int64_t d, Hq, Hkv, Lq, Lk, S, Bl, R, u;
+
+    int64_t G()     const { return Hq / Hkv; }   // GQA factor
+    int64_t Nq()    const { return Lq / S;   }   // reduced query rows
+    int64_t Nk()    const { return Lk / S;   }   // reduced key rows
+    int64_t P()     const { return Bl / S;   }   // reduced rows per block
+    int64_t NBq_s() const { return Lq / Bl;  }   // SCORER query blocks
+    int64_t NBk()   const { return Lk / Bl;  }
+    int64_t Bq()    const { return R * Bl;   }   // ATTENTION query block
+    int64_t NBq_a() const { return NBq_s() / R; }
+
+    // KV block holding query token 0. Well defined because Bl divides both Lq and Lk.
+    int64_t off_b() const { return (Lk - Lq) / Bl; }
+    // Causally reachable blocks for attention query block a: the newest query token of
+    // the block sits in KV block off_b + (a+1)*R - 1.
+    int64_t n_avail(int64_t a) const { return off_b() + (a + 1)*R; }
+};
+
+static bool xattn_is_pow2(int64_t x) { return x > 0 && (x & (x - 1)) == 0; }
+
+// max(a, b). ggml_clamp is unconditionally IN-PLACE (ggml.c:4443-4457 builds its
+// result with ggml_view_tensor, with a TODO admitting it), so the CLAMP node aliases
+// the SUB output. That is safe here and only here: the SUB output is dead the instant
+// it is clamped, and the clamp is elementwise with an identical layout. Never clamp a
+// tensor you still need, and never clamp a leaf.
+static ggml_tensor * xattn_max2(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b) {
+    return ggml_add(ctx, ggml_clamp(ctx, ggml_sub(ctx, a, b), 0.0f, FLT_MAX), b);
+}
+
+// Halve ne3 by max until it is 1. Splitting on ne3 -- the SLOWEST axis -- is what
+// keeps both halves fully contiguous: ggml_is_contiguous_m_n never inspects nb[3] past
+// the ne[i] != 1 guard (ggml.c:1473-1491), so lo and hi are plain contiguous slabs and
+// nothing here depends on strided-source handling in the HTP binary kernel.
+static ggml_tensor * xattn_reduce_max_ne3(ggml_context * ctx, ggml_tensor * cur) {
+    for (int64_t g = cur->ne[3]; g > 1; g /= 2) {
+        GGML_ASSERT(g % 2 == 0);   // guaranteed by the power-of-two asserts in xattn_build_selection
+        ggml_tensor * lo = ggml_view_4d(ctx, cur, cur->ne[0], cur->ne[1], cur->ne[2], g/2,
+                                        cur->nb[1], cur->nb[2], cur->nb[3], 0);
+        ggml_tensor * hi = ggml_view_4d(ctx, cur, cur->ne[0], cur->ne[1], cur->ne[2], g/2,
+                                        cur->nb[1], cur->nb[2], cur->nb[3], (size_t) (g/2) * cur->nb[3]);
+        cur = xattn_max2(ctx, lo, hi);
+    }
+    return cur;
+}
+
+struct xattn_sel_nodes {
+    ggml_tensor * q        = nullptr;  // F32 [d, Lq, Hq, 1]        also the FA leg's src[0]
+    ggml_tensor * k        = nullptr;  // F16 [d, Lk, Hkv, 1]
+    ggml_tensor * attn_sum = nullptr;  // F32 [NBk, NBq_s, Hq]
+    ggml_tensor * mh       = nullptr;  // F32 [NBk, NBq_s, Hkv, 1]  max over the G query heads
+    ggml_tensor * mr       = nullptr;  // F32 [NBk, NBq_a, Hkv, 1]  max over the R scorer blocks
+    ggml_tensor * scores   = nullptr;  // F32 mr + bias, the argsort source
+    ggml_tensor * ranked   = nullptr;  // I32 [NBk, NBq_a, Hkv, 1]  full argsort
+    ggml_tensor * sel      = nullptr;  // I32 [u,   NBq_a, Hkv, 1], nb[1] = 4*NBk
+};
+
+// The whole chain, q/k leaves to sel. Leaf names are fixed so initialize_tensors can
+// find them: "q", "k", "xattn_idx", "xattn_cmask", "xattn_bias".
+static xattn_sel_nodes xattn_build_selection(ggml_context * ctx, const xattn_geom & gm) {
+    // Everything here is a GGML_ASSERT rather than something discovered at run time,
+    // because eval() reports an unsupported op as "not supported" and SKIPS the case
+    // (:1354-1377) -- it does not split the graph and it does not fail. 8/8 turning
+    // into 0/0 is the failure mode this guards against.
+    GGML_ASSERT(gm.Lq % gm.S == 0 && gm.Lk % gm.S == 0);
+    GGML_ASSERT(gm.Bl % gm.S == 0 && gm.S <= gm.Bl);
+    GGML_ASSERT(gm.Lq % gm.Bl == 0 && gm.Lk % gm.Bl == 0);
+    GGML_ASSERT(gm.Lk >= gm.Lq);
+    GGML_ASSERT(gm.Hq % gm.Hkv == 0);
+    // The two reduce trees bisect an axis. This costs nothing real: br_unit is
+    // ceil(32/G) (flash-attn-ops.h:386) and must divide Bq, and for G in {3,5,6,7} it
+    // gives 11/7/6/5 -- none of which divides 64 or 128 -- so those G already cannot
+    // run per-query-block sparse FA at all (ggml-hexagon.cpp:2126-2132).
+    GGML_ASSERT(xattn_is_pow2(gm.G()));
+    GGML_ASSERT(xattn_is_pow2(gm.R));
+    GGML_ASSERT(gm.NBq_s() % gm.R == 0);            // the stage-B reshape needs R | NBq_s
+    // ggml_hexagon_supported_softmax: ne0 must be <= 32 or a multiple of 32 (:3301).
+    GGML_ASSERT(gm.Nk() <= 32 || gm.Nk() % 32 == 0);
+    // ggml_hexagon_supported_fa_sparse, mirrored (:2249, :2259, :2271). Bl = 32 is
+    // rejected outright by the bs gate, so the scorer block size is not free.
+    GGML_ASSERT(gm.Bl >= 64 && gm.Bl % 64 == 0);
+    GGML_ASSERT(gm.Bq() >= 32 && gm.Bq() % 32 == 0 && gm.Bq() <= UINT16_MAX);
+    GGML_ASSERT(gm.u >= 1 && gm.u <= gm.NBk());
+    // NOT asserted, but the rule for choosing u: hmx_fa_find_chunk_size requires
+    // m = Bc/bs to divide sel->ne[0] with m <= 8 (flash-attn-ops.h:440-446), so the
+    // achievable chunk counts are exactly {u/m : m | u, m <= 8} and a PRIME u collapses
+    // that set to {u} -- one chunk per block. Measured, u=17 costs 2.48x u=18. Pick
+    // u % 8 == 0, which leaves m in {1,2,4,8} all legal. Deliberately not an assert:
+    // the perf sweep registers u=17 on purpose, as the sawtooth control.
+
+    xattn_sel_nodes n;
+
+    // --- scoring: byte-identical to test_xattn_score stage 0 at rev_k = 0, so the FA
+    //     leg can read the ORIGINAL q and k leaves and the two legs share them.
+    n.q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, gm.d, gm.Lq, gm.Hq,  1);
+    ggml_set_name(n.q, "q");
+    n.k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, gm.d, gm.Lk, gm.Hkv, 1);
+    ggml_set_name(n.k, "k");
+
+    ggml_tensor * idx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, gm.Lq, gm.Hq);
+    ggml_set_name(idx, "xattn_idx");
+
+    ggml_tensor * qperm = ggml_get_rows(ctx, n.q, idx);                       // F32 [d, Lq, Hq]
+    ggml_tensor * rq    = ggml_reshape_3d(ctx, qperm, gm.S*gm.d, gm.Nq(), gm.Hq);
+    ggml_tensor * rk    = ggml_reshape_3d(ctx, n.k,  gm.S*gm.d, gm.Nk(), gm.Hkv);
+
+    ggml_tensor * mm = ggml_mul_mat(ctx, rk, rq);                             // F32 [Nk, Nq, Hq]
+    ggml_mul_mat_set_prec(mm, GGML_PREC_F32);
+
+    ggml_tensor * cmask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, gm.Nk(), gm.Nq());
+    ggml_set_name(cmask, "xattn_cmask");
+
+    ggml_tensor * sm = ggml_soft_max_ext(ctx, mm, cmask,
+                                         1.0f/(sqrtf((float) gm.d) * (float) gm.S), 0.0f);
+
+    ggml_tensor * t6  = ggml_reshape_4d(ctx, sm, gm.P(), gm.NBk(), gm.Nq(), gm.Hq);
+    ggml_tensor * t7  = ggml_sum_rows(ctx, t6);                               // [1, NBk, Nq, Hq]
+    ggml_tensor * t8  = ggml_reshape_4d(ctx, t7, gm.NBk(), gm.P(), gm.NBq_s(), gm.Hq);
+    ggml_tensor * t9  = ggml_permute(ctx, t8, 1, 0, 2, 3);
+    ggml_tensor * t10 = ggml_cont(ctx, t9);
+    ggml_tensor * t11 = ggml_sum_rows(ctx, t10);                              // [1, NBk, NBq_s, Hq]
+    n.attn_sum = ggml_reshape_3d(ctx, t11, gm.NBk(), gm.NBq_s(), gm.Hq);
+    ggml_set_name(n.attn_sum, "attn_sum");
+
+    // --- stage A: Hq -> Hkv by max over the G query heads.
+    // The query-head index is the FAST half of Hq -- the kernel takes head
+    // kv_head*G + j (htp/flash-attn-ops.c:2887) -- so the split is a free reshape.
+    if (gm.G() == 1) {
+        // the permute+cont below would be an exact no-op; skip the copy
+        n.mh = ggml_reshape_4d(ctx, n.attn_sum, gm.NBk(), gm.NBq_s(), gm.Hkv, 1);
+    } else {
+        ggml_tensor * a4 = ggml_reshape_4d(ctx, n.attn_sum, gm.NBk(), gm.NBq_s(), gm.G(), gm.Hkv);
+        // ggml_permute(a, ax0..ax3) sends a's axis i to result axis ax_i (ggml.c:3815),
+        // so this is [NBk, NBq_s, Hkv, G].
+        ggml_tensor * ap = ggml_permute(ctx, a4, 0, 1, 3, 2);
+        n.mh = xattn_reduce_max_ne3(ctx, ggml_cont(ctx, ap));
+    }
+    ggml_set_name(n.mh, "xattn_mh");
+
+    // --- stage B: the R scorer query blocks -> one attention query block, by max.
+    // a_s = a_a*R + jl with jl fast, so this is again a free reshape.
+    if (gm.R == 1) {
+        n.mr = n.mh;   // NBq_a == NBq_s already; keep mh's name rather than shadow it
+    } else {
+        ggml_tensor * b4 = ggml_reshape_4d(ctx, n.mh, gm.NBk(), gm.R, gm.NBq_a(), gm.Hkv);
+        ggml_tensor * bp = ggml_permute(ctx, b4, 0, 3, 1, 2);   // [NBk, NBq_a, Hkv, R]
+        n.mr = xattn_reduce_max_ne3(ctx, ggml_cont(ctx, bp));
+        ggml_set_name(n.mr, "xattn_mr");
+    }
+
+    // --- stage C: bias, rank, cut.
+    //
+    // The bias leaf is NOT test scaffolding. It carries three deployment jobs:
+    //   1. -BIG on causally impossible blocks. Masked cells are not ABSENT from the
+    //      ranking -- HTP's scorer softmax clamps its exponent at -88 (htp/hvx-exp.h),
+    //      so a -1e30 logit becomes ~6e-39, subnormal but present; CPU gives exactly 0.
+    //      Either way the future-block tail is a mass of near-exact ties, and without
+    //      this a real block whose mass is genuinely small can lose a slot to one.
+    //   2. +BIG on block 0 (the sink) and on the last causally available block (the
+    //      diagonal). This is what the reference's find_blocks does unconditionally,
+    //      and it is what guarantees no query row's mask comes out all -INF: the FA
+    //      kernel's -inf sentinel is a FINITE -65504 (htp/flash-attn-ops.c:550) and a
+    //      fully-masked FIRST chunk gives every column p = exp2(0) = 1, inflating l by
+    //      the chunk width until a later real chunk rescales it.
+    //   3. A strictly decreasing ramp -eps*b, far above the ~1e-39 masked floor and far
+    //      below any real score separation, so the residual ordering is deterministic
+    //      and identical on both backends and ties break sink-ward.
+    // One ADD over NBk*NBq_a floats; in a runtime it is built once per (Lq,Lk,Bl,Bq).
+    ggml_tensor * bias = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, gm.NBk(), gm.NBq_a(), 1, 1);
+    ggml_set_name(bias, "xattn_bias");
+    // broadcast over ne2 = Hkv via ggml_can_repeat (ggml-hexagon.cpp:3132)
+    n.scores = ggml_add(ctx, n.mr, bias);
+    ggml_set_name(n.scores, "xattn_scores");
+
+    // The ADD's dst is freshly allocated and contiguous, which is what makes an
+    // explicit ggml_cont unnecessary HERE. ggml_hexagon_supported_argsort checks only
+    // F32 in / I32 out / ne0 <= 16K (:3369-3389) and both device kernels address row r
+    // as data + r*nb[1] over the flattened ne1*ne2*ne3, so a permuted or strided source
+    // is silently MIS-SORTED rather than rejected. Do not restructure this chain so the
+    // argsort's source becomes a view.
+    n.ranked = ggml_argsort(ctx, n.scores, GGML_SORT_ORDER_DESC);
+    ggml_set_name(n.ranked, "xattn_ranked");
+
+    // Exactly ggml_argsort_top_k's output: a strided view keeping nb[1..3]
+    // (ggml.c:5362-5376), which is the layout supported_fa_sparse was relaxed to admit
+    // (:2239-2246) and the sel_strided shape already at 46/46 on device.
+    n.sel = ggml_view_4d(ctx, n.ranked, gm.u, gm.NBq_a(), gm.Hkv, 1,
+                         n.ranked->nb[1], n.ranked->nb[2], n.ranked->nb[3], 0);
+    ggml_set_name(n.sel, "xattn_sel");
+
+    return n;
+}
+
+// bias[b, a_a]: the three jobs above. BIG has to dominate any score (mr is bounded by
+// P = Bl/S) without reaching a magnitude where adding it in F32 would swallow the ramp --
+// and it does not have to, because the ordinary blocks carry no BIG term at all. Two
+// blocks that BOTH carry one are exactly tied once the ramp falls below ulp(1e4), which
+// is harmless: they are the forced pair, and both are inside the top-u by construction.
+static const float XATTN_BIAS_BIG = 1.0e4f;
+// Far above the ~1e-39 masked floor, far below the smallest real score separation (the
+// plant below produces ~5e-3 at NBk=32, which leaves 500x of headroom) and still ~80x
+// above the F32 ulp of a score of order 1.
+static const float XATTN_BIAS_EPS = 1.0e-5f;
+
+static std::vector<float> xattn_build_bias(const xattn_geom & gm) {
+    std::vector<float> bias((size_t) gm.NBk() * gm.NBq_a(), 0.0f);
+    for (int64_t a = 0; a < gm.NBq_a(); a++) {
+        const int64_t navail = gm.n_avail(a);
+        for (int64_t b = 0; b < gm.NBk(); b++) {
+            float v = -XATTN_BIAS_EPS * (float) b;
+            if (b >= navail) {
+                v -= XATTN_BIAS_BIG;
+            } else if (b == 0 || b == navail - 1) {
+                v += XATTN_BIAS_BIG;
+            }
+            bias[a*gm.NBk() + b] = v;
+        }
+    }
+    return bias;
+}
+
+// --- the analytic plant ----------------------------------------------------
+//
+// Random q/k give near-uniform softmax scores and an essentially random top-u
+// (examples/xattn-overlap/xattn-overlap.cpp:10-13), so an eval arm built on them can
+// only compare two backends' rankings -- and that comparison is undecidable, not
+// merely hard: rank is discontinuous in the score, the two backends' scores differ
+// (HTP's softmax normalizes with an approximate reciprocal), CPU's std::sort and HTP's
+// bitonic network / Hoare quicksort are all unstable and mutually inconsistent, and
+// the future-block tail is exactly tied.
+//
+// So rig q and k instead, so the whole scoring chain has a closed form the host can
+// evaluate in double precision with a controlled margin at the cut. With orthonormal
+// directions e_0 .. e_{NBq_s*Hq-1} (the first coordinate axes):
+//
+//   Q[:, l, hq]     = sqrt(d) * e_dir,   dir = (l/Bl)*Hq + hq
+//   K[:, l, hkv][c] = g[l/Bl][c]                    (identical for every KV head)
+//
+// Q is constant across the Bl tokens of a query block and S | Bl, so every reduced
+// query row of that block is S copies of sqrt(d)*e_dir; likewise every reduced key row
+// of block b is S copies of g[b]. The reduced dot is therefore S*sqrt(d)*g[b][dir],
+// and soft_max_ext's 1/(sqrt(d)*S) scale turns it into exactly g[b][dir]: the (scorer
+// query block, key block, query head) logit matrix is directly programmable, and
+// attn_sum is a closed form.
+//
+// The one thing this plant CANNOT see is the antidiagonal reversal: K is constant
+// within a block, so sum_j q_{a_j}.k_{b_j} is invariant under any permutation of the
+// q's. XATTN_REVERSE (stage 2) and XATTN_SCORE (stage 0) cover that on random data.
+static const double XATTN_PLANT_RANGE = 1.0e4;
+
+// The programmed logit table, [NBq_a][Hq][NBk]. A geometric ramp of total range
+// XATTN_PLANT_RANGE across the NBk ranks, so adjacent ranks are separated by
+// RANGE^(1/(NBk-1)) -- 1.35x at NBk=32 -- three orders of magnitude above any backend
+// disagreement in attn_sum, which is why the winning SET does not depend on either
+// argsort's tie-breaking.
+//
+// Rounded through F16 because that is what K stores: the host reference has to see the
+// same value the kernel does, or the two orderings can differ at the bottom of the ramp.
+static std::vector<double> xattn_plant_logits(const xattn_geom & gm) {
+    const int64_t NBk = gm.NBk();
+    const double  c   = std::log(XATTN_PLANT_RANGE) / (double) (NBk > 1 ? NBk - 1 : 1);
+    std::vector<double> L((size_t) gm.NBq_a() * gm.Hq * NBk);
+    for (int64_t a = 0; a < gm.NBq_a(); a++) {
+        for (int64_t hq = 0; hq < gm.Hq; hq++) {
+            for (int64_t b = 0; b < NBk; b++) {
+                // 7 is coprime with every power-of-two NBk, so this is a bijection.
+                //
+                // The a term is essential and must not be simplified away -- it is the
+                // role sel_block's iqb term plays in test_flash_attn_ext_sparse:
+                // without it every query block wants the same blocks and a kernel that
+                // reads selection row 0 for everything passes. It deliberately does NOT
+                // vary with the scorer block INSIDE a, so the R rows stage B merges
+                // agree on the order and the max cannot manufacture a near-tie out of
+                // two rows that rank blocks differently.
+                const int64_t rank = (b*7 + a*5 + hq*3) % NBk;
+                const float   v    = (float) (c * (double) (NBk - 1 - rank));
+                L[((size_t) a*gm.Hq + hq)*NBk + b] = ggml_fp16_to_fp32(ggml_fp32_to_fp16(v));
+            }
+        }
+    }
+    return L;
+}
+
+static void xattn_fill_plant_q(ggml_tensor * t, const xattn_geom & gm) {
+    GGML_ASSERT(t->ne[0] == gm.d && t->ne[1] == gm.Lq && t->ne[2] == gm.Hq);
+    std::vector<float> q((size_t) gm.d * gm.Lq * gm.Hq, 0.0f);
+    const float amp = sqrtf((float) gm.d);
+    for (int64_t hq = 0; hq < gm.Hq; hq++) {
+        for (int64_t l = 0; l < gm.Lq; l++) {
+            q[((size_t) hq*gm.Lq + l)*gm.d + (l/gm.Bl)*gm.Hq + hq] = amp;
+        }
+    }
+    ggml_backend_tensor_set(t, q.data(), 0, q.size()*sizeof(float));
+}
+
+static void xattn_fill_plant_k(ggml_tensor * t, const xattn_geom & gm, const std::vector<double> & L) {
+    const int64_t ndir = gm.NBq_s() * gm.Hq;
+    GGML_ASSERT(ndir <= gm.d);   // one orthonormal direction per (scorer query block, head)
+    GGML_ASSERT(t->ne[0] == gm.d && t->ne[1] == gm.Lk && t->ne[2] == gm.Hkv);
+    std::vector<ggml_fp16_t> k((size_t) gm.d * gm.Lk * gm.Hkv, ggml_fp32_to_fp16(0.0f));
+    for (int64_t hkv = 0; hkv < gm.Hkv; hkv++) {
+        for (int64_t l = 0; l < gm.Lk; l++) {
+            const int64_t b = l / gm.Bl;
+            for (int64_t dir = 0; dir < ndir; dir++) {
+                const int64_t a_s = dir / gm.Hq, hq = dir % gm.Hq;
+                k[((size_t) hkv*gm.Lk + l)*gm.d + dir] =
+                    ggml_fp32_to_fp16((float) L[((size_t) (a_s/gm.R)*gm.Hq + hq)*gm.NBk() + b]);
+            }
+        }
+    }
+    ggml_backend_tensor_set(t, k.data(), 0, k.size()*sizeof(ggml_fp16_t));
+}
+
+// What the graph must produce, computed in double by mirroring it node for node.
+// Rows are flattened the way tensor_to_float walks the argsort output:
+// r = hkv*NBq_a + a_a.
+struct xattn_plant_ref {
+    std::vector<double>  score;   // [rows][NBk], mr + bias
+    std::vector<int32_t> set;     // [rows][u], the expected selection, ascending
+    double gap_abs   = 0.0;       // worst score[rank u-1] - score[rank u] over rows
+    double gap_rel   = 0.0;       // worst of that gap relative to |score[rank u]|
+};
+
+static xattn_plant_ref xattn_compute_plant(const xattn_geom & gm, const std::vector<float> & bias) {
+    const int64_t NBk = gm.NBk(), NBqs = gm.NBq_s(), NBqa = gm.NBq_a();
+    const int64_t Nq = gm.Nq(), Nk = gm.Nk(), P = gm.P();
+    const int64_t Hq = gm.Hq, Hkv = gm.Hkv, G = gm.G(), R = gm.R;
+
+    const std::vector<double> L = xattn_plant_logits(gm);
+
+    // attn_sum[hq][a_s][b]: softmax over the reduced grid under the PERMISSIVE reduced
+    // causal mask (rk <= rq + Nk - Nq), then the two pools. Masked cells are dropped
+    // outright here; on device they survive as ~e^-88, which is 30 orders below the
+    // "> 0" threshold every check below uses.
+    std::vector<double> as((size_t) Hq*NBqs*NBk, 0.0);
+    std::vector<double> p(Nk);
+    for (int64_t hq = 0; hq < Hq; hq++) {
+        for (int64_t rq = 0; rq < Nq; rq++) {
+            const int64_t  a_s    = rq / P;
+            const double * lrow   = &L[((size_t) (a_s/R)*Hq + hq)*NBk];
+            const int64_t  rk_max = std::min(Nk - 1, rq + (Nk - Nq));
+            double mx = -1e300, z = 0.0;
+            for (int64_t rk = 0; rk <= rk_max; rk++) { mx = std::max(mx, lrow[rk/P]); }
+            for (int64_t rk = 0; rk <= rk_max; rk++) { p[rk] = std::exp(lrow[rk/P] - mx); z += p[rk]; }
+            double * out = &as[((size_t) hq*NBqs + a_s)*NBk];
+            for (int64_t rk = 0; rk <= rk_max; rk++) { out[rk/P] += p[rk] / z; }
+        }
+    }
+
+    xattn_plant_ref ref;
+    ref.score.assign((size_t) Hkv*NBqa*NBk, 0.0);
+    ref.set.assign((size_t) Hkv*NBqa*gm.u, 0);
+    ref.gap_abs = 1e300;
+    ref.gap_rel = 1e300;
+
+    std::vector<int32_t> order(NBk);
+    for (int64_t h = 0; h < Hkv; h++) {
+        for (int64_t a = 0; a < NBqa; a++) {
+            double * s = &ref.score[((size_t) h*NBqa + a)*NBk];
+            for (int64_t b = 0; b < NBk; b++) {
+                double v = -1e300;
+                for (int64_t jl = 0; jl < R; jl++) {          // stage B: max over R
+                    for (int64_t j = 0; j < G; j++) {         // stage A: max over G
+                        v = std::max(v, as[((size_t) (h*G + j)*NBqs + a*R + jl)*NBk + b]);
+                    }
+                }
+                s[b] = v + (double) bias[a*NBk + b];
+            }
+            for (int64_t b = 0; b < NBk; b++) { order[b] = (int32_t) b; }
+            std::stable_sort(order.begin(), order.end(),
+                             [&](int32_t x, int32_t y) { return s[x] > s[y]; });
+            const double su1 = s[order[gm.u - 1]];
+            const double su  = gm.u < NBk ? s[order[gm.u]] : su1;
+            if (gm.u < NBk) {
+                ref.gap_abs = std::min(ref.gap_abs, su1 - su);
+                ref.gap_rel = std::min(ref.gap_rel, (su1 - su) / std::max(1e-30, std::fabs(su)));
+            }
+            int32_t * dst = &ref.set[((size_t) h*NBqa + a)*gm.u];
+            for (int64_t i = 0; i < gm.u; i++) { dst[i] = order[i]; }
+            std::sort(dst, dst + gm.u);
+        }
+    }
+    if (gm.u == NBk) {   // no cut: every block is selected, so there is nothing to separate
+        ref.gap_abs = 1e300;
+        ref.gap_rel = 1e300;
+    }
+    return ref;
+}
+
+// The selection pipeline without the attention: scores -> reduce -> rank.
+//
+//   stage 0  XATTN_MERGE       mr, the merged score, vs CPU by NMSE. Smooth (softmax
+//                              then sums then maxes), so no argsort and no tie
+//                              exposure at all -- this is where the reduce numerics
+//                              and the axis order are pinned.
+//   stage 1  XATTN_MERGE_MASS  sum_rows(mh) against an analytic constant on BOTH
+//                              backends, the one check an NMSE-vs-CPU comparison
+//                              cannot make.
+//   stage 2  XATTN_SELECT      the full argsort, checked as a SET.
+//
+// Nothing here says anything about attention; test_xattn_e2e below does that. The
+// claim is the conjunction, and no arm is the claim.
+struct test_xattn_select : public test_case {
+    const int64_t d, Hq, Hkv, Lq, Lk, S, Bl, R, u;
+    const int     stage;
+    // stage 2 only: rig q and k so the winning SET is analytically known (see
+    // xattn_compute_plant). Without it the arm can still check that the device's own
+    // prefix is a true top-u of the device's own scores -- exact and tie-immune -- but
+    // it cannot check WHICH blocks, because index-for-index agreement between two
+    // backends under unplanted scores is undecidable.
+    const bool    plant;
+
+    ggml_tensor *        scores = nullptr;   // stashed for the unplanted self-check
+    xattn_plant_ref      ref;
+
+    xattn_geom g() const { return xattn_geom{ d, Hq, Hkv, Lq, Lk, S, Bl, R, u }; }
+
+    std::string op_desc(ggml_tensor *) override {
+        return stage == 0 ? "XATTN_MERGE" : stage == 1 ? "XATTN_MERGE_MASS" : "XATTN_SELECT";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR11(d, Hq, Hkv, Lq, Lk, S, Bl, R, u, stage, plant);
+    }
+
+    // A custom err() is called on sentinels and on every intermediate node unless the
+    // whole graph is run (test_top_k documents this at :6132-6136), and the set logic
+    // below cannot cope with either.
+    bool run_whole_graph()  override { return true; }
+    bool perf_whole_graph() override { return true; }
+
+    // stage 2 counts set-membership violations, so anything but 0 is a failure. This
+    // has to be max_nmse_err(), not max_err(): the eval callback consults
+    // max_err(backend), whose default forwards to max_nmse_err(backend) (:1479).
+    double max_nmse_err() override { return stage == 1 ? 1e-2 : stage == 2 ? 0.0 : 5e-4; }
+
+    uint64_t op_flops(ggml_tensor *) override {
+        return 2ull * Hq * (Lq/S) * (Lk/S) * (S * d);   // the scorer dominates
+    }
+
+    test_xattn_select(int64_t d = 128, int64_t Hq = 4, int64_t Hkv = 2, int64_t Lq = 512,
+                      int64_t Lk = 512, int64_t S = 8, int64_t Bl = 64, int64_t R = 1,
+                      int64_t u = 4, int stage = 0, bool plant = false)
+        : d(d), Hq(Hq), Hkv(Hkv), Lq(Lq), Lk(Lk), S(S), Bl(Bl), R(R), u(u),
+          stage(stage), plant(plant) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const xattn_geom gm = g();
+        xattn_sel_nodes  n  = xattn_build_selection(ctx, gm);
+        scores = n.scores;
+
+        if (stage == 0) { return n.mr; }
+        if (stage == 1) {
+            // Every reduced softmax row sums to 1 and the pool adds P = Bl/S of them,
+            // so every row of attn_sum sums to exactly P. mh is a max over the G query
+            // heads of rows that each sum to P, so its row mass lies in [P, G*P] --
+            // exactly P when G == 1, which is the only setting where this is sharp.
+            // Registered at G == 1 for that reason.
+            ggml_tensor * mass = ggml_sum_rows(ctx, n.mh);      // [1, NBq_s, Hkv, 1]
+            ggml_set_name(mass, "xattn_mh_mass");
+            return mass;
+        }
+        // Compare the FULL argsort, not the top-u view: whole-graph comparison asserts
+        // the test node is present in g1->nodes (ggml-backend.cpp:2239-2254) while node
+        // mode skips view ops (:2268-2270), and comparing the argsort itself sidesteps
+        // the question. The prefix is sliced inside err().
+        GGML_ASSERT(stage == 2);
+        return n.ranked;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const xattn_geom          gm   = g();
+        const std::vector<float>  bias = xattn_build_bias(gm);
+        const std::vector<double> L    = plant ? xattn_plant_logits(gm) : std::vector<double>();
+
+        if (plant) {
+            ref = xattn_compute_plant(gm, bias);
+            // A plant whose cut is not decisively separated is worse than no test: both
+            // argsorts are unstable and the two backends' scores differ, so a marginal
+            // pair can rank either way and the arm would fail for the wrong reason.
+            // Abort at construction rather than ship a flaky row.
+            GGML_ASSERT(ref.gap_abs > 1e-3);
+            GGML_ASSERT(ref.gap_rel > 0.15);
+            // Registering inside the causal shortfall would be checking undefined
+            // tie-break behaviour: once u exceeds a query block's causally available
+            // count the -BIG term can no longer keep future blocks out of the top-u.
+            GGML_ASSERT(u <= gm.n_avail(0));
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "xattn_idx") == 0) {
+                xattn_fill_idx(t, Lq, Hq, S);
+            } else if (strcmp(t->name, "xattn_cmask") == 0) {
+                xattn_fill_cmask(t, gm.Nk(), gm.Nq());
+            } else if (strcmp(t->name, "xattn_bias") == 0) {
+                ggml_backend_tensor_set(t, bias.data(), 0, bias.size()*sizeof(float));
+            } else if (plant && strcmp(t->name, "q") == 0) {
+                xattn_fill_plant_q(t, gm);
+            } else if (plant && strcmp(t->name, "k") == 0) {
+                xattn_fill_plant_k(t, gm, L);
+            } else if (t->op == GGML_OP_NONE && t->view_src == nullptr) {
+                // LEAVES ONLY. rk is ggml_reshape_3d(k, ...) -- a view that shares k's
+                // storage -- so the default fill would silently overwrite everything
+                // written above and the plant would evaporate into random data. The
+                // same hazard is why test_flash_attn_ext_sparse has an explicit
+                // do-nothing branch for "sel_view".
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        const xattn_geom gm = g();
+        if (stage == 0) { return err_merge(a, b, n, gm); }
+        if (stage == 1) { return err_mass (a, b, n, gm); }
+        return err_select(a, b, n, gm);
+    }
+
+    // stage 0: ordinary NMSE, plus a structural invariant that holds on each backend
+    // ALONE. mr[b, a, h] is a max over the R scorer rows of pooled softmax mass, so it
+    // is > 0 exactly when block b is causally reachable from attention query block a
+    // and ~0 otherwise (CPU gives exact zero, HTP ~e^-88 through the softmax exponent
+    // clamp). Where that boundary sits is what a wrong axis in either reduce moves --
+    // and unlike the NMSE it catches an error both backends make identically.
+    double err_merge(const float * a, const float * b, size_t n, const xattn_geom & gm) {
+        double e = nmse(a, b, n);
+        GGML_ASSERT(n == (size_t) (gm.NBk() * gm.NBq_a() * gm.Hkv));
+        for (int64_t h = 0; h < gm.Hkv; h++) {
+            for (int64_t iq = 0; iq < gm.NBq_a(); iq++) {
+                const int64_t navail = gm.n_avail(iq);
+                for (int64_t ib = 0; ib < gm.NBk(); ib++) {
+                    const size_t i = ((size_t) h*gm.NBq_a() + iq)*gm.NBk() + ib;
+                    const bool   reach = ib < navail;
+                    const float  vals[2] = { a[i], b[i] };
+                    for (float v : vals) {
+                        if (reach ? !(v > 1e-9f) : !(v < 1e-9f)) {
+                            e += 1.0;   // decisive against any max_nmse_err
+                        }
+                    }
+                }
+            }
+        }
+        return e;
+    }
+
+    // stage 1: an absolute deviation from the analytic band, not an NMSE -- neither
+    // side is a reference here. Loose because hexagon's softmax normalizes with an
+    // approximate reciprocal; a structural pooling bug is off by a whole factor of P
+    // or NBk, so 1e-2 still catches everything this stage exists for.
+    double err_mass(const float * a, const float * b, size_t n, const xattn_geom & gm) {
+        const double lo = (double) gm.P();
+        const double hi = (double) gm.P() * (double) gm.G();
+        double e = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            for (double v : { (double) a[i], (double) b[i] }) {
+                e = std::max(e, std::max(lo - v, v - hi));
+            }
+        }
+        return std::max(e, 0.0);
+    }
+
+    // stage 2: everything decidable about a ranking, and nothing that is not.
+    double err_select(const float * a, const float * b, size_t n, const xattn_geom & gm) {
+        const int64_t NBk  = gm.NBk();
+        const int64_t rows = gm.NBq_a() * gm.Hkv;
+        GGML_ASSERT(n == (size_t) (NBk * rows));
+
+        // The stashed tensor lives in backend1's context and the runner calls
+        // eval(b, b_cpu) (:12503), so this reads the DEVICE's scores. The CPU's own
+        // intermediates are not reachable from here, which is why only `a` gets the
+        // self-consistency check below.
+        std::vector<float> sc;
+        if (!plant) {
+            sc.resize(ggml_nelements(scores));
+            ggml_backend_tensor_get(scores, sc.data(), 0, sc.size()*sizeof(float));
+        }
+
+        double diff = 0.0;
+        std::vector<int32_t> ia(NBk), ib(NBk);
+        for (int64_t r = 0; r < rows; r++) {
+            for (int64_t c = 0; c < NBk; c++) {
+                ia[c] = (int32_t) a[r*NBk + c];
+                ib[c] = (int32_t) b[r*NBk + c];
+                // an I32 tensor that does not read back integer-valued means the
+                // comparison picked up the wrong bytes, not a ranking disagreement
+                diff += std::fabs(a[r*NBk + c] - ia[c]);
+                diff += std::fabs(b[r*NBk + c] - ib[c]);
+            }
+            // Every row must be a permutation of [0, NBk). Near-vacuous for an argsort
+            // (a permutation is distinct by construction) but it is exactly what breaks
+            // if a future selector pads a short list -- and the FA kernel clamps
+            // out-of-range indices without ever deduplicating
+            // (htp/flash-attn-ops.c:250-255), so a duplicate is invisible everywhere
+            // except the answer.
+            diff += perm_penalty(ia, NBk);
+            diff += perm_penalty(ib, NBk);
+
+            if (plant) {
+                // The winning set is known, so check BOTH backends against the truth
+                // rather than against each other.
+                const int32_t * want = &ref.set[(size_t) r*u];
+                diff += set_miss(ia.data(), want, u);
+                diff += set_miss(ib.data(), want, u);
+            } else {
+                // Decidable without a plant and immune to ties: the device's own prefix
+                // must be a true top-u of the device's own scores.
+                const float * s = &sc[r*NBk];
+                float lo_sel = FLT_MAX, hi_rest = -FLT_MAX;
+                for (int64_t c = 0; c < NBk; c++) {
+                    const int32_t idx = ia[c];
+                    if (idx < 0 || idx >= NBk) { continue; }   // already penalised above
+                    if (c < u) { lo_sel  = std::min(lo_sel,  s[idx]); }
+                    else       { hi_rest = std::max(hi_rest, s[idx]); }
+                }
+                if (u < NBk && lo_sel < hi_rest) { diff += 1.0; }
+            }
+        }
+        return diff;
+    }
+
+    static double perm_penalty(const std::vector<int32_t> & row, int64_t NBk) {
+        std::vector<int32_t> s = row;
+        std::sort(s.begin(), s.end());
+        double bad = 0.0;
+        for (int64_t i = 0; i < NBk; i++) {
+            if (s[i] != (int32_t) i) { bad += 1.0; }
+        }
+        return bad;
+    }
+
+    // how many of `want` are missing from the first u entries of `got`
+    static double set_miss(const int32_t * got, const int32_t * want, int64_t u) {
+        std::set<int32_t> have(got, got + u);
+        double miss = 0.0;
+        for (int64_t i = 0; i < u; i++) {
+            if (!have.count(want[i])) { miss += 1.0; }
+        }
+        return miss;
+    }
+};
+
+// The whole thing: real XAttention scores -> computed selection -> block-sparse FA,
+// with src[5] a NODE rather than a leaf. Two modes, because no single one is both
+// end-to-end and free of tie reasoning.
+//
+//  plant = false, u = NBk, maskless -- the tie-immune control.
+//      Sparse attention over ALL blocks is dense attention, so a plain dense CPU
+//      reference agrees for ANY permutation the argsort emits: every tie-break
+//      decision is a no-op. This is the only arm that is simultaneously end-to-end,
+//      non-vacuous and free of tie reasoning, and it is the one that runs the
+//      DEPLOYABLE graph shape -- the FA leg reading the same q and k leaves the scorer
+//      does. It catches src[5] as a computed node (buffer placement, split, ordering,
+//      fusion); a duplicate or out-of-range index escaping the sort (the kernel clamps
+//      to n_blk_total-1 and never deduplicates -- htp/flash-attn-ops.c:250-255 -- so a
+//      duplicate silently shifts that block's logits by +ln 2); a block-index-vs-KV-row
+//      units error; and sel->ne[2] == Hkv with nr > 1, a shape the 46/46 sparse suite
+//      has NEVER run (n_sel_heads() returns nh only when nr == 1, :7376-7378).
+//      It says nothing about WHICH blocks get picked.
+//
+//  plant = true -- the deployable density, ranked by the real scorer.
+//      q and k are rigged so the winning set is analytically known with a >= 1.2x
+//      margin, and the -INF mask is built from that set with the same construction
+//      test_flash_attn_ext_sparse uses. This must not degenerate into "add +M to a
+//      chosen set via the bias leaf": that construction passes even for an
+//      implementation that discards the real scores entirely.
+//
+//      DEVIATION from the contract, and the reason. In this mode the FA leg reads its
+//      OWN k/v, not the scorer's k. Sharing them makes the arm nearly vacuous: with
+//      shared k the FA logit for (query block, key block) is exactly the scorer's
+//      programmed logit, so a block's attention weight is monotone in its selection
+//      score with the same 1e4 dynamic range. The only way a selection error can show
+//      up is a missing block -- and the block most likely to be missing is the one at
+//      the cut, which carries ~1e-5 of the attention mass. A whole missing block would
+//      hide five orders of magnitude under the 5e-4 NMSE gate. Flattening the FA
+//      logits by cancelling the ramp in the mask was the alternative; it makes the
+//      arm's verdict depend on how exactly the HMX q.k reproduces a value it then
+//      subtracts, which is a flaky red waiting to happen. With an independent random
+//      k/v each selected block carries ~1/u of the mass -- sampled at u=16, Bl=64 the
+//      per-block share runs 3.8%..9.6% -- so a missing block is a >= 3.8% output error
+//      instead of a 1e-5 one. q IS still shared, and the plant-free mode above runs the
+//      fully shared graph. check_selection() below makes the verdict decisive either
+//      way, by checking the selection the kernel was handed rather than only its effect.
+//
+//      Runs at G = 1. With sel->ne[2] = Hkv and G > 1 there is no expressible mask:
+//      ggml's FA picks mask head (query_head % mask->ne[2]), which equals the KV head
+//      only when nr == 1 (:7370-7375). A harness limitation, not a kernel one -- and
+//      it is exactly why the plant-free mode exists.
+struct test_xattn_e2e : public test_case {
+    const int64_t d, Hq, Hkv, Lq, Lk, S, Bl, R, u;
+    const bool    plant;
+
+    xattn_plant_ref ref;
+    ggml_tensor *   ranked = nullptr;   // stashed for err(); see check_selection()
+
+    xattn_geom g() const { return xattn_geom{ d, Hq, Hkv, Lq, Lk, S, Bl, R, u }; }
+
+    std::string op_desc(ggml_tensor *) override { return "XATTN_E2E"; }
+
+    std::string vars() override {
+        return VARS_TO_STR10(d, Hq, Hkv, Lq, Lk, S, Bl, R, u, plant);
+    }
+
+    bool run_whole_graph()  override { return true; }
+    bool perf_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    // The NMSE on the attention output is the arm's verdict, but on its own it reports
+    // a selection error as an unexplained numeric drift. So check the selection the
+    // kernel was actually handed, directly, and make any violation decisive.
+    //
+    // This reads BACKEND1's tensor -- the runner calls eval(b, b_cpu) (:12503) -- which
+    // is exactly the one that matters: the CPU never looks at src[5] at all.
+    double err(const float * a, const float * b, size_t n) override {
+        return nmse(a, b, n) + check_selection();
+    }
+
+    double check_selection() {
+        const xattn_geom gm   = g();
+        const int64_t    NBk  = gm.NBk();
+        const int64_t    rows = gm.NBq_a() * gm.Hkv;
+        std::vector<int32_t> r((size_t) ggml_nelements(ranked));
+        ggml_backend_tensor_get(ranked, r.data(), 0, r.size()*sizeof(int32_t));
+
+        double bad = 0.0;
+        for (int64_t i = 0; i < rows; i++) {
+            const int32_t * row = &r[i*NBk];
+            // A duplicate or out-of-range index is invisible everywhere except the
+            // answer: the kernel clamps out-of-range to n_blk_total-1 and never
+            // deduplicates (htp/flash-attn-ops.c:250-255), so a repeated block just
+            // shifts its own logits by +ln 2. An argsort prefix is distinct by
+            // construction -- which is the point: this is what breaks if it ever is not.
+            std::vector<int32_t> sorted(row, row + NBk);
+            std::sort(sorted.begin(), sorted.end());
+            for (int64_t c = 0; c < NBk; c++) {
+                if (sorted[c] != (int32_t) c) { bad += 1.0; }
+            }
+            if (plant) {
+                std::set<int32_t> have(row, row + u);
+                const int32_t * want = &ref.set[(size_t) i*u];
+                for (int64_t c = 0; c < u; c++) {
+                    if (!have.count(want[c])) { bad += 1.0; }
+                }
+            }
+        }
+        return bad;
+    }
+
+    uint64_t op_flops(ggml_tensor *) override {
+        const uint64_t fa  = 2ull * Hq * Lq * (2 * d) * (uint64_t) (u * Bl);
+        const uint64_t scr = 2ull * Hq * (Lq/S) * (Lk/S) * (S * d);
+        return fa + scr;
+    }
+
+    test_xattn_e2e(int64_t d = 128, int64_t Hq = 4, int64_t Hkv = 2, int64_t Lq = 256,
+                   int64_t Lk = 512, int64_t S = 8, int64_t Bl = 64, int64_t R = 2,
+                   int64_t u = 8, bool plant = false)
+        : d(d), Hq(Hq), Hkv(Hkv), Lq(Lq), Lk(Lk), S(S), Bl(Bl), R(R), u(u), plant(plant) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const xattn_geom gm = g();
+        if (plant) {
+            GGML_ASSERT(gm.G() == 1);           // see the mask-head note above
+            GGML_ASSERT(u < gm.NBk());          // otherwise there is nothing to select
+        }
+        xattn_sel_nodes n = xattn_build_selection(ctx, gm);
+        ranked = n.ranked;
+
+        // The FA leg's K/V. Shared with the scorer unless the plant needs them
+        // independent -- see the DEVIATION note above.
+        ggml_tensor * kfa = n.k;
+        if (plant) {
+            kfa = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, Lk, Hkv, 1);
+            ggml_set_name(kfa, "k_fa");
+        }
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, Lk, Hkv, 1);
+        ggml_set_name(v, "v");
+
+        // The mask carries the -INF pattern, so it IS the selection: CPU dense
+        // attention restricted by it equals the kernel's attention over the selected
+        // blocks exactly. Only expressible because the winning set is known ahead of
+        // initialize_tensors, which is the whole point of the plant.
+        ggml_tensor * m = nullptr;
+        if (plant) {
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, Lk, Lq, Hq, 1);
+            ggml_set_name(m, "m");
+        }
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, n.q, kfa, v, m, 1.0f/sqrtf((float) d), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        out->src[5]       = n.sel;
+        out->op_params[4] = (int32_t) Bl;         // bs
+        out->op_params[5] = (int32_t) gm.Bq();    // bq; 0 would mean "== bs"
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const xattn_geom          gm   = g();
+        const std::vector<float>  bias = xattn_build_bias(gm);
+        const std::vector<double> L    = plant ? xattn_plant_logits(gm) : std::vector<double>();
+
+        if (plant) {
+            ref = xattn_compute_plant(gm, bias);
+            GGML_ASSERT(ref.gap_abs > 1e-3);
+            GGML_ASSERT(ref.gap_rel > 0.15);
+            // Outside the causal shortfall: once u exceeds a query block's causally
+            // available count the -BIG term can no longer keep future blocks out, and
+            // the arm would be checking undefined tie-break behaviour.
+            GGML_ASSERT(u <= gm.n_avail(0));
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "xattn_idx") == 0) {
+                xattn_fill_idx(t, Lq, Hq, S);
+            } else if (strcmp(t->name, "xattn_cmask") == 0) {
+                xattn_fill_cmask(t, gm.Nk(), gm.Nq());
+            } else if (strcmp(t->name, "xattn_bias") == 0) {
+                ggml_backend_tensor_set(t, bias.data(), 0, bias.size()*sizeof(float));
+            } else if (plant && strcmp(t->name, "q") == 0) {
+                xattn_fill_plant_q(t, gm);
+            } else if (plant && strcmp(t->name, "k") == 0) {
+                xattn_fill_plant_k(t, gm, L);
+            } else if (plant && strcmp(t->name, "m") == 0) {
+                fill_mask(t, gm);
+            } else if (t->op == GGML_OP_NONE && t->view_src == nullptr) {
+                // leaves only -- see the note in test_xattn_select::initialize_tensors
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    // -INF outside the selected blocks, finite noise inside. keep[] is rebuilt
+    // whenever the ATTENTION query block changes: the -INF pattern is the selection,
+    // so a per-query-block selection is a per-query-ROW mask pattern.
+    void fill_mask(ggml_tensor * t, const xattn_geom & gm) {
+        const int64_t ne0 = t->ne[0], ne1 = t->ne[1], nh = t->ne[2];
+        GGML_ASSERT(ne0 == Lk && ne1 == Lq && nh == Hq);
+        std::vector<ggml_fp16_t> data((size_t) ne0*ne1*nh);
+
+        std::mt19937 gen(1234);
+        std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+
+        for (int64_t ih = 0; ih < nh; ih++) {
+            int64_t cur_qb = -1;
+            std::vector<bool> keep(ne0, false);
+            for (int64_t i1 = 0; i1 < ne1; i1++) {
+                const int64_t iqb = i1 / gm.Bq();
+                if (iqb != cur_qb) {
+                    cur_qb = iqb;
+                    keep.assign(ne0, false);
+                    // ih is the query head, and G == 1 here, so it is also the KV head
+                    const int32_t * sel = &ref.set[((size_t) ih*gm.NBq_a() + iqb)*u];
+                    for (int64_t i = 0; i < u; i++) {
+                        for (int64_t j = sel[i]*Bl; j < std::min((sel[i] + 1)*Bl, Lk); j++) {
+                            keep[j] = true;
+                        }
+                    }
+                }
+                for (int64_t i0 = 0; i0 < ne0; i0++) {
+                    const float val = keep[i0] ? dis(gen) : -INFINITY;
+                    data[(size_t) ih*ne1*ne0 + i1*ne0 + i0] = ggml_fp32_to_fp16(val);
+                }
+            }
+        }
+        ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
     }
 };
 
@@ -11373,6 +12315,73 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_xattn_score( 64, 2, 2, 128, 128, 1, 64, stage)); // Nk=128
     }
 
+    // Real XAttention scores -> a COMPUTED selection -> block-sparse flash attention.
+    // Four arms, because no single one is both end-to-end and decidable, and the claim
+    // is their conjunction. ggml-cpu's flash attention reads no src[5] (the only
+    // src[5] reads in ggml-cpu/ops.cpp are SSM/RWKV/delta-net), so a CPU reference
+    // computes DENSE attention -- which is exactly why the QSUB stage-0 arm above is
+    // perf-only at 0/3, and why each arm here has to say how it closes that gap.
+
+    // Arm 0 -- XATTN_MERGE: the merged score vs CPU by NMSE, no argsort anywhere, so
+    // zero tie exposure. This is where the reduce numerics and the axis order are
+    // pinned: reshape_4d(attn_sum, NBk, NBq_s, G, Hkv) assumes query heads are grouped
+    // G-FAST (the kernel takes head kv_head*G + j, htp/flash-attn-ops.c:2887), and if
+    // that were backwards the max would be over the wrong heads. G=4, Hkv=2 is the row
+    // that sees it. err() also checks, on each backend alone, that mr is > 0 exactly on
+    // the causally reachable blocks -- the one class of error both backends can make
+    // identically.
+    for (int64_t G : { 1, 2, 4 }) {
+        for (int64_t R : { 1, 2, 8 }) {
+            // Lq=512, Bl=64 -> NBq_s=8, so R=8 collapses to one attention query block.
+            // Nk = Lk/S = 64 keeps hexagon's softmax on its vectorized path.
+            test_cases.emplace_back(new test_xattn_select(128, 2*G, 2, 512, 512, 8, 64, R, 4, /*stage=*/0));
+        }
+    }
+    // chunked prefill (Lk > Lq), where the causal offset moves the reachable boundary
+    test_cases.emplace_back(new test_xattn_select(128, 4, 2, 512, 2048, 8, 64, /*R=*/4, 8, /*stage=*/0));
+    // sum_rows(mh) == P exactly, which only holds at G == 1: mh is a max over G rows
+    // that each sum to P, so above that the invariant degrades to the band [P, G*P].
+    test_cases.emplace_back(new test_xattn_select(128, 2, 2, 512, 512, 8, 64, /*R=*/1, 4, /*stage=*/1));
+    test_cases.emplace_back(new test_xattn_select(128, 2, 2, 512, 512, 8, 64, /*R=*/4, 4, /*stage=*/1));
+
+    // Arm 1 -- XATTN_SELECT: scores -> argsort -> top-u, as a SET.
+    //
+    // Registered at NBk = 32 AND NBk = 16. Those are two entirely different device
+    // implementations selected only by ne0: an HVX bitonic network for
+    // ne0 in {32,64,128,256,512,1024} and a scalar Hoare quicksort otherwise
+    // (htp/argsort-ops.c:487-508). One shape leaves the other completely untested.
+    //
+    // Both a planted and an unplanted row of each. The planted row checks BOTH backends
+    // against an analytically known set; the unplanted one checks the only thing that
+    // is decidable without a plant -- that the device's own prefix is a true top-u of
+    // the device's own scores -- and it is the row that would catch a sort which
+    // happens to be correct on the plant's monotone ramp and wrong on general data.
+    for (bool plant : { false, true }) {
+        // NBk = 32: HVX bitonic, GQA on, per-query-block selection
+        test_cases.emplace_back(new test_xattn_select(128, 4, 2, 512, 2048, 8, 64, /*R=*/4, 16, /*stage=*/2, plant));
+        // NBk = 16: the scalar quicksort fallback
+        test_cases.emplace_back(new test_xattn_select(128, 2, 2, 256, 1024, 8, 64, /*R=*/2, 8, /*stage=*/2, plant));
+    }
+
+    // Arms 2 and 3 -- XATTN_E2E.
+    //
+    // Arm 2 (plant = false, u = NBk, maskless): sparse attention over ALL blocks is
+    // dense attention, so a dense CPU reference agrees for any permutation the argsort
+    // emits. Tie-immune, end-to-end, and the only arm that runs the fully shared graph
+    // (the FA leg reading the scorer's own q and k). Both rows have G > 1 and
+    // sel->ne[2] == Hkv, which is a shape the 46/46 sparse suite has never run.
+    test_cases.emplace_back(new test_xattn_e2e(128, 4, 2, 256,  512, 8, 64, /*R=*/2, /*u=*/8));
+    test_cases.emplace_back(new test_xattn_e2e(128, 4, 2, 512, 2048, 8, 64, /*R=*/4, /*u=*/32));
+    // Arm 3 (plant = true): the deployable density, ranked by the real scorer, with the
+    // -INF mask built from the analytically known set. G == 1 -- see the struct comment.
+    test_cases.emplace_back(new test_xattn_e2e(128, 4, 4, 512, 2048, 8, 64, /*R=*/4, /*u=*/16, /*plant=*/true));
+    // The same geometry as an XATTN_SELECT row, so the set the E2E arm builds its -INF
+    // mask from is independently verified to be the set the graph actually computes.
+    // Without this pairing the E2E arm's reference and its subject share an unchecked
+    // assumption. (The second E2E plant row's geometry is already registered above.)
+    test_cases.emplace_back(new test_xattn_select(128, 4, 4, 512, 2048, 8, 64, /*R=*/4, 16, /*stage=*/2, /*plant=*/true));
+    test_cases.emplace_back(new test_xattn_e2e(128, 2, 2, 256, 1024, 8, 64, /*R=*/2, /*u=*/8,  /*plant=*/true));
+
     // The gather arms are benchmark scaffolding, but they are built from standard ops,
     // so the CPU reference can check they really compute attention over the selected
     // rows -- a wrong stride or index list would otherwise only show up as a silently
@@ -12115,6 +13124,135 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         const int nblk = kv / 64;
         const int u    = nblk / 2;            // ceil(1.93 * nblk/4) rounded to a power of 2
         test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, 512, 64, u, /*mask=*/false));
+    }
+
+    // THE NUMBER THAT HAS NEVER EXISTED: dense vs a real-scores-driven sparse
+    // attention at one shape. Every published figure in this work so far compares
+    // against a size-matched PROXY -- an evenly spaced selection leaf with n_sel =
+    // nblk/2 -- and is provisional until D/E is measured.
+    //
+    // Five rows per (kv, u), all in one scope so device thermal drift is shared:
+    //   D   dense FA at the same shape                          FLASH_ATTN_EXT
+    //   P   the size-matched proxy, shared selection leaf        FLASH_ATTN_EXT_SPARSE
+    //   P'  the proxy with the real sel SHAPE (query axis)       FLASH_ATTN_EXT_SPARSE
+    //   E   scorer + reduce + argsort + FA, computed selection   XATTN_E2E
+    //   S   E's graph truncated to the selection                 XATTN_SELECT
+    //
+    // D/E is the end-to-end answer. P vs (E - S) says whether the proxy was honest;
+    // report that as a SIGNED percentage, because a proxy that was optimistic and one
+    // that was pessimistic are different findings. Two mechanisms push opposite ways: a
+    // real selection is clustered (sink + recent), which should help KV block
+    // residency, while a query axis constrains Br | bq. P' vs (E - S) isolates the
+    // second from the first, since P' and E then differ only in WHERE sel comes from.
+    // S/E is the scoring share, to compare against the recorded ~44% -- and the XATTN
+    // fusion does NOT fire here (try_fuse_xattn_score requires sm->src[1] == nullptr,
+    // ggml-hexagon.cpp:3823, and real XAttention's softmax carries the reduced causal
+    // mask), so both sides of that ratio are unfused.
+    //
+    // kv_effective = sel->ne[0] * bs (ggml-hexagon.cpp:2094), so two u values are two
+    // different kernel configurations -- Br, Bc, thread count, pipelining and VTCM all
+    // move together. A u sweep is NOT a one-variable experiment, and a table without
+    // Br / Bc / n_kv_blocks / n_threads / pipeline / vtcm from HEX_VERBOSE (:2145-2151)
+    // is uninterpretable. u=17 is the sawtooth control: it is prime, so the only legal
+    // m is 1 and the kernel runs 17 KV chunks. Measured with a leaf sel it cost 2.48x
+    // u=18; confirming it with a COMPUTED sel proves the effect is in the kernel's
+    // chunking rather than in the harness.
+    for (int kv : { 2048, 4096 }) {
+        const int nblk = kv / 64;
+        // D
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, kv, 512, /*mask=*/false, false, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        for (int u : { 8, 16, 17, 24, 32 }) {
+            if (u > nblk) {
+                continue;   // u > NBk drops the WHOLE FA op to a dense CPU backend (:2271)
+            }
+            // P and E at the union configuration: R = 8 makes Bq = 512 = the whole
+            // ubatch, so sel->ne[1] == 1 and E has exactly P's selection shape.
+            test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, 512, 64, u, /*mask=*/false));
+            test_cases.emplace_back(new test_xattn_e2e(128, 16, 8, 512, kv, 8, 64, /*R=*/8, u));
+        }
+        // S, once per (kv, R): the selection leg sorts all NBk blocks and hands back a
+        // free view of the first u, so its cost does not depend on u at all. One row is
+        // enough -- and if the sweep's E rows do not move against a CONSTANT S, that is
+        // thermal drift rather than a u effect.
+        test_cases.emplace_back(new test_xattn_select(128, 16, 8, 512, kv, 8, 64, /*R=*/8, 16, /*stage=*/2));
+        // P' and E' with a query axis: R = 2 gives Bq = 128 and sel->ne[1] = 4, so the
+        // kernel must pick a sel row per query block and Br is pinned to divide 128.
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, 512, 64, 16, /*mask=*/false,
+                                                               /*per_head_sel=*/true, /*bq=*/128, /*per_qblock=*/true));
+        test_cases.emplace_back(new test_xattn_e2e   (128, 16, 8, 512, kv, 8, 64, /*R=*/2, 16));
+        test_cases.emplace_back(new test_xattn_select(128, 16, 8, 512, kv, 8, 64, /*R=*/2, 16, /*stage=*/2));
+
+        // The Nq lever. The score matmul's throughput is near-linear in Nq = Lq/S, measured
+        // 430 GF/s at Nq=32 rising to 1674 at Nq=256 -- so the two knobs that move Nq are the
+        // cheapest scoring win available, and neither is kernel work:
+        //   S:  8 -> 16 halves the scoring FLOPs but HALVES Nq too, so it is not obviously a win
+        //   Lq: the prefill chunk size, a pure runtime choice, and the only knob that raises Nq
+        // Both are swept end-to-end rather than on the scoring pass alone, because a larger Lq
+        // also changes the attention side (more rows per query tile, more KV re-staging).
+        for (int S : { 8, 16 }) {
+            test_cases.emplace_back(new test_xattn_e2e(128, 16, 8, 512, kv, S, 64, /*R=*/8, 16));
+        }
+        for (int lq : { 1024, 2048 }) {
+            if (lq > kv) continue;                 // Lk >= Lq
+            for (int S : { 8, 16 }) {
+                // R = Lq/Bl keeps Bq = Lq, i.e. one selection for the whole chunk, so only
+                // Lq changes and the selection shape stays comparable across the sweep.
+                test_cases.emplace_back(new test_xattn_e2e(128, 16, 8, lq, kv, S, 64, /*R=*/lq/64, 16));
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // THE CONTEXT-LENGTH CURVE, kv = 512 -> 4096, at the configuration that currently
+    // wins. Three rows per (kv, Lq), registered adjacently so thermal drift is shared:
+    //   D  dense FA at the same shape                          FLASH_ATTN_EXT
+    //   E  scorer + reduce + argsort + FA, computed selection   XATTN_E2E
+    //   S  E's graph truncated to the selection                 XATTN_SELECT
+    // E - S is the attention leg alone, so D/(E-S) prices the kernel, D/E is the
+    // deliverable number, and S/E is what scoring still costs. The three rows decompose
+    // the whole pass with nothing left over.
+    //
+    // Density is held FIXED at 50% (u = NBk/2) across the sweep, so both legs' FLOPs
+    // scale with kv identically and D/E measures efficiency rather than a density
+    // schedule -- any curvature in the curve is then a real kernel effect. u is a power
+    // of two at every kv here (4/8/16/32), which also keeps n_kv_blocks off the
+    // sawtooth (flash-attn-ops.h:444) so no point is a chunking artifact.
+    //
+    // Two chunk arms, because Lq is a free runtime lever and the size of its effect is
+    // the finding: Lq = 512 is the regime every earlier figure was measured in, and
+    // Lq = min(kv, 2048) is the large-chunk regime with R = Lq/Bl, i.e. Bq = Lq and one
+    // selection for the whole chunk. They coincide at kv = 512, registered once there.
+    for (int kv : { 512, 1024, 2048, 4096 }) {
+        const int u      = kv / 64 / 2;
+        const int lq_big = kv < 2048 ? kv : 2048;
+        const int lqs[2] = { 512, lq_big };
+        const int n_lq   = lq_big == 512 ? 1 : 2;
+        for (int i = 0; i < n_lq; i++) {
+            const int lq = lqs[i];
+            test_cases.emplace_back(new test_flash_attn_ext   (128, 128, 8, {2, 1}, kv, lq, /*mask=*/false, false, 0, 0,
+                                                               GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            // Same shape, timed whole-graph. D_wg - D is the per-call cost AT THIS
+            // SCALE, which is what says whether E may be compared to D at all.
+            test_cases.emplace_back(new test_flash_attn_ext_wg(128, 128, 8, {2, 1}, kv, lq, /*mask=*/false, false, 0, 0,
+                                                               GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_xattn_e2e   (128, 16, 8, lq, kv, 16, 64, /*R=*/lq/64, u));
+            test_cases.emplace_back(new test_xattn_select(128, 16, 8, lq, kv, 16, 64, /*R=*/lq/64, u, /*stage=*/2));
+            // Decompose S itself, since it is ~half the pass and "scoring" is five
+            // different things. Nested-difference ladder, innermost first:
+            //   XATTN_REVERSE     the antidiagonal permutation alone   (replicated)
+            //   XATTN_SCORE_MM    the reduced matmul alone             (replicated)
+            //   XATTN_SCORE       reversal + mm + softmax + attn_sum   (whole-graph)
+            //   XATTN_MERGE       + Hq->Hkv max and the R-block max    (whole-graph)
+            //   XATTN_SELECT      + argsort                            (whole-graph)
+            // so softmax+reduce = SCORE - C - REVERSE - MM, merge = MERGE - SCORE, and
+            // argsort = SELECT - MERGE. The last two differences cancel C; the first
+            // does not, which is the whole reason C had to be measured rather than fit.
+            test_cases.emplace_back(new test_xattn_score (128, 16, 8, lq, kv, 16, 64, /*stage=*/2));
+            test_cases.emplace_back(new test_xattn_score (128, 16, 8, lq, kv, 16, 64, /*stage=*/1));
+            test_cases.emplace_back(new test_xattn_score (128, 16, 8, lq, kv, 16, 64, /*stage=*/0));
+            test_cases.emplace_back(new test_xattn_select(128, 16, 8, lq, kv, 16, 64, /*R=*/lq/64, u, /*stage=*/0));
+        }
     }
 
     // Attribute the per-query-block penalty. The MAC count is identical across every

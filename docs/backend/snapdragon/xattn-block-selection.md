@@ -388,6 +388,46 @@ terms differ 2.3x**: 132 µs for an OpenCL queue flush against 307 µs for a
 FastRPC/dspqueue round trip. Any NPU-vs-GPU table built from raw `n_runs=1` numbers
 silently hands the GPU a 175 µs head start.
 
+### CORRECTION: the 1.605 slope does not exist at scale
+
+The fit above was made over replicated times of **80-450 µs**. Extrapolated to the
+multi-millisecond graphs the end-to-end arms actually run, it is badly wrong, and
+because it is a *slope* the error grows with the number it is applied to.
+
+Measured directly with `test_flash_attn_ext_wg` -- the same dense FA graph timed
+whole-graph, paired against the ordinary replicated row at the identical shape. The
+replicated row runs `n` copies of the op in one `ggml_backend_graph_compute`
+(`n = 100 GFLOP / op_flops + 1`, test-backend-ops.cpp:1590), so under an additive
+model `whole - replicated = C(1 - 1/n)` and `C` is recoverable at every shape:
+
+| kv | Lq | n | replicated | whole-graph | diff | **C** | 1.605-fit predicts |
+|--:|--:|--:|--:|--:|--:|--:|--:|
+| 512 | 512 | 47 | 933 | 1544 | 611 | **624** | 1805 |
+| 1024 | 512 | 24 | 1247 | 1843 | 596 | **621** | 2309 |
+| 1024 | 1024 | 12 | 2507 | 3013 | 506 | **552** | 4331 |
+| 2048 | 512 | 12 | 2083 | 2626 | 542 | **592** | 3651 |
+| 2048 | 2048 | 3 | 8788 | 9253 | 465 | **698** | 14412 |
+| 4096 | 512 | 6 | 4297 | 4841 | 544 | **653** | 7204 |
+| 4096 | 2048 | 2 | 16289 | 16587 | 298 | **597** | 26451 |
+
+**C = 620 µs, range 552-698, flat across a 17x range of work.** The per-call cost is
+purely additive; there is no multiplicative term. At the largest shape the fit predicts
+26.5 ms where 16.6 ms is measured -- it invents 10 ms of "overhead" that is not there.
+
+Why the original fit found a slope: it regressed `whole` on `replicated` across shapes
+whose `n` differed, and `whole - replicated = C(1 - 1/n)` moves with `n`. Over that
+narrow window the `n`-dependence masqueraded as proportionality. The additive model
+fits the old six points about as well (`C` = 380-593) and the new seven far better.
+
+**Use `X_wg - 620` to de-overhead a whole-graph number. Never divide by 1.605.** In a
+real forward pass the whole model is one `graph_compute`, so the 620 µs is paid once
+per token batch, not once per attention -- which is exactly why subtracting it (rather
+than charging it to the op) is the right basis for comparing against a replicated row.
+
+Everything computed as a *difference between two whole-graph rows* is unaffected; `C`
+cancels there. What is affected is every absolute figure that was divided by 1.605 --
+see the corrected tables in `xattn-scoring.md`.
+
 ### De-overheaded scoring comparison (stage 2, eager/unfused on both)
 
 Each column inverted through its own backend's fit:
