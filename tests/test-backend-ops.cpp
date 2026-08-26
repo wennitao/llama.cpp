@@ -9148,6 +9148,213 @@ struct test_xattn_e2e : public test_case {
 // Against test_flash_attn_ext_sparse at the same (kv, bs, n_sel) this varies exactly
 // one thing: whether materializing the selected blocks costs more than indexing them
 // in place from inside the kernel.
+// QUOKA: Query-oriented KV selection for efficient LLM prefill (Jones et al., Qualcomm
+// AI Research, ICLR 2026, arXiv:2602.08722). Algorithm 1 verbatim:
+//
+//   Require: Q, K, V, prefill chunk B_CP, selective attention budget B_SA, max queries N_Q
+//    1: if B_CP > N_Q then                                    > Query sub-selection
+//    2:     M_Q <- mean(Q, dim=2)
+//    3:     S_Q <- CosSim(Q, M_Q)
+//    4:     Q   <- gather(topk(-S_Q, N_Q), Q)
+//    5: end if
+//    6: Q <- Q/norm(Q, dim=-1)                                 > (b, n_q,  N_Q, d)
+//    7: K <- K/norm(K, dim=-1)                                 > (b, n_KV, T,   d)
+//    8: Qbar <- mean(Q.reshape(b, n_KV, n_q/n_KV, N_Q, d), 2)  > (b, n_KV, N_Q, d)
+//    9: S    <- Qbar K^T                                       > (b, n_KV, N_Q, T)
+//   10: Shat <- max(S, dim=2)                                  > (b, n_KV, T)
+//   11: I    <- topk(Shat, B_SA)
+//   12: K*, V* <- gather(K, I), gather(V, I)
+//
+// THE THING TO KNOW BEFORE READING ANY NUMBER FROM THIS ARM: **QUOKA is not block
+// sparse.** Shat carries one score per TOKEN, topk picks individual keys, and step 12
+// materialises a compacted cache that a DENSE kernel then consumes. The paper says so --
+// "fully compatible with standard dense kernels" -- and contrasts itself with kernel-level
+// block sparsity explicitly. So it has no KV block size to sweep; its knobs are B_CP
+// (128 primary, ablated 128/256/512), B_SA (512/1024/2048) and N_Q (16).
+//
+// Two consequences specific to this backend, both of which the existing measurements
+// already price:
+//   - Its selection is CHUNK-WIDE (step 10 maxes over the query axis, leaving one row per
+//     KV head), which is the bq = B_CP shape this kernel is FASTEST at. QUOKA pays no
+//     per-query-block tax at all.
+//   - But B_CP = 128 is a very short chunk, and dense FA here has a Q-proportional floor
+//     of ~740 us at nb=512. A 128-token chunk pays that floor 16x more often per 2048
+//     tokens than a 2048-token chunk does. That interaction, not the scorer, is what
+//     decides QUOKA on this device -- see the FLASH_ATTN_EXT rows at nb=128.
+//
+// This arm stops at the ranked list, exactly as XATTN_SELECT does, so the two scorers are
+// compared on equal terms and the gather + dense-attention leg is priced separately from
+// the existing GATHER and FLASH_ATTN_EXT rows.
+struct test_quoka_score : public test_case {
+    const int64_t d, Hq, Hkv, Lq, Lk, NQ, BSA;
+    const int     stage;   // 0 = through Shat, 1 = through the top-k, 2 = K normalisation alone
+    const bool    subsel;  // run steps 1-5; false isolates the scoring cost
+    // Step 7 normalises the WHOLE cached K. Charging that to every chunk is an artifact of
+    // building it inside the per-chunk graph: K is written once and read by every later
+    // chunk, so in a runtime it is a cache-write cost amortised across chunks -- the same
+    // argument that moves XAttention's antidiagonal permutation onto the K side. Default
+    // false, i.e. K arrives pre-normalised in f16 and feeds mul_mat directly exactly as the
+    // XAttention scorer's K does. stage 2 prices the normalisation on its own.
+    const bool    knorm;
+
+    int64_t G()   const { return Hq / Hkv; }
+    // Queries actually scored. Step 1 only fires when B_CP > N_Q; below that the chunk is
+    // already smaller than the budget and every query is kept.
+    int64_t NQe() const { return Lq < NQ ? Lq : NQ; }
+
+    std::string op_desc(ggml_tensor *) override {
+        return stage == 2 ? "QUOKA_KNORM" : stage == 0 ? "QUOKA_SCORE" : "QUOKA_SELECT";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR10(d, Hq, Hkv, Lq, Lk, NQ, BSA, stage, subsel, knorm);
+    }
+
+    bool run_whole_graph()  override { return true; }
+    bool perf_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    // Step 9 is the only matmul: Qbar [d, NQ, Hkv] x K [d, T, Hkv] -> [T, NQ, Hkv].
+    // Note what is NOT here: no Lq term at all once the sub-selection has run, and Hkv
+    // rather than Hq because step 8 pre-aggregates over the GQA group. That is the whole
+    // reason QUOKA's scorer is cheap, and it is why its cost does not grow with the chunk.
+    uint64_t op_flops(ggml_tensor *) override {
+        return 2ull * Hkv * NQe() * Lk * d;
+    }
+
+    test_quoka_score(int64_t d = 128, int64_t Hq = 16, int64_t Hkv = 8, int64_t Lq = 128,
+                     int64_t Lk = 4096, int64_t NQ = 16, int64_t BSA = 1024,
+                     int stage = 0, bool subsel = true, bool knorm = false)
+        : d(d), Hq(Hq), Hkv(Hkv), Lq(Lq), Lk(Lk), NQ(NQ), BSA(BSA), stage(stage),
+          subsel(subsel), knorm(knorm) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_ASSERT(Hq % Hkv == 0);
+        GGML_ASSERT(xattn_is_pow2(G()));       // the group mean below bisects
+        GGML_ASSERT(NQ <= Lq);
+        GGML_ASSERT(BSA <= Lk);
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, Lq, Hq,  1);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, Lk, Hkv, 1);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * qs = q;
+        if (!subsel && Lq > NQ) {
+            // The control for steps 1-5: same downstream shape, no selection. Taking the
+            // first NQ rows of each head is a strided view (the head stride is Lq*d), so it
+            // needs one cont -- tiny, and it keeps both arms' matmul identical, which is
+            // the only way the difference prices the sub-selection rather than the scoring.
+            qs = ggml_cont(ctx, ggml_view_3d(ctx, q, d, NQ, Hq, q->nb[1], q->nb[2], 0));
+            ggml_set_name(qs, "quoka_q_first");
+        } else if (subsel && Lq > NQ) {
+            // Steps 2-4. S_Q = CosSim(Q, M_Q) is a per-query scalar, and the rank is by
+            // -S_Q, so the LOWEST-cosine-similarity queries are kept: the paper's whole
+            // observation is that those attend broadly and carry the attention mass.
+            //
+            // CosSim(q_i, M_Q) shares the denominator |M_Q| across i and |q_i| is what
+            // l2_norm already removes, so ranking by <q_i/|q_i|, M_Q> is the same order.
+            // One l2_norm plus one mul_mat, not a divide per element.
+            ggml_tensor * qn0 = ggml_l2_norm(ctx, q, 1e-6f);                  // [d, Lq, Hq]
+            // M_Q = mean over the QUERY axis, which is ne1. ggml only reduces ne0, and
+            // reaching it needs a transposing cont -- which this backend rejects at
+            // execution for this shape. Halving adds instead: both halves are contiguous
+            // blocks at the natural nb1, so every step is a plain elementwise add.
+            GGML_ASSERT(xattn_is_pow2(Lq));
+            ggml_tensor * acc = q;
+            for (int64_t n = Lq; n > 1; n /= 2) {
+                ggml_tensor * lo = ggml_view_3d(ctx, acc, d, n/2, Hq, acc->nb[1], acc->nb[2], 0);
+                ggml_tensor * hi = ggml_view_3d(ctx, acc, d, n/2, Hq, acc->nb[1], acc->nb[2],
+                                                (size_t) (n/2) * acc->nb[1]);
+                acc = ggml_cont(ctx, ggml_add(ctx, lo, hi));
+            }
+            ggml_tensor * mqv = ggml_scale(ctx, acc, 1.0f/(float) Lq);        // [d, 1, Hq]
+            // <q_i/|q_i|, M_Q> as a broadcast multiply plus a row sum, NOT a mul_mat.
+            // mul_mat here would be f32 x f32, which this backend's host gate accepts but
+            // the DSP rejects at execution (HTP_STATUS_NO_SUPPORT, one per graph, silently
+            // costing a fallback) -- every other matmul in these graphs is f16 x f32.
+            // The reduced axis is d = 128 floats, a 512-byte row, so sum_rows is in its
+            // good regime rather than the 4-element regime that hurts XAttention.
+            ggml_tensor * sqm = ggml_mul(ctx, qn0, mqv);                      // [d, Lq, Hq]
+            ggml_tensor * sqr = ggml_sum_rows(ctx, sqm);                      // [1, Lq, Hq]
+            // 2-D on purpose. argsort_top_k returns a strided VIEW of the sorted prefix,
+            // and get_rows wants idx->ne[1] == q->ne[2]; keeping the scores [Lq, Hq] makes
+            // that view already the right rank, so no reshape is needed. The 3-D form
+            // needed a cont to reshape, and CONT has no i32 path in cpy-ops.c -- it fails
+            // at execution with HTP_STATUS_NO_SUPPORT and drops one op per graph to a
+            // fallback, which is invisible except as a slower number.
+            ggml_tensor * sq  = ggml_reshape_2d(ctx, sqr, Lq, Hq);            // free: ne0 == 1
+            ggml_set_name(sq, "quoka_s_q");
+            // topk(-S_Q) == the LAST NQ of an ascending argsort; ggml_argsort_top_k is
+            // descending, so negate and take the prefix.
+            ggml_tensor * neg = ggml_scale(ctx, sq, -1.0f);
+            // argsort_top_k hands back a VIEW of the sorted prefix, so it is not
+            // contiguous and cannot be reshaped in place; get_rows needs idx->ne[1] to
+            // equal q->ne[2], hence the cont + reshape rather than a view.
+            ggml_tensor * idx = ggml_argsort_top_k(ctx, neg, NQ);             // [NQ, Hq] view
+            qs = ggml_get_rows(ctx, q, idx);                                  // [d, NQ, Hq]
+            ggml_set_name(qs, "quoka_q_sub");
+        }
+
+        // Steps 6-7. K's normalisation costs a f16->f32 CPY plus an L2_NORM over the whole
+        // cache -- at Lk=4096 that is 16 MB written, read and written again, ~48 MB per
+        // chunk, which measured larger than everything else in the graph combined. See the
+        // knorm note above for why that does not belong in a per-chunk cost.
+        ggml_tensor * qn = ggml_l2_norm(ctx, qs, 1e-6f);                      // [d, NQe, Hq]
+        ggml_tensor * kn = k;                                                 // f16, as-is
+        if (knorm) {
+            kn = ggml_l2_norm(ctx, ggml_cast(ctx, k, GGML_TYPE_F32), 1e-6f);
+        }
+        ggml_set_name(kn, "quoka_k_norm");
+        if (stage == 2) {
+            return kn;
+        }
+
+        // Step 8: mean over the GQA group. The query-head index is the FAST half of Hq
+        // (the FA kernel takes head kv_head*G + j, htp/flash-attn-ops.c:2887), so the
+        // split is a free reshape and the mean is a bisection over ne2.
+        ggml_tensor * qbar = qn;
+        if (G() > 1) {
+            ggml_tensor * q4 = ggml_reshape_4d(ctx, qn, d, NQe(), G(), Hkv);
+            for (int64_t g = G(); g > 1; g /= 2) {
+                ggml_tensor * lo = ggml_view_4d(ctx, q4, q4->ne[0], q4->ne[1], g/2, q4->ne[3],
+                                                q4->nb[1], q4->nb[2], q4->nb[3], 0);
+                ggml_tensor * hi = ggml_view_4d(ctx, q4, q4->ne[0], q4->ne[1], g/2, q4->ne[3],
+                                                q4->nb[1], q4->nb[2], q4->nb[3], (size_t) (g/2) * q4->nb[2]);
+                q4 = ggml_cont(ctx, ggml_add(ctx, lo, hi));
+            }
+            qbar = ggml_scale(ctx, ggml_reshape_3d(ctx, q4, d, NQe(), Hkv), 1.0f/(float) G());
+        }
+        ggml_set_name(qbar, "quoka_qbar");
+
+        // Step 9. No causal mask: QUOKA scores the whole cached K for the chunk, and
+        // chunked prefill makes every cached key causally reachable by construction.
+        ggml_tensor * S = ggml_mul_mat(ctx, kn, qbar);                        // [Lk, NQe, Hkv]
+        ggml_mul_mat_set_prec(S, GGML_PREC_F32);
+        ggml_set_name(S, "quoka_scores");
+
+        // Step 10: max over the NQ axis. Bring NQ to ne3 and reuse the bisection tree.
+        ggml_tensor * shat;
+        if (NQe() > 1) {
+            GGML_ASSERT(xattn_is_pow2(NQe()));
+            ggml_tensor * sp = ggml_permute(ctx, S, 0, 3, 2, 1);              // [Lk, 1, Hkv, NQe]
+            shat = xattn_reduce_max_ne3(ctx, ggml_cont(ctx, sp));             // [Lk, 1, Hkv, 1]
+        } else {
+            shat = ggml_reshape_4d(ctx, S, Lk, 1, Hkv, 1);
+        }
+        ggml_set_name(shat, "quoka_shat");
+        if (stage == 0) {
+            return shat;
+        }
+
+        // Step 11. Step 12's gather is deliberately NOT built here -- see the header note.
+        ggml_tensor * ranked = ggml_argsort_top_k(ctx, shat, BSA);            // [BSA, 1, Hkv, 1]
+        ggml_set_name(ranked, "quoka_ranked");
+        return ranked;
+    }
+};
+
 struct test_flash_attn_ext_gather : public test_case {
     const int64_t hs;      // head size (DK == DV)
     const int64_t nh;      // number of KV heads
@@ -12390,6 +12597,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_xattn_select(128, 2, 2, 256, 1024, 8, 64, /*R=*/2, 8, /*stage=*/2, plant));
     }
 
+    // QUOKA (arXiv:2602.08722) Algorithm 1. subsel=false for the checked arms: step 4's
+    // topk over per-query cosine similarity is tie-unstable across backends exactly as the
+    // block argsort is, so a HTP-vs-CPU NMSE on the full chain would be reporting tie
+    // order, not arithmetic. The scoring core -- l2_norm, GQA pre-aggregation, the matmul
+    // and the max tree -- is deterministic and is what these check.
+    test_cases.emplace_back(new test_quoka_score(128, 4, 2, 128,  512, 16,  128, /*stage=*/0, /*subsel=*/false));
+    test_cases.emplace_back(new test_quoka_score(128, 8, 2, 256, 1024, 32,  256, /*stage=*/0, /*subsel=*/false));
+    test_cases.emplace_back(new test_quoka_score(128, 4, 4, 128,  512, 16,  128, /*stage=*/0, /*subsel=*/false));
+
     // Arms 2 and 3 -- XATTN_E2E.
     //
     // Arm 2 (plant = false, u = NBk, maskless): sparse attention over ALL blocks is
@@ -13420,6 +13636,49 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_xattn_score(128, 16, 8, lq, kv, 16, 64, /*stage=*/5));
             test_cases.emplace_back(new test_xattn_score(128, 16, 8, lq, kv, 16, 64, /*stage=*/5,
                                                          /*rev_k=*/0, /*no_sm=*/true));
+        }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // QUOKA (arXiv:2602.08722) on this NPU, against the XAttention scorer already measured.
+    //
+    // Its own configuration first: B_CP = 128, N_Q = 16, B_SA in {512, 1024, 2048}. Then
+    // the same scorer at the chunk sizes that suit THIS kernel, because QUOKA's score cost
+    // is independent of the chunk (N_Q is fixed) while XAttention's is linear in it -- so
+    // the two methods' relative cost is itself a function of B_CP and that has to be swept
+    // rather than assumed.
+    //
+    // The N_Q sweep is the accuracy/latency knob the paper ablates (N_q = B_CP/16); it is
+    // the only axis that moves QUOKA's matmul at all.
+    for (int kv : { 1024, 2048, 4096 }) {
+        for (int bcp : { 128, 512, 2048 }) {
+            if (bcp > kv) {
+                continue;
+            }
+            const int bsa = kv < 1024 ? kv : 1024;
+            test_cases.emplace_back(new test_quoka_score(128, 16, 8, bcp, kv, 16, bsa, /*stage=*/0));
+            test_cases.emplace_back(new test_quoka_score(128, 16, 8, bcp, kv, 16, bsa, /*stage=*/1));
+        }
+        for (int nq : { 32, 128 }) {
+            test_cases.emplace_back(new test_quoka_score(128, 16, 8, 512, kv, nq, 1024, /*stage=*/1));
+        }
+        // subsel off, at the paper's chunk: prices steps 1-5 by difference.
+        test_cases.emplace_back(new test_quoka_score(128, 16, 8, 128, kv, 16, 1024, /*stage=*/1, /*subsel=*/false));
+        // K normalisation on its own, and the same scorer paying for it inline, so the
+        // amortisation argument is priced rather than asserted.
+        test_cases.emplace_back(new test_quoka_score(128, 16, 8, 128, kv, 16, 1024, /*stage=*/2, /*subsel=*/true,  /*knorm=*/true));
+        test_cases.emplace_back(new test_quoka_score(128, 16, 8, 128, kv, 16, 1024, /*stage=*/1, /*subsel=*/true,  /*knorm=*/true));
+    }
+
+    // The interaction that actually decides QUOKA here. Its B_CP=128 chunk pays the dense
+    // kernel's Q-proportional floor 16x more often per 2048 tokens than a 2048-token chunk
+    // does, and that floor was measured at ~740 us for nb=512. These rows put a number on
+    // nb=128 and nb=256 so the chunk choice can be priced instead of assumed. B_SA is the
+    // gathered cache length, so the QUOKA attention leg IS dense FA at kv = B_SA.
+    for (int nb : { 128, 256 }) {
+        for (int kv : { 512, 1024, 2048 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, kv, nb, /*mask=*/false, false, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         }
     }
 
