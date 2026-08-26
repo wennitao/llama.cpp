@@ -530,13 +530,51 @@ BQ 32→256 is 2.82× in rank-4 and 2.77× in rank-3. For the pair that matches 
 **BQ=64 vs BQ=256 is 1.93× in rank-3** (1.99× in rank-4) against the **1.84–2.09×** measured
 here at `bq=64` versus a chunk-wide selection — two independent stacks, within a few percent.
 
-The mechanisms attributed do **not** yet agree. mllm calls it "pure HMX utilisation" and a
-"small-M HMX floor", but its TF/s figures are wall-derived at fixed FLOPs, so they restate
-the wall-time ratio rather than measure occupancy. The trace here measures occupancy
-directly and finds `HMX_COMP` busy flat at 1.1× while every phase's interval count
-multiplies by 8 (`flash-attn-htp-anatomy.md`). Both stacks see the same magnitude and label
-it differently; that is unresolved, and it matters, because the two labels imply different
-fixes.
+### RESOLVED: mllm's own control refutes its attribution
+
+This was recorded as an open disagreement — mllm calls the BQ effect "pure HMX utilisation"
+and a "small-M HMX floor"; the trace here finds `HMX_COMP` busy flat at 1.1× while every
+phase's interval count multiplies by 8. mllm's own rank-4/rank-3 experiment settles it, and
+it settles it against mllm.
+
+Read the two layouts from their benchmark source rather than the prose
+(`tests/qnn/BlockSparseAttentionCausalTest.cpp:576-672`):
+
+| | rank-4 | rank-3 "big batch" |
+|:--|:--|:--|
+| Q | `[Hq, num_qb, BQ, D]` | `[big_batch, BQ, D]`, `big_batch = Hq·num_qb` (:600, :667) |
+| K_arr | `[Hq, num_qb, top_k·BK, D]` | `[big_batch, top_k·BK, D]` (:606) |
+| QK | `[Hq, num_qb, BQ, top_k·BK]` | `[big_batch, BQ, top_k·BK]` (:668) |
+
+The matmul's **M is `BQ` in both**. K, N, the tile shapes, the FLOPs and the *number of batch
+entries* are all identical, and the source comment at :605 states the layouts are **"Bytes
+identical"** — it is the same buffer with one fewer dimension. Validated `miss=0` against the
+same host reference.
+
+**And it is 2.7× faster.** A change that provably alters neither M, nor the tile shapes, nor
+the arithmetic, nor the entry count moves the metric by 2.7× at every BQ. So TF/s here is not
+measuring how efficiently HMX multiplies — mllm says so itself for this experiment ("the 2.7×
+is pure scheduling"), while using the same metric two paragraphs later to conclude the BQ
+effect is "pure HMX utilisation, not arithmetic".
+
+The inconsistency is in the metric, not the measurement. `TF/s = FLOPs / wall`, and every
+cell holds FLOPs fixed, so TF/s **is** inverted wall time. It establishes that the spread is
+not arithmetic *volume*; it cannot locate where the time went. Every other mllm experiment
+has the same confound: their "decomposition tax" (M=256/64-batch vs M=1024/16-batch, 1.92× at
+equal FLOPs) varies M and entry count together, exactly like the BQ sweep does.
+
+So the honest statement is: **mllm's data cannot discriminate the two mechanisms, and its one
+control that holds M and entry count fixed shows a 2.7× swing from scheduling alone.** The
+trace here can discriminate, because it separates busy cycles from wall: `HMX_COMP` busy
+rises 1.1× — the unit is not doing more work, it is being fed less often — while fully-idle
+time goes 7.6% → 33.9% across 113 → 1090 gaps of unchanged mean size.
+
+Worth noting the two labels may be closer than they read. "Small-M HMX floor" is ambiguous
+between *"HMX multiplies inefficiently at small M"* (a specific claim, unsupported by their
+data and refuted by our 1.1×) and *"HMX idles because a small-M job does not cover the
+per-job overhead"* (our finding, in different words). Practically both point the same way —
+make BQ bigger. The distinction only matters for whether barrier-elimination work inside the
+kernel is worth doing, which is priced separately at a ~1.2× ceiling.
 
 Two further findings from the same mllm document are worth carrying:
 
