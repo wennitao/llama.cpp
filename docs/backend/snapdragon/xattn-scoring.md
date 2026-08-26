@@ -419,6 +419,29 @@ hand, so placement is proven by construction rather than by scheduler debug outp
 NMSE of both the split and the pipeline against the all-HTP result is **0.0**, so the algebra and
 the CPU/DSP coherency are both correct. This is purely a performance result.
 
+> **CORRECTION (measured after the fact).** The magnitudes below are inflated roughly 2.2x by
+> an uncontrolled variable: CPU thread placement. This SoC has 6 cores at 2.78 GHz and 2 prime
+> cores at 4.09 GHz, all on the `walt` governor and observed idling at 1.0-2.4 GHz. The CPU
+> backend's 8 threads spread across the little cores; pinning the process to the two prime cores
+> -- with 2 threads instead of 8 -- more than halves the reversal:
+>
+> | | cpu reversal | split (A) | all-HTP | |
+> |:--|--:|--:|--:|--:|
+> | default, 8 threads | 797 us | 1538 | 1013 | 0.66x |
+> | `taskset c0`, 2 prime cores | **366 us** | 1030 | 1003 | **0.97x** |
+>
+> Stable to +-1% over three runs each. So the split is **break-even, not a 1.5x loss**, and the
+> "rpcmem is intrinsically slow for the CPU" reading is mostly wrong: with threads on prime
+> cores the R1 ratio (cpu-over-rpcmem vs cpu-over-malloc) falls from 1.89 to **1.05**.
+>
+> What survives the correction is narrower but still real: a **post-DSP degradation**. Even
+> pinned, the reversal costs 101 us on a buffer the DSP has never touched and 366 us on one it
+> has -- 3.6x, persistent across iterations with no DSP activity in between. That effect is
+> genuine; its previously reported size was not.
+>
+> The wider lesson is the measurement one. Every CPU number in this document taken without
+> pinning is a measurement of the Linux scheduler as much as of the code.
+
 ### Why: the CPU cannot cheaply compute over rpcmem
 
 The zero-copy premise was that hexagon buffers are host memory -- `rpcmem_alloc2` with
