@@ -9355,6 +9355,169 @@ struct test_quoka_score : public test_case {
     }
 };
 
+// QUOKA scoring driving a BLOCK selection, feeding this backend's block-sparse FA.
+//
+// The hybrid the two measurements point at. QUOKA's scorer is cheap (GQA pre-aggregation
+// collapses n_q to n_KV, and a fixed N_Q stops the matmul growing with the chunk) but its
+// token-granularity top-k measured 12.2 ms at Lk=4096 -- 80% of its pass -- against 0-81 us
+// for XAttention's argsort over 64 blocks. Pooling Shat over KV blocks before the top-k
+// makes step 11 free AND removes step 12's gather entirely, because a block list is what
+// src[5] already consumes as a DMA source offset.
+//
+// Reduction ORDER is the whole trick. QUOKA maxes over queries first, leaving [Lk, Hkv];
+// pooling over the block axis first instead is free -- the token index is ne0, so
+// [Lk, NQ, Hkv] -> [Bl, NBk, NQ, Hkv] is a reshape -- and it shrinks the query-axis max
+// tree by Bl. At Lk=4096, NQ=16, Hkv=8 that tree drops from 524288 elements to 8192.
+// It also lands the block pool on 64-element rows, 16x longer than the P = Bl/S = 4 rows
+// that make XAttention's sum_rows run at 1.0 GB/s.
+struct test_quoka_block : public test_case {
+    const int64_t d, Hq, Hkv, Lq, Lk, NQ, Bl, u;
+    const int     stage;    // 0 = block scores, 1 = selection, 2 = end-to-end with FA
+    const bool    blk_max;  // block pool: true = max (QUOKA's outlier-preserving choice), false = sum
+    // Steps 1-5. Their topk over per-query cosine similarity is tie-unstable across
+    // backends, and a different query SET changes every downstream value, so a HTP-vs-CPU
+    // NMSE with it on reports tie order rather than arithmetic. false takes the first NQ
+    // queries instead, which is what makes the new block-pooling logic checkable.
+    const bool    subsel;
+
+    int64_t G()   const { return Hq / Hkv; }
+    int64_t NQe() const { return Lq < NQ ? Lq : NQ; }
+    int64_t NBk() const { return Lk / Bl; }
+
+    std::string op_desc(ggml_tensor *) override {
+        return stage == 0 ? "QUOKA_BLK_SCORE" : stage == 1 ? "QUOKA_BLK_SELECT" : "QUOKA_BLK_E2E";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR11(d, Hq, Hkv, Lq, Lk, NQ, Bl, u, stage, blk_max, subsel);
+    }
+
+    bool run_whole_graph()  override { return true; }
+    bool perf_whole_graph() override { return true; }
+    double max_nmse_err()   override { return 5e-4; }
+
+    uint64_t op_flops(ggml_tensor *) override {
+        const uint64_t score = 2ull * Hkv * NQe() * Lk * d;
+        const uint64_t fa    = stage == 2 ? 2ull * Hq * Lq * (2 * d) * (uint64_t) (u * Bl) : 0;
+        return score + fa;
+    }
+
+    test_quoka_block(int64_t d = 128, int64_t Hq = 16, int64_t Hkv = 8, int64_t Lq = 512,
+                     int64_t Lk = 4096, int64_t NQ = 16, int64_t Bl = 64, int64_t u = 16,
+                     int stage = 0, bool blk_max = true, bool subsel = true)
+        : d(d), Hq(Hq), Hkv(Hkv), Lq(Lq), Lk(Lk), NQ(NQ), Bl(Bl), u(u), stage(stage),
+          blk_max(blk_max), subsel(subsel) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_ASSERT(Hq % Hkv == 0 && xattn_is_pow2(G()));
+        GGML_ASSERT(Lk % Bl == 0 && Bl >= 64 && Bl % 64 == 0);
+        GGML_ASSERT(u >= 1 && u <= NBk());
+        GGML_ASSERT(xattn_is_pow2(Lq) && xattn_is_pow2(NQe()) && xattn_is_pow2(Bl));
+        GGML_ASSERT(Lk >= Lq);
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, Lq, Hq,  1);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, Lk, Hkv, 1);
+        ggml_set_name(k, "k");
+
+        // --- QUOKA steps 1-9, exactly as test_quoka_score builds them. K arrives
+        //     pre-normalised (a cache-write cost); see that struct's knorm note.
+        ggml_tensor * qs = q;
+        if (!subsel && Lq > NQ) {
+            qs = ggml_cont(ctx, ggml_view_3d(ctx, q, d, NQ, Hq, q->nb[1], q->nb[2], 0));
+        } else if (Lq > NQ) {
+            ggml_tensor * qn0 = ggml_l2_norm(ctx, q, 1e-6f);
+            ggml_tensor * acc = q;
+            for (int64_t n = Lq; n > 1; n /= 2) {
+                ggml_tensor * lo = ggml_view_3d(ctx, acc, d, n/2, Hq, acc->nb[1], acc->nb[2], 0);
+                ggml_tensor * hi = ggml_view_3d(ctx, acc, d, n/2, Hq, acc->nb[1], acc->nb[2],
+                                                (size_t) (n/2) * acc->nb[1]);
+                acc = ggml_cont(ctx, ggml_add(ctx, lo, hi));
+            }
+            ggml_tensor * mqv = ggml_scale(ctx, acc, 1.0f/(float) Lq);
+            ggml_tensor * sqm = ggml_mul(ctx, qn0, mqv);
+            ggml_tensor * sqr = ggml_sum_rows(ctx, sqm);
+            ggml_tensor * sq  = ggml_reshape_2d(ctx, sqr, Lq, Hq);
+            ggml_tensor * neg = ggml_scale(ctx, sq, -1.0f);
+            ggml_tensor * idx = ggml_argsort_top_k(ctx, neg, NQ);
+            qs = ggml_get_rows(ctx, q, idx);
+        }
+        ggml_tensor * qn = ggml_l2_norm(ctx, qs, 1e-6f);
+        ggml_tensor * qbar = qn;
+        if (G() > 1) {
+            ggml_tensor * q4 = ggml_reshape_4d(ctx, qn, d, NQe(), G(), Hkv);
+            for (int64_t g = G(); g > 1; g /= 2) {
+                ggml_tensor * lo = ggml_view_4d(ctx, q4, q4->ne[0], q4->ne[1], g/2, q4->ne[3],
+                                                q4->nb[1], q4->nb[2], q4->nb[3], 0);
+                ggml_tensor * hi = ggml_view_4d(ctx, q4, q4->ne[0], q4->ne[1], g/2, q4->ne[3],
+                                                q4->nb[1], q4->nb[2], q4->nb[3], (size_t) (g/2) * q4->nb[2]);
+                q4 = ggml_cont(ctx, ggml_add(ctx, lo, hi));
+            }
+            qbar = ggml_scale(ctx, ggml_reshape_3d(ctx, q4, d, NQe(), Hkv), 1.0f/(float) G());
+        }
+        ggml_tensor * S = ggml_mul_mat(ctx, k, qbar);                     // [Lk, NQe, Hkv]
+        ggml_mul_mat_set_prec(S, GGML_PREC_F32);
+        ggml_set_name(S, "quoka_scores");
+
+        // --- THE CHANGE: pool the KV-block axis FIRST. Free reshape, then either one
+        //     sum_rows over a 64-element row or a max bisection over ne0.
+        ggml_tensor * pooled = ggml_reshape_4d(ctx, S, Bl, NBk(), NQe(), Hkv);
+        if (blk_max) {
+            for (int64_t n = Bl; n > 1; n /= 2) {
+                ggml_tensor * lo = ggml_view_4d(ctx, pooled, n/2, pooled->ne[1], pooled->ne[2], pooled->ne[3],
+                                                pooled->nb[1], pooled->nb[2], pooled->nb[3], 0);
+                ggml_tensor * hi = ggml_view_4d(ctx, pooled, n/2, pooled->ne[1], pooled->ne[2], pooled->ne[3],
+                                                pooled->nb[1], pooled->nb[2], pooled->nb[3],
+                                                (size_t) (n/2) * pooled->nb[0]);
+                pooled = ggml_cont(ctx, xattn_max2(ctx, lo, hi));
+            }
+        } else {
+            pooled = ggml_sum_rows(ctx, pooled);                          // [1, NBk, NQe, Hkv]
+        }
+        ggml_tensor * bs3 = ggml_reshape_3d(ctx, pooled, NBk(), NQe(), Hkv);
+        ggml_set_name(bs3, "quoka_block_scores");
+
+        // --- QUOKA step 10, now on a Bl-times smaller tensor.
+        ggml_tensor * mr;
+        if (NQe() > 1) {
+            ggml_tensor * sp = ggml_permute(ctx, bs3, 0, 3, 2, 1);        // [NBk, 1, Hkv, NQe]
+            mr = xattn_reduce_max_ne3(ctx, ggml_cont(ctx, sp));           // [NBk, 1, Hkv, 1]
+        } else {
+            mr = ggml_reshape_4d(ctx, bs3, NBk(), 1, Hkv, 1);
+        }
+        ggml_set_name(mr, "quoka_mr");
+        if (stage == 0) {
+            return mr;
+        }
+
+        // --- Selection, byte-identical in shape to the XAttention path's stage C so the
+        //     same src[5] contract applies: sink/diagonal bias, full argsort, strided view.
+        ggml_tensor * bias = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, NBk(), 1, 1, 1);
+        ggml_set_name(bias, "xattn_bias");
+        ggml_tensor * scores = ggml_add(ctx, mr, bias);
+        ggml_tensor * ranked = ggml_argsort(ctx, scores, GGML_SORT_ORDER_DESC);
+        ggml_set_name(ranked, "quoka_ranked");
+        ggml_tensor * sel = ggml_view_4d(ctx, ranked, u, 1, Hkv, 1,
+                                         ranked->nb[1], ranked->nb[2], ranked->nb[3], 0);
+        ggml_set_name(sel, "quoka_sel");
+        if (stage == 1) {
+            return ranked;
+        }
+
+        // --- Block-sparse attention. No gather: sel is a block-index list consumed as a
+        //     DMA source offset, which is the whole reason to pool into blocks.
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, Lk, Hkv, 1);
+        ggml_set_name(v, "v");
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f/sqrtf((float) d), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        out->src[5]       = sel;
+        out->op_params[4] = (int32_t) Bl;
+        out->op_params[5] = 0;             // chunk-wide selection: Br is unconstrained
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_flash_attn_ext_gather : public test_case {
     const int64_t hs;      // head size (DK == DV)
     const int64_t nh;      // number of KV heads
@@ -12597,6 +12760,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_xattn_select(128, 2, 2, 256, 1024, 8, 64, /*R=*/2, 8, /*stage=*/2, plant));
     }
 
+    // The QUOKA-scored BLOCK selection. Stage 0 only: stage 1 adds an argsort whose ties
+    // are backend-dependent, and stage 2's src[5] is invisible to the CPU reference.
+    test_cases.emplace_back(new test_quoka_block(128, 4, 2, 128,  512, 16, 64, 4, /*stage=*/0, /*blk_max=*/true,  /*subsel=*/false));
+    test_cases.emplace_back(new test_quoka_block(128, 4, 2, 128,  512, 16, 64, 4, /*stage=*/0, /*blk_max=*/false, /*subsel=*/false));
+    test_cases.emplace_back(new test_quoka_block(128, 8, 2, 256, 1024, 32, 64, 8, /*stage=*/0, /*blk_max=*/true,  /*subsel=*/false));
+
     // QUOKA (arXiv:2602.08722) Algorithm 1. subsel=false for the checked arms: step 4's
     // topk over per-query cosine similarity is tie-unstable across backends exactly as the
     // block argsort is, so a HTP-vs-CPU NMSE on the full chain would be reporting tie
@@ -13668,6 +13837,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         // amortisation argument is priced rather than asserted.
         test_cases.emplace_back(new test_quoka_score(128, 16, 8, 128, kv, 16, 1024, /*stage=*/2, /*subsel=*/true,  /*knorm=*/true));
         test_cases.emplace_back(new test_quoka_score(128, 16, 8, 128, kv, 16, 1024, /*stage=*/1, /*subsel=*/true,  /*knorm=*/true));
+    }
+
+    // The hybrid: QUOKA scoring, block selection, block-sparse FA. Swept against the same
+    // chunk sizes as everything else, at 25% density (u = NBk/4), both block-pool modes.
+    // stage 1 vs 0 prices the now-block-level top-k that cost QUOKA 12.2 ms at token level;
+    // stage 2 vs 1 is the attention leg, which should match the shared-selection rows in
+    // xattn-scoring.md since sel has exactly that shape.
+    for (int kv : { 2048, 4096 }) {
+        const int u = kv / 64 / 4;
+        // B_CP is capped at 512 here for two reasons: it is the top of the paper's own
+        // ablation (128/256/512), and QUOKA's steps 1-5 are linear in B_CP, so the score
+        // alone measured 15227 us at B_CP=2048 against 3982 at 512 -- large chunks are
+        // simply the wrong regime for this scorer, the opposite of XAttention's. A third
+        // reason is mechanical: the halving-add tree for M_Q adds ~4 nodes per doubling and
+        // test-backend-ops sizes its context for 128 tensors (:1568), which Lq=2048
+        // overflows into a segfault.
+        for (int bcp : { 128, 512 }) {
+            for (int st = 0; st <= 2; st++) {
+                test_cases.emplace_back(new test_quoka_block(128, 16, 8, bcp, kv, 16, 64, u, st, /*blk_max=*/true));
+                test_cases.emplace_back(new test_quoka_block(128, 16, 8, bcp, kv, 16, 64, u, st, /*blk_max=*/false));
+            }
+        }
     }
 
     // The interaction that actually decides QUOKA here. Its B_CP=128 chunk pays the dense

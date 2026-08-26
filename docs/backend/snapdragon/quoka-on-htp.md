@@ -123,3 +123,56 @@ as a slower number, since `perf` reports no error:
 Also worth recording: `GGML_HEXAGON_OPBATCH=0` does not disable batching, it sets the batch
 size to zero and nothing executes (`n-ops 0`, no `execute-op` lines, no results). It is not a
 usable A/B control.
+
+## The hybrid: QUOKA scoring, block selection, block-sparse FA
+
+Implemented as `test_quoka_block` (`QUOKA_BLK_SCORE` / `_SELECT` / `_E2E`). QUOKA's steps 1–9
+unchanged, then `Ŝ` is pooled over KV blocks *before* the query-axis max, top-k over `NBk`,
+and the block list goes to `flash_attn_ext` as `src[5]` — no gather. 3/3 against CPU on the
+deterministic core, zero fallbacks.
+
+**Reduction order is the trick.** The token index is `ne0`, so `[Lk, N_Q, Hkv] → [Bl, NBk,
+N_Q, Hkv]` is a free reshape; pooling that axis first costs one `sum_rows` over **64-element
+rows** (16× longer than the `P = Bl/S = 4` rows that make XAttention's reduce run at 1.0
+GB/s) and shrinks the query-axis max tree by `Bl` — from 524288 elements to 8192 at Lk=4096.
+
+| Lk | B_CP | u | pool | score | **top-k** | attn | e2e | dense | D/e2e |
+|--:|--:|--:|:--|--:|--:|--:|--:|--:|--:|
+| 2048 | 128 | 8 | max | 2873 | −22 | 476 | 3326 | 751 | 0.23× |
+| 2048 | 128 | 8 | **sum** | 1618 | −70 | 542 | 2089 | 751 | 0.36× |
+| 2048 | 512 | 8 | **sum** | 2773 | 24 | 1162 | 3959 | 2076 | 0.52× |
+| 4096 | 128 | 16 | **sum** | 1967 | 16 | 610 | 2593 | 751 | 0.29× |
+| 4096 | 512 | 16 | max | 5309 | 63 | 1368 | 6740 | 4295 | 0.64× |
+| 4096 | 512 | 16 | **sum** | 3115 | 42 | 1386 | 4543 | 4295 | **0.95×** |
+
+Three results:
+
+1. **The top-k vanished.** −70 to +63 µs — below noise at every point — against QUOKA's
+   **12262 µs** token-level top-k at Lk=4096. Pooling into blocks before ranking is worth
+   ~12 ms per chunk, and it removes step 12's gather as a bonus, since `src[5]` is consumed
+   as a DMA source offset.
+2. **Sum-pool beats max-pool 1.6–1.7×** (1967 vs 4103 at Lk=4096/B_CP=128). One `sum_rows`
+   over 64-element rows against a 6-step max bisection. QUOKA's argument for `max` is about
+   the *query* axis, where it is preserved; on the block axis `sum` is both cheaper and the
+   choice XAttention already makes.
+3. **The attention leg is correct and cheap** — 1386 µs at Lk=4096/B_CP=512/u=16 against
+   1352 µs for the equivalent shared-selection `FLASH_ATTN_EXT_SPARSE` row in
+   `xattn-scoring.md`, 2.5% apart. The selection shape is chunk-wide, so no per-query-block
+   tax.
+
+**But it still does not beat dense**, best 0.95×, because the scorer is now the whole pass
+(69% at the best point). And the reason is the one this project keeps rediscovering: the
+16× FLOP advantage does not translate, because the pass is bound by the `[Lk, ·, Hkv]` score
+tensor and its reductions, not by arithmetic. Per query token the two scorers are
+**identical**: QUOKA-block 3115/512 = 6.1 µs/token against XAttention 3150/512 = 6.2.
+
+### Where the remaining lever is
+
+QUOKA's steps 1–5 are linear in `B_CP` — measured 15227 µs of score at B_CP=2048 against
+3982 at 512 — and that is exactly what stops the chunk being enlarged. Everything *else* in
+the scorer is independent of `B_CP` (a fixed `N_Q` matmul plus a `Lk`-sized reduction). So
+the configuration worth measuring next is **the QUOKA scorer without query sub-selection at a
+large chunk**: a fixed ~2 ms scorer amortised over 2048 query tokens, plus the ~5 ms
+attention leg, against 16302 µs of dense. That is the only arrangement in which QUOKA's
+cheap-matmul property actually pays here, and it trades away the paper's accuracy argument,
+so it is a quality question before it is a latency one.
