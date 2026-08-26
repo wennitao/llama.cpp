@@ -8009,6 +8009,8 @@ struct test_xattn_score : public test_case {
     const int     rev_k;
     const int     stage; // 0 attn_sum, 1 reduced matmul, 2 the reversal,
                          // 3 row-mass invariant, 4 stage 1 timed whole-graph
+    // See xattn_geom::no_sm. Ranks by summed raw logits instead of attention mass.
+    const bool    no_sm;
 
     int64_t Nq()  const { return Lq / S;  }
     int64_t Nk()  const { return Lk / S;  }
@@ -8020,7 +8022,8 @@ struct test_xattn_score : public test_case {
         return stage == 1 ? "XATTN_SCORE_MM" :
                stage == 2 ? "XATTN_REVERSE" :
                stage == 3 ? "XATTN_ROWSUM" :
-               stage == 4 ? "XATTN_SCORE_MM_WG" : "XATTN_SCORE";
+               stage == 4 ? "XATTN_SCORE_MM_WG" :
+               stage == 5 ? "XATTN_SCORE_HALF" : "XATTN_SCORE";
     }
 
     bool run_whole_graph() override { return true; }
@@ -8033,6 +8036,7 @@ struct test_xattn_score : public test_case {
     std::string vars() override {
         // append only when the K-side variant is selected, so the existing rows keep
         // their names and their recorded baselines stay comparable
+        if (no_sm)  return VARS_TO_STR9(d, Hq, Hkv, Lq, Lk, S, Bl, stage, no_sm);
         if (!rev_k) return VARS_TO_STR8(d, Hq, Hkv, Lq, Lk, S, Bl, stage);
         return VARS_TO_STR9(d, Hq, Hkv, Lq, Lk, S, Bl, stage, rev_k);
     }
@@ -8072,8 +8076,9 @@ struct test_xattn_score : public test_case {
 
     test_xattn_score(int64_t d = 128, int64_t Hq = 16, int64_t Hkv = 8, int64_t Lq = 1024,
                      int64_t Lk = 1024, int64_t S = 8, int64_t Bl = 64, int stage = 0,
-                     int rev_k = 0)
-        : d(d), Hq(Hq), Hkv(Hkv), Lq(Lq), Lk(Lk), S(S), Bl(Bl), rev_k(rev_k), stage(stage) {}
+                     int rev_k = 0, bool no_sm = false)
+        : d(d), Hq(Hq), Hkv(Hkv), Lq(Lq), Lk(Lk), S(S), Bl(Bl), rev_k(rev_k), stage(stage),
+          no_sm(no_sm) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // The reference asserts NONE of these and S | Bl in particular fails SILENTLY
@@ -8152,13 +8157,22 @@ struct test_xattn_score : public test_case {
         // Scale + mask + softmax in ONE node: soft_max_ext computes
         // softmax(a*scale + mask*slope) with slope == 1 at max_bias == 0, which is
         // exactly the reference's matmul -> /(sqrt(d)*S) -> +causal_mask -> softmax.
-        ggml_tensor * sm = ggml_soft_max_ext(ctx, mm, cmask,
-                                             1.0f/(sqrtf((float) d) * (float) S), 0.0f);
+        ggml_tensor * sm = no_sm ? ggml_add(ctx, mm, cmask)
+                                 : ggml_soft_max_ext(ctx, mm, cmask,
+                                                     1.0f/(sqrtf((float) d) * (float) S), 0.0f);
 
         // Pool the KEY sub-block axis. Free reshape: the key sub-index is the fast
         // part of rk, so it already lands on ne0.
         ggml_tensor * t6 = ggml_reshape_4d(ctx, sm, P(), NBk(), Nq(), Hq);
         ggml_tensor * t7 = ggml_sum_rows(ctx, t6);              // [1, NBk, Nq, Hq]
+
+        // Stage 5 stops here, so the "softmax + sum_rows" term splits in two:
+        //   t(5) - t(4)  =  [softmax] + the KEY-axis reduction, both free reshapes
+        //   t(0) - t(5)  =  the QUERY-axis reduction: permute + cont + sum_rows
+        // The second is the only real COPY in the whole chain -- ne0 has to become the
+        // query sub-block index and no reshape can do that -- so this is the difference
+        // that says whether the epilogue is arithmetic or data movement.
+        if (stage == 5) { return t7; }
 
         // Pool the QUERY sub-block axis. It is the fast part of rq, so it has to be
         // brought to ne0 first -- one permute + one cont, the only copy in the chain.
@@ -8239,6 +8253,14 @@ struct test_xattn_score : public test_case {
 // Geometry of one selection pipeline. Every field is a graph-build-time constant.
 struct xattn_geom {
     int64_t d, Hq, Hkv, Lq, Lk, S, Bl, R, u;
+    // Drop the softmax and rank blocks by the SUM OF RAW LOGITS instead. Purely a cost
+    // question here -- it is a different estimator, not an optimisation of the same one
+    // (softmax is what turns a logit into attention MASS, which is what XAttention's
+    // block score means), so every no_sm arm is a latency measurement only.
+    // The causal mask stays, additively: -1e30 on an unreachable cell survives a sum of
+    // P*P = 16 of them as -1.6e31, finite in f32 and far below any real block, so masked
+    // blocks still sink to the bottom of the ranking without a softmax to zero them.
+    bool    no_sm = false;
 
     int64_t G()     const { return Hq / Hkv; }   // GQA factor
     int64_t Nq()    const { return Lq / S;   }   // reduced query rows
@@ -8349,8 +8371,12 @@ static xattn_sel_nodes xattn_build_selection(ggml_context * ctx, const xattn_geo
     ggml_tensor * cmask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, gm.Nk(), gm.Nq());
     ggml_set_name(cmask, "xattn_cmask");
 
-    ggml_tensor * sm = ggml_soft_max_ext(ctx, mm, cmask,
-                                         1.0f/(sqrtf((float) gm.d) * (float) gm.S), 0.0f);
+    // The scale is dropped with the softmax on purpose: it is a single positive factor,
+    // so it cannot reorder a top-k, and charging the no_sm arm for a node the criterion
+    // does not need would understate the saving.
+    ggml_tensor * sm = gm.no_sm ? ggml_add(ctx, mm, cmask)
+                                : ggml_soft_max_ext(ctx, mm, cmask,
+                                                    1.0f/(sqrtf((float) gm.d) * (float) gm.S), 0.0f);
 
     ggml_tensor * t6  = ggml_reshape_4d(ctx, sm, gm.P(), gm.NBk(), gm.Nq(), gm.Hq);
     ggml_tensor * t7  = ggml_sum_rows(ctx, t6);                               // [1, NBk, Nq, Hq]
@@ -8641,6 +8667,7 @@ static xattn_plant_ref xattn_compute_plant(const xattn_geom & gm, const std::vec
 // claim is the conjunction, and no arm is the claim.
 struct test_xattn_select : public test_case {
     const int64_t d, Hq, Hkv, Lq, Lk, S, Bl, R, u;
+    const bool    no_sm;
     const int     stage;
     // stage 2 only: rig q and k so the winning SET is analytically known (see
     // xattn_compute_plant). Without it the arm can still check that the device's own
@@ -8652,14 +8679,14 @@ struct test_xattn_select : public test_case {
     ggml_tensor *        scores = nullptr;   // stashed for the unplanted self-check
     xattn_plant_ref      ref;
 
-    xattn_geom g() const { return xattn_geom{ d, Hq, Hkv, Lq, Lk, S, Bl, R, u }; }
+    xattn_geom g() const { return xattn_geom{ d, Hq, Hkv, Lq, Lk, S, Bl, R, u, no_sm }; }
 
     std::string op_desc(ggml_tensor *) override {
         return stage == 0 ? "XATTN_MERGE" : stage == 1 ? "XATTN_MERGE_MASS" : "XATTN_SELECT";
     }
 
     std::string vars() override {
-        return VARS_TO_STR11(d, Hq, Hkv, Lq, Lk, S, Bl, R, u, stage, plant);
+        return VARS_TO_STR12(d, Hq, Hkv, Lq, Lk, S, Bl, R, u, no_sm, stage, plant);
     }
 
     // A custom err() is called on sentinels and on every intermediate node unless the
@@ -8679,8 +8706,8 @@ struct test_xattn_select : public test_case {
 
     test_xattn_select(int64_t d = 128, int64_t Hq = 4, int64_t Hkv = 2, int64_t Lq = 512,
                       int64_t Lk = 512, int64_t S = 8, int64_t Bl = 64, int64_t R = 1,
-                      int64_t u = 4, int stage = 0, bool plant = false)
-        : d(d), Hq(Hq), Hkv(Hkv), Lq(Lq), Lk(Lk), S(S), Bl(Bl), R(R), u(u),
+                      int64_t u = 4, int stage = 0, bool plant = false, bool no_sm = false)
+        : d(d), Hq(Hq), Hkv(Hkv), Lq(Lq), Lk(Lk), S(S), Bl(Bl), R(R), u(u), no_sm(no_sm),
           stage(stage), plant(plant) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -13356,6 +13383,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
             test_cases.emplace_back(new test_xattn_e2e   (128, 16, 8, lq, kv, 16, 64, /*R=*/lq/64, u));
             test_cases.emplace_back(new test_xattn_select(128, 16, 8, lq, kv, 16, 64, /*R=*/lq/64, u, /*stage=*/2));
+        }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // WHAT DOES THE SOFTMAX COST? The scoring decomposition lumps "softmax + sum_rows"
+    // into one 4674 µs term at kv=4096/Lq=2048 -- 3.2x the score matmul and the largest
+    // single item in the whole pass -- but the two reductions stay whether or not the
+    // softmax does, so that number is an upper bound on what dropping it could save.
+    //
+    // Two pairs per shape, so the saving is priced at both levels:
+    //   XATTN_SCORE  stage 0   the scorer alone, reversal + mm + [softmax] + attn_sum
+    //   XATTN_SELECT stage 2   the whole selection leg, + head/block merge + argsort
+    // Both are whole-graph and both members of a pair carry the same C, so each
+    // difference is exact without de-overheading either side.
+    //
+    // NOT an optimisation of the same estimator -- see xattn_geom::no_sm. Ranking by
+    // summed raw logits is a different criterion from ranking by attention mass, and
+    // only the latency question is being answered here.
+    for (int kv : { 1024, 2048, 4096 }) {
+        const int lqs[2] = { 512, kv < 2048 ? kv : 2048 };
+        const int n_lq   = lqs[1] == 512 ? 1 : 2;
+        for (int i = 0; i < n_lq; i++) {
+            const int lq = lqs[i];
+            const int u  = kv / 64 / 4;
+            for (int ns = 0; ns <= 1; ns++) {
+                test_cases.emplace_back(new test_xattn_score (128, 16, 8, lq, kv, 16, 64, /*stage=*/0,
+                                                              /*rev_k=*/0, /*no_sm=*/ns != 0));
+                test_cases.emplace_back(new test_xattn_select(128, 16, 8, lq, kv, 16, 64, /*R=*/lq/64, u,
+                                                              /*stage=*/2, /*plant=*/false, /*no_sm=*/ns != 0));
+            }
+            // Split the epilogue: stage 4 is the matmul timed whole-graph and stage 5
+            // stops after the key-axis reduction, so t(5)-t(4) is softmax + reduce-1 and
+            // t(0)-t(5) is the permute+cont+reduce-2 copy. All three carry the same C.
+            test_cases.emplace_back(new test_xattn_score(128, 16, 8, lq, kv, 16, 64, /*stage=*/4));
+            test_cases.emplace_back(new test_xattn_score(128, 16, 8, lq, kv, 16, 64, /*stage=*/5));
+            test_cases.emplace_back(new test_xattn_score(128, 16, 8, lq, kv, 16, 64, /*stage=*/5,
+                                                         /*rev_k=*/0, /*no_sm=*/true));
         }
     }
 

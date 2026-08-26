@@ -877,3 +877,69 @@ whose dense bound `flash-attn-ops.h:417-419` documents as deliberately not loose
 Rows 2-7 all have `kv_eff >= 256` (4+ blocks, 6 threads) and their `ceil` values stand.
 Row 1's end-to-end verdict also stands: even with the kernel fixed, 925 µs of selection
 against 921 µs of dense keeps it a loss.
+
+## What does the softmax cost? Almost nothing — and that relocates the target
+
+Measured on device **41c5710f** (also SM8750 / Hexagon v79; the earlier sweeps were on
+87b3a4aa). The two units agree to within 1.4% on every row measured on both — e.g.
+`XATTN_SELECT(Lq=2048,Lk=4096,u=16)` 8212 vs 8229 µs, `XATTN_SCORE_MM(Lq=2048,Lk=4096)`
+1459 vs 1455 — so the tables above carry over.
+
+`xattn_geom::no_sm` replaces `ggml_soft_max_ext` with a plain `ggml_add` of the causal
+mask, and drops the `1/(√d·S)` scale with it (a single positive factor cannot reorder a
+top-k). Blocks are then ranked by summed raw logits. `ggml_hexagon_supported_binary`
+accepts the broadcast add (F32, contiguous, `ggml_can_repeat`), and `test -o XATTN_SCORE,
+XATTN_SELECT` passes 13/13 with zero unsupported ops, so this is an HTP-to-HTP comparison
+with no CPU fallback on either side. Each pair is registered adjacently and both members
+are whole-graph, so the difference is exact with no per-call constant to remove.
+
+| Lq | Lk | scorer | no-softmax | saved | | selection | no-softmax | saved | |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 512 | 1024 | 1572 | 1493 | 80 | 5.1% | 1774 | 1721 | 53 | 3.0% |
+| 1024 | 1024 | 2288 | 2226 | 62 | 2.7% | 2579 | 2454 | 125 | 4.8% |
+| 512 | 2048 | 1979 | 1962 | 17 | 0.9% | 2183 | 2151 | 32 | 1.5% |
+| 2048 | 2048 | 5009 | 4824 | 185 | 3.7% | 5307 | 5268 | 38 | 0.7% |
+| 512 | 4096 | 2983 | 2912 | 72 | 2.4% | 3150 | 3089 | 61 | 1.9% |
+| 2048 | 4096 | 7854 | 7694 | 160 | 2.0% | 8212 | 8084 | 128 | 1.6% |
+
+**0.7–4.8% of the selection leg, 17–185 µs.** At the configuration that currently wins
+end-to-end (kv=4096, Lq=2048) it is 128 µs out of 8212 — about 1% of the whole pass.
+Run-to-run spread on repeated rows in the same log is 0.2–0.9%, so the small entries are
+barely above noise. Dropping the softmax is not a performance lever.
+
+### Where the epilogue actually goes
+
+`XATTN_SCORE_HALF` (stage 5) stops after the key-axis reduction, so the term splits three
+ways. `XATTN_SCORE_MM_WG` (stage 4) is the matmul timed whole-graph; all three carry the
+same C.
+
+| Lq | Lk | epilogue | softmax | | reduce-1 | | reduce-2 | | reduce-1 ns/elem |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 512 | 1024 | 387 | 69 | 18% | 186 | 48% | 133 | 34% | 5.67 |
+| 1024 | 1024 | 649 | 69 | 11% | 353 | 54% | 227 | 35% | 5.39 |
+| 512 | 2048 | 573 | 38 | 7% | 331 | 58% | 203 | 36% | 5.05 |
+| 2048 | 2048 | 2349 | 216 | 9% | 1350 | 57% | 783 | 33% | 5.15 |
+| 512 | 4096 | 1221 | 76 | 6% | 666 | 55% | 478 | 39% | 5.08 |
+| 2048 | 4096 | **4754** | **221** | **5%** | **2719** | **57%** | **1815** | **38%** | 5.19 |
+
+- **reduce-1** — `ggml_sum_rows` over the key sub-block axis — is the largest single term
+  in the whole scoring pass, 57% of the epilogue and **12× the softmax**.
+- Its cost is a flat **~5.2 ns per input element at every shape**, varying only 5.05-5.67
+  across a 16× range of tensor size. A cost that tracks element count and nothing else is
+  a per-row overhead, and the row here is `ne0 = P = Bl/S = 4` floats — **16 bytes against
+  a 128-byte HVX vector**. The kernel performs 131k-524k separate 4-element reductions.
+- **reduce-2** — permute + `cont` + the query-axis `sum_rows` — is another 38%, on a
+  quarter as many elements, because it carries the chain's only transposing copy.
+- Nothing here is a fallback: `ggml_hexagon_supported_sum_rows` requires only F32 and
+  contiguity (:3196-3215), both hold, and there is no `ne0` gate.
+
+So the epilogue is **95% block pooling and 5% softmax**. Two consequences:
+
+1. `try_fuse_xattn_score` is aimed correctly but described wrongly in this doc: its value
+   is in eliminating the `sum_rows` pair and their DRAM round trips, not the softmax. That
+   also explains why the fused stand-in measured 1.12-1.58x rather than the small factor a
+   softmax-only saving would predict.
+2. **`P = Bl/S` is a first-class performance parameter**, not just a granularity choice.
+   At `Bl=64, S=16` it is 4, the worst case. `Bl=128` at the same S doubles it and halves
+   the row count while leaving the score matmul untouched, and `bs=128` is already legal
+   in the attention kernel. Untested, and the obvious next measurement.
