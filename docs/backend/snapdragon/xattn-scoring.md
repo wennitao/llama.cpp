@@ -948,9 +948,8 @@ So the epilogue is **95% block pooling and 5% softmax**. Two consequences:
 
 The obvious split — HMX keeps the GEMM, the reductions move to a unit that likes short
 rows — is a losing trade here, and it loses on the compute alone, before any transfer or
-synchronisation cost is counted. Same graph, same shapes, `-b CPU` (8 threads on 8 cores,
-which measured best: `taskset c0` and `f0` are 3-7x worse, since the thread count is not
-reduced with the core mask).
+synchronisation cost is counted. Same graph, same shapes, `-b CPU` with the default 8
+worker threads on all 8 cores, which measured best — see the core-binding note below.
 
 `Lq=2048, Lk=4096, S=16`, whole-graph µs, C cancelling in every difference:
 
@@ -999,3 +998,45 @@ The rank-1 form is a ~134 MFLOP matmul at Nq=32, which at the measured 430 GF/s 
 Nq is ~310 µs, plus two pre-sums. **This is the reason to care about dropping the softmax
 — not the 2% the node itself costs.** It is a different estimator with unmeasured accuracy,
 and that, not the latency, is what would decide it.
+
+#### Core binding: every mask made it worse, and not for the reason to expect
+
+`test-backend-ops` sets the CPU backend to `std::thread::hardware_concurrency()` worker
+threads (:14143, `N_THREADS` at :52) and never consults the affinity mask. Confirmed on
+device, mid-run, under `taskset 03`:
+
+```
+Threads:            12          <- 8 ggml workers + main + backend threads
+Cpus_allowed_list:  0-1
+```
+
+So a mask does not repartition the work, it only removes cores from under a fixed thread
+count. `XATTN_SCORE_MM_WG`, `Lq=2048, Lk=4096`, whole-graph µs:
+
+| mask | cores allowed | | µs |
+|:--|:--|:--|--:|
+| `ff` | all 8 | 2 prime + 6 perf | **22311** |
+| `0f` | 0-3 | 4 perf @2.78 GHz | 40159 |
+| `f0` | 4-7 | 2 perf + **2 prime** | 53054 |
+| `c0` | 6-7 | **2 prime** @4.09 GHz | 86004 |
+| `03` | 0-1 | 2 perf @2.78 GHz | 92361 |
+
+Two things worth keeping:
+
+- **Restricting cores always loses**, roughly in proportion to how many are removed. The
+  unrestricted default is the best CPU configuration available, so it is the fair one to
+  put against the NPU — and every alternative only widens the NPU's margin.
+- **Binding to the "prime" cores does not buy their clock.** At equal core count, `c0`
+  (2 prime, 4.09 GHz max) beats `03` (2 perf, 2.78 GHz max) by only 1.07x, nowhere near
+  the 1.47x the max-frequency table implies; and at four cores the mask *containing* both
+  prime cores is 1.32x **slower** than four uniform performance cores. Sampling
+  `scaling_cur_freq` during the runs shows why: under the `walt` governor cpu6/cpu7 sit at
+  **~1017 MHz** throughout, in both masks, including `f0` where they are among the only
+  cores allowed to run. cpu0-cpu5 ramp to 2400 MHz. The prime cores never approach their
+  4.09 GHz maximum on this workload.
+
+This reverses the earlier finding in `rpcmem-cpu-access.md`, where `taskset c0` improved a
+CPU-side measurement 797 -> 366 µs. That payload was small and few-threaded, so pinning
+chose *which* core ran it; here 8 worker threads are already spread across all 8 cores, so
+a mask can only take cores away. Pinning helps when threads < cores and hurts when
+threads == cores — and on this device it never buys clock.
