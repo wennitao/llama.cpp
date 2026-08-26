@@ -1040,3 +1040,67 @@ CPU-side measurement 797 -> 366 µs. That payload was small and few-threaded, so
 chose *which* core ran it; here 8 worker threads are already spread across all 8 cores, so
 a mask can only take cores away. Pinning helps when threads < cores and hurts when
 threads == cores — and on this device it never buys clock.
+
+## Tensor shapes, op by op
+
+Not derived from the graph builder — taken from the backend's own dispatch log,
+`GGML_HEXAGON_VERBOSE=1` → `ggml_hexagon_dump_op_exec` (:138), which prints names, dims,
+types, strides and buffer placement for every op it executes. Dims are `ne0:ne1:ne2:ne3`,
+strides `nb0:nb1:nb2:nb3` in bytes, `!` marks a non-contiguous source.
+
+At `d=128, Hq=16, Hkv=8, Lq=2048, Lk=4096, S=16, Bl=64, R=32`, giving
+`Nq=128, Nk=256, P=4, NBq=32, NBk=64, G=2, NBq_a=1`:
+
+| op | in | out | MiB moved | µs | GB/s |
+|:--|:--|:--|--:|--:|--:|
+| `GET_ROWS` reversal | `[128,2048,16]` f32, idx `[2048,16]` i32 | `[128,2048,16]` f32 | 32.1 | 1071 | **31.5** |
+| `MUL_MAT` score | K `[2048,256,8]` f16 × Q `[2048,128,16]` f32 | `[256,128,16]` f32 | 26.0 | 1459 | **18.7** |
+| `SOFT_MAX` | `[256,128,16]` f32, mask `[256,128]` f32 | `[256,128,16]` f32 | 4.1 | 221 | **19.6** |
+| `SUM_ROWS` reduce-1 | `[4,64,128,16]` f32 | `[1,64,128,16]` f32 | 2.5 | 2719 | **1.0** |
+| `CONT`+`SUM_ROWS` reduce-2 | `[4,64,32,16]` f32, transposed view | `[1,64,32,16]` f32 | 1.1 | 1815 | **0.6** |
+| merge: 3×`CONT` + 6×max | `[64,32,8,2]`, then `[64,1,8,32]` f32 | `[64,1,8]` f32 | 0.4 | 357 | 1.1 |
+| `ARGSORT` | `[64,1,8]` f32 | `[64,1,8]` i32 | 0.002 | ~20 | — |
+
+In general terms, with `Nq = Lq/S`, `Nk = Lk/S`, `P = Bl/S`, `NBq = Lq/Bl`, `NBk = Lk/Bl`,
+`G = Hq/Hkv`, `NBq_a = NBq/R`:
+
+| op | src0 | src1 | dst |
+|:--|:--|:--|:--|
+| `GET_ROWS` | `[d, Lq, Hq]` f32 | `[Lq, Hq]` i32 | `[d, Lq, Hq]` f32 |
+| `MUL_MAT` | `[S·d, Nk, Hkv]` f16 | `[S·d, Nq, Hq]` f32 | `[Nk, Nq, Hq]` f32 |
+| `SOFT_MAX` | `[Nk, Nq, Hq]` f32 | `[Nk, Nq]` f32 | `[Nk, Nq, Hq]` f32 |
+| `SUM_ROWS` #1 | `[P, NBk, Nq, Hq]` f32 | — | `[1, NBk, Nq, Hq]` f32 |
+| `CONT` | `[P, NBk, NBq, Hq]` f32 (permuted) | — | same, contiguous |
+| `SUM_ROWS` #2 | `[P, NBk, NBq, Hq]` f32 | — | `[1, NBk, NBq, Hq]` f32 |
+| stage A `CONT`+max | `[NBk, NBq, Hkv, G]` f32 | — | `[NBk, NBq, Hkv]` f32 |
+| stage B `CONT`+max | `[NBk, NBq_a, Hkv, R]` f32 | — | `[NBk, NBq_a, Hkv]` f32 |
+| `ARGSORT` | `[NBk, NBq_a, Hkv]` f32 | — | `[NBk, NBq_a, Hkv]` i32 |
+
+**28 dispatched ops per selection pass**: 1 `GET_ROWS`, 1 `MUL_MAT`, 1 `SOFT_MAX`,
+2 `SUM_ROWS`, 3 `CONT`, 6 max-of-two (each a `SUB`+`CLAMP`+`ADD` triple, since ggml has no
+elementwise max — `log₂G = 1` for stage A and `log₂R = 5` for stage B), 1 bias `ADD`,
+1 `ARGSORT`.
+
+### The bandwidth column is the whole diagnosis
+
+The three big ops run at **19-32 GB/s**, which is the neighbourhood of this device's DRAM
+bandwidth — `GET_ROWS` moves 32 MiB and is the largest traffic item in the pass, yet costs
+less than half of what the reductions cost. The two block reductions run at **1.0 and 0.6
+GB/s**, roughly **30-50x below their neighbours**, while moving 3.6 MiB between them.
+
+That is not a bandwidth problem and not an arithmetic problem. Both `SUM_ROWS` have
+`ne0 = P = Bl/S = 4` — a 16-byte row against a 128-byte HVX vector — and reduce-2 pays a
+transposing `CONT` on top (`nb0=256, nb1=4`, i.e. `ne1` is the fast axis in memory). The
+cost is per-row bookkeeping repeated 131072 and 32768 times.
+
+Two levers follow directly from the shape table, neither requiring a new kernel:
+
+- **`P = Bl/S` is the row length.** `Bl=128` at the same `S` makes it 8 and halves the row
+  count; the `MUL_MAT`, `SOFT_MAX` and `GET_ROWS` shapes are untouched, and `bs=128` is
+  already legal in the attention kernel.
+- **The rank-1 form eliminates both rows entirely** by pooling the operands instead of the
+  output — see the section above. The pre-sums it needs run over rows of length `S·d = 2048`.
+
+One incidental find in the same dump: in the `no_sm` arm the backend emits a fused
+`MUL_MAT+ADD` node (`[2048,256,8] × [2048,128,16] × [256,128] → [256,128,16]`), so the
+mask add is already free there. Only the softmax variant dispatches `SOFT_MAX` separately.
