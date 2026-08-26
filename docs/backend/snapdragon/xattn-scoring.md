@@ -943,3 +943,59 @@ So the epilogue is **95% block pooling and 5% softmax**. Two consequences:
    At `Bl=64, S=16` it is 4, the worst case. `Bl=128` at the same S doubles it and halves
    the row count while leaving the score matmul untouched, and `bs=128` is already legal
    in the attention kernel. Untested, and the obvious next measurement.
+
+### Would CPU or GPU be better at the epilogue? Measured: no
+
+The obvious split — HMX keeps the GEMM, the reductions move to a unit that likes short
+rows — is a losing trade here, and it loses on the compute alone, before any transfer or
+synchronisation cost is counted. Same graph, same shapes, `-b CPU` (8 threads on 8 cores,
+which measured best: `taskset c0` and `f0` are 3-7x worse, since the thread count is not
+reduced with the core mask).
+
+`Lq=2048, Lk=4096, S=16`, whole-graph µs, C cancelling in every difference:
+
+| | HTP | CPU | HTP advantage |
+|:--|--:|--:|--:|
+| score matmul | 3100 | 20402 | 6.6x |
+| softmax | 221 | 1054 | 4.8x |
+| reduce-1 (key-axis `sum_rows`) | 2719 | 5058 | 1.9x |
+| reduce-2 (permute + cont + `sum_rows`) | 1815 | 7365 | 4.1x |
+| **whole epilogue** | **4754** | **13477** | **2.8x** |
+
+**The NPU is faster at every sub-part, including the one it is bad at.** reduce-1 costs
+5.2 ns per element on HTP and 9.6 ns on the CPU — ggml's `sum_rows` is a per-row
+`ggml_vec_sum_f32` call, so a 4-element row is as unfriendly to NEON as it is to HVX, and
+the CPU has less bandwidth to hide it. There is no sub-piece of this pass worth relocating,
+which makes the transfer question moot; the prior relocation work had already priced the
+best case at 0.97-1.11x (`xattn-split`, `rpcmem-cpu-access.md`).
+
+GPU is **not** measured here: this build has no `libggml-opencl.so` and the earlier OpenCL
+work ran on a different device (b4bd0901, Adreno 830). The one relevant prior data point is
+the de-overheaded scoring comparison in `xattn-block-selection.md`, where the GPU lost to
+the NPU at small R and drew at R=64 — on the whole pass, not the epilogue specifically.
+
+### The implication: without the softmax, the pooling is not an epilogue at all
+
+Not measured — recorded because it follows from the same bilinearity the `no_sm` arm
+already assumes. With the softmax gone the block score is a sum of raw logits, and a sum
+factorises where a softmax cannot:
+
+```
+attn_sum[bq,bk] = Σ_{i∈bq} Σ_{j∈bk} (rq_i · rk_j) = (Σ_{i∈bq} rq_i) · (Σ_{j∈bk} rk_j)
+```
+
+So the pooling can move to the *operands*: pre-sum P adjacent reduced-Q rows and P adjacent
+reduced-K rows, then matmul the pooled operands directly to `[NBq, NBk]`. That deletes both
+reductions outright and shrinks the matmul by `P² = 16x` (`[128,256]` → `[32,64]` at
+Lq=2048/Lk=4096). The pre-sums run over rows of length `S·d = 2048` — the opposite of the
+4-element rows that make `sum_rows` slow here.
+
+The block-level causal mask still applies afterwards, and it has to: the identity holds
+exactly for fully-unmasked block pairs and fails for the partially-masked diagonal block —
+which `find_blocks` force-includes regardless, so its score never decides anything.
+
+Scale, from the numbers above: today the scorer is 3100 (mm) + 4754 (epilogue) = 7854 µs.
+The rank-1 form is a ~134 MFLOP matmul at Nq=32, which at the measured 430 GF/s for that
+Nq is ~310 µs, plus two pre-sums. **This is the reason to care about dropping the softmax
+— not the 2% the node itself costs.** It is a different estimator with unmeasured accuracy,
+and that, not the latency, is what would decide it.
