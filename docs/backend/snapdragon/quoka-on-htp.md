@@ -176,3 +176,67 @@ large chunk**: a fixed ~2 ms scorer amortised over 2048 query tokens, plus the ~
 attention leg, against 16302 µs of dense. That is the only arrangement in which QUOKA's
 cheap-matmul property actually pays here, and it trades away the paper's accuracy argument,
 so it is a quality question before it is a latency one.
+
+## Dropping the sub-selection: 2.45× over dense
+
+The prediction was that QUOKA's steps 1–5 are the only chunk-scaling term, so removing them
+frees the chunk and lets a fixed scorer amortise. Measured, on device `2a38935c` (also
+SM8750/v79; its dense rows match the earlier two devices to 0.4%, so these compare directly).
+`subsel=2` replaces the cosine-similarity ranking with `N_Q` rows **evenly spaced across the
+chunk** — a strided view plus one `cont`, no index leaf, no argsort, no per-query arithmetic.
+Sum pooling, `u = NBk/4` (25%), `N_Q = 16`.
+
+| Lk | B_CP | queries | score | top-k | attn | e2e | dense | **D/e2e** | scorer µs/token |
+|--:|--:|:--|--:|--:|--:|--:|--:|--:|--:|
+| 4096 | 128 | QUOKA | 1924 | 53 | 621 | 2598 | – | – | 15.44 |
+| 4096 | 512 | QUOKA | 3095 | 34 | 1471 | 4600 | 4286 | 0.93× | 6.11 |
+| 4096 | 512 | strided | 1400 | 11 | 1484 | 2896 | 4286 | 1.48× | 2.76 |
+| 4096 | 2048 | strided | 1399 | 7 | 5228 | 6635 | 16260 | **2.45×** | **0.69** |
+| 2048 | 512 | strided | 916 | 36 | 1248 | 2200 | 2082 | 0.95× | 1.86 |
+| 2048 | 2048 | strided | 961 | 6 | 3952 | 4919 | 8798 | **1.79×** | 0.47 |
+
+Four things the table shows:
+
+1. **The scorer is now genuinely chunk-independent.** 1400 µs at B_CP=512 and 1399 at
+   B_CP=2048, same Lk. That is the whole point: a fixed `N_Q` matmul plus an `Lk`-sized
+   reduction, with nothing left that scales with the chunk. QUOKA's own scorer went
+   1924 → 3095 over the same range.
+2. **Per query token the scorer collapses 22×**, 15.44 → 0.69 µs, and 8.9× against QUOKA's
+   own best chunk.
+3. **Dropping the sub-selection is worth 2.2× on its own** at fixed chunk (3095 → 1400 at
+   Lk=4096, B_CP=512), i.e. steps 1–5 were ~55% of the scorer.
+4. **The top-k stays free** — 6–36 µs everywhere.
+
+### Against everything else measured
+
+At the identical shape (kv=4096, Lq=2048, 25% density, chunk-wide selection):
+
+| | selection | attention | e2e | vs dense |
+|:--|--:|--:|--:|--:|
+| XAttention (`xattn-scoring.md`) | 7477 | 5056 | 12534 | 1.26× |
+| **QUOKA-strided + block selection** | **1407** | 5228 | **6635** | **2.45×** |
+| dense | – | – | 16260 | 1.00× |
+
+**The selection leg fell 5.3×, and that is the entire difference.** The attention legs agree
+to 3% — as they must, since both hand the kernel the same chunk-wide block list; 5228 also
+cross-checks against the 5181 µs `FLASH_ATTN_EXT_SPARSE` shared-selection row to 0.9%.
+
+Scoring's share of the pass goes from **60% to 21%**. For the first time in this work the
+attention kernel, not the scorer, is the dominant cost — which relocates every remaining
+optimisation back onto the per-query-block and barrier work priced in
+`flash-attn-htp-anatomy.md`.
+
+`N_Q` is now the only knob on the scorer, and it is sub-linear because the `Lk`-sized
+reduction is fixed: at Lk=4096, B_CP=2048, `N_Q` = 16/32/64 costs 1407/1812/2661 µs. Even at
+`N_Q`=64 the pass is 7889 µs, **2.06×** dense.
+
+### What this costs, which is not measured
+
+The strided sample abandons QUOKA's central claim outright — that queries with *low* cosine
+similarity to the mean query carry the attention mass, and that ranking by it is what
+preserves accuracy. An evenly spaced sample has no such argument; it is defensible only as
+"covers the chunk". Two further quality debts ride along: `B_CP=2048` against `Lk=4096` means
+one KV set serves 2048 query tokens (the coarsest selection this backend admits, the same
+caveat as the XAttention union configuration), and `N_Q=16` representatives for those 2048
+queries is a 128:1 compression. The 2.45× is an upper bound conditional on a quality result
+nobody has produced.

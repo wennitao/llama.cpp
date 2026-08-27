@@ -9374,11 +9374,21 @@ struct test_quoka_block : public test_case {
     const int64_t d, Hq, Hkv, Lq, Lk, NQ, Bl, u;
     const int     stage;    // 0 = block scores, 1 = selection, 2 = end-to-end with FA
     const bool    blk_max;  // block pool: true = max (QUOKA's outlier-preserving choice), false = sum
-    // Steps 1-5. Their topk over per-query cosine similarity is tie-unstable across
-    // backends, and a different query SET changes every downstream value, so a HTP-vs-CPU
-    // NMSE with it on reports tie order rather than arithmetic. false takes the first NQ
-    // queries instead, which is what makes the new block-pooling logic checkable.
-    const bool    subsel;
+    // How the N_Q scored queries are chosen:
+    //   1  QUOKA steps 1-5: rank all B_CP queries by -CosSim(q, M_Q) and keep the lowest.
+    //      This is the paper's accuracy claim, and it is the ONLY term in the scorer that
+    //      scales with B_CP -- measured 15227 us of score at B_CP=2048 against 3982 at 512,
+    //      which is exactly what stops the chunk being enlarged. Also tie-unstable across
+    //      backends, so arms using it cannot be NMSE-checked against CPU.
+    //   0  the first N_Q rows. A control, not a proposal: it makes the block-pooling logic
+    //      checkable by removing the tie-unstable argsort.
+    //   2  N_Q rows evenly spaced across the chunk, as a strided view plus one cont -- no
+    //      index leaf, no argsort, no per-query arithmetic. This is the deployable form of
+    //      "drop the sub-selection": the scorer becomes independent of B_CP, so the fixed
+    //      cost amortises over a large chunk instead of being paid per 128 tokens. It
+    //      abandons the paper's central claim that low-cos-sim queries carry the attention
+    //      mass, so it is a quality question before it is a latency one.
+    const int     subsel;
 
     int64_t G()   const { return Hq / Hkv; }
     int64_t NQe() const { return Lq < NQ ? Lq : NQ; }
@@ -9404,7 +9414,7 @@ struct test_quoka_block : public test_case {
 
     test_quoka_block(int64_t d = 128, int64_t Hq = 16, int64_t Hkv = 8, int64_t Lq = 512,
                      int64_t Lk = 4096, int64_t NQ = 16, int64_t Bl = 64, int64_t u = 16,
-                     int stage = 0, bool blk_max = true, bool subsel = true)
+                     int stage = 0, bool blk_max = true, int subsel = 1)
         : d(d), Hq(Hq), Hkv(Hkv), Lq(Lq), Lk(Lk), NQ(NQ), Bl(Bl), u(u), stage(stage),
           blk_max(blk_max), subsel(subsel) {}
 
@@ -9423,7 +9433,15 @@ struct test_quoka_block : public test_case {
         // --- QUOKA steps 1-9, exactly as test_quoka_score builds them. K arrives
         //     pre-normalised (a cache-write cost); see that struct's knorm note.
         ggml_tensor * qs = q;
-        if (!subsel && Lq > NQ) {
+        if (subsel == 2 && Lq > NQ) {
+            // Evenly spaced: stride the query axis by Lq/NQ. nb[1] scaled is still a
+            // legal view and every row stays contiguous, so this is one cont over
+            // NQ*d*Hq floats and nothing else -- no dependence on Lq at all.
+            GGML_ASSERT(Lq % NQ == 0);
+            qs = ggml_cont(ctx, ggml_view_3d(ctx, q, d, NQ, Hq,
+                                             (size_t) (Lq/NQ) * q->nb[1], q->nb[2], 0));
+            ggml_set_name(qs, "quoka_q_strided");
+        } else if (subsel == 0 && Lq > NQ) {
             qs = ggml_cont(ctx, ggml_view_3d(ctx, q, d, NQ, Hq, q->nb[1], q->nb[2], 0));
         } else if (Lq > NQ) {
             ggml_tensor * qn0 = ggml_l2_norm(ctx, q, 1e-6f);
@@ -12762,9 +12780,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // The QUOKA-scored BLOCK selection. Stage 0 only: stage 1 adds an argsort whose ties
     // are backend-dependent, and stage 2's src[5] is invisible to the CPU reference.
-    test_cases.emplace_back(new test_quoka_block(128, 4, 2, 128,  512, 16, 64, 4, /*stage=*/0, /*blk_max=*/true,  /*subsel=*/false));
-    test_cases.emplace_back(new test_quoka_block(128, 4, 2, 128,  512, 16, 64, 4, /*stage=*/0, /*blk_max=*/false, /*subsel=*/false));
-    test_cases.emplace_back(new test_quoka_block(128, 8, 2, 256, 1024, 32, 64, 8, /*stage=*/0, /*blk_max=*/true,  /*subsel=*/false));
+    test_cases.emplace_back(new test_quoka_block(128, 4, 2, 128,  512, 16, 64, 4, /*stage=*/0, /*blk_max=*/true,  /*subsel=*/0));
+    test_cases.emplace_back(new test_quoka_block(128, 4, 2, 128,  512, 16, 64, 4, /*stage=*/0, /*blk_max=*/false, /*subsel=*/0));
+    test_cases.emplace_back(new test_quoka_block(128, 8, 2, 256, 1024, 32, 64, 8, /*stage=*/0, /*blk_max=*/true,  /*subsel=*/0));
+    test_cases.emplace_back(new test_quoka_block(128, 4, 2, 256,  512, 16, 64, 4, /*stage=*/0, /*blk_max=*/false, /*subsel=*/2));
 
     // QUOKA (arXiv:2602.08722) Algorithm 1. subsel=false for the checked arms: step 4's
     // topk over per-query cosine similarity is tie-unstable across backends exactly as the
@@ -13858,6 +13877,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_quoka_block(128, 16, 8, bcp, kv, 16, 64, u, st, /*blk_max=*/true));
                 test_cases.emplace_back(new test_quoka_block(128, 16, 8, bcp, kv, 16, 64, u, st, /*blk_max=*/false));
             }
+        }
+        // The configuration the whole QUOKA line was pointing at: sub-selection dropped
+        // (subsel=2, evenly spaced), sum pooling, and the chunk opened up to where a
+        // chunk-independent scorer actually amortises. B_CP=2048 is only reachable this way
+        // -- QUOKA's own steps 1-5 both cost 15 ms there and overflow the harness's
+        // 128-tensor context with their halving-add tree.
+        for (int bcp : { 512, 2048 }) {
+            if (bcp > kv) {
+                continue;
+            }
+            for (int st = 0; st <= 2; st++) {
+                test_cases.emplace_back(new test_quoka_block(128, 16, 8, bcp, kv, 16, 64, u, st,
+                                                             /*blk_max=*/false, /*subsel=*/2));
+            }
+        }
+        // N_Q sweep at the large chunk: with the sub-selection gone this is the only knob
+        // that moves the score matmul, and it is now free of B_CP entirely.
+        for (int nq : { 32, 64 }) {
+            test_cases.emplace_back(new test_quoka_block(128, 16, 8, 2048, kv, nq, 64, u, /*stage=*/1,
+                                                         /*blk_max=*/false, /*subsel=*/2));
         }
     }
 
