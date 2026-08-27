@@ -13912,6 +13912,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // ---------------------------------------------------------------------------------
+    // THE FULL COMPARISON, kv = 512 -> 4096. Every method at matched shapes, registered
+    // adjacently so thermal drift is shared, at a fixed 25% density and the largest chunk
+    // each context admits (min(kv, 2048)).
+    //
+    //   D      dense FA, replicated                        FLASH_ATTN_EXT
+    //   D_wg   dense FA, whole-graph -> C at this shape     FLASH_ATTN_EXT_WG
+    //   X      XAttention scorer + block selection + FA     XATTN_E2E / XATTN_SELECT
+    //   Q      QUOKA scorer + block selection + FA          QUOKA_BLK_* subsel=1
+    //   Qs     Q with the sub-selection replaced by an
+    //          evenly spaced sample                         QUOKA_BLK_* subsel=2
+    //
+    // Q is registered only for chunks <= 512: its steps 1-5 cost 15 ms at B_CP=2048 and
+    // their halving-add tree overflows the harness's 128-tensor context into a segfault
+    // (:1568), which is itself part of why the strided variant exists.
+    //
+    // kv=512 is deliberately included even though 25% there is u = 2, i.e. kv_eff = 128,
+    // below FA_MIN_KV_BLOCKS*64 = 192. That row runs single-threaded and non-pipelined
+    // (ggml-hexagon.cpp:2139) and is expected to lose; it is the control that shows the
+    // density floor is a real deployment constraint rather than a curiosity.
+    for (int kv : { 512, 1024, 2048, 4096 }) {
+        const int chunk = kv < 2048 ? kv : 2048;
+        const int u     = kv / 64 / 4;
+        test_cases.emplace_back(new test_flash_attn_ext   (128, 128, 8, {2, 1}, kv, chunk, /*mask=*/false, false, 0, 0,
+                                                           GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext_wg(128, 128, 8, {2, 1}, kv, chunk, /*mask=*/false, false, 0, 0,
+                                                           GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_xattn_select(128, 16, 8, chunk, kv, 16, 64, chunk/64, u, /*stage=*/2));
+        test_cases.emplace_back(new test_xattn_e2e   (128, 16, 8, chunk, kv, 16, 64, chunk/64, u));
+        test_cases.emplace_back(new test_quoka_block(128, 16, 8, chunk, kv, 16, 64, u, /*stage=*/1, /*blk_max=*/false, /*subsel=*/2));
+        test_cases.emplace_back(new test_quoka_block(128, 16, 8, chunk, kv, 16, 64, u, /*stage=*/2, /*blk_max=*/false, /*subsel=*/2));
+        if (chunk <= 512) {
+            test_cases.emplace_back(new test_quoka_block(128, 16, 8, chunk, kv, 16, 64, u, /*stage=*/1, /*blk_max=*/false, /*subsel=*/1));
+            test_cases.emplace_back(new test_quoka_block(128, 16, 8, chunk, kv, 16, 64, u, /*stage=*/2, /*blk_max=*/false, /*subsel=*/1));
+        }
+    }
+
     // Attribute the per-query-block penalty. The MAC count is identical across every
     // row here -- only the SCHEDULE changes -- so any difference is tiling cost alone.
     //

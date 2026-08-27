@@ -240,3 +240,55 @@ one KV set serves 2048 query tokens (the coarsest selection this backend admits,
 caveat as the XAttention union configuration), and `N_Q=16` representatives for those 2048
 queries is a 128:1 compression. The 2.45× is an upper bound conditional on a quality result
 nobody has produced.
+
+## Full comparison, kv = 512 → 4096
+
+Every method at matched shapes, registered adjacently so drift is shared. Fixed 25% density
+(`u = NBk/4`), chunk = `min(kv, 2048)`, `S=16`, `N_Q=16`, sum pooling, chunk-wide selection
+throughout. Each shape's own `C` is derived from its `FLASH_ATTN_EXT_WG`/`FLASH_ATTN_EXT`
+pair and subtracted from every whole-graph arm; dense is quoted as `D_wg − C`.
+
+| kv | chunk | u | C | dense | X sel | X e2e | **X** | Qs sel | Qs e2e | **Qs** |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 512 | 512 | 2 | 607 | 924 | 931 | 2370 | 0.39× | **119** | 1752 | **0.53×** |
+| 1024 | 1024 | 4 | 590 | 2440 | 1904 | 3758 | 0.65× | **216** | 2274 | **1.07×** |
+| 2048 | 2048 | 8 | 679 | 8567 | 4465 | 8291 | 1.03× | **287** | 4242 | **2.02×** |
+| 4096 | 2048 | 16 | 670 | 15930 | 7403 | 12653 | 1.26× | **690** | 5965 | **2.67×** |
+
+`X` = XAttention scorer, `Qs` = QUOKA scorer with the sub-selection replaced by an evenly
+spaced sample. Both drive the identical block selection, `u`, and chunk-wide `sel` shape.
+
+**QUOKA's scorer as published is not competitive.** The one shape where its steps 1–5 fit
+the harness (kv=512, chunk=512) gives selection 1958 µs against XAttention's 931 and
+`Qs`'s 119 — 2.1× worse than XAttention, 16× worse than the strided variant. It is the
+*structure minus the sub-selection* that wins, not QUOKA as specified.
+
+### The two things that moved
+
+| kv | attention leg X | attention leg Qs | delta | scoring share X | scoring share Qs |
+|--:|--:|--:|--:|--:|--:|
+| 512 | 1439 | 1633 | +13.5% | 39% | **7%** |
+| 1024 | 1854 | 2058 | +11.0% | 51% | **9%** |
+| 2048 | 3827 | 3955 | +3.3% | 54% | **7%** |
+| 4096 | 5250 | 5276 | +0.5% | 59% | **12%** |
+
+1. **The attention legs are the same kernel doing the same work** — within 0.5% at kv=4096,
+   as they must be, since both hand it the same chunk-wide block list at the same density.
+   The spread at short context is thermal, not structural.
+2. **Scoring's share collapses from 39–59% to 7–12%.** That is the entire result. Every
+   conclusion in `xattn-scoring.md` that turned on "selection is about half the pass and its
+   share grows with context" describes the XAttention scorer specifically, not sparse
+   attention on this backend.
+
+### Crossover
+
+`Qs` beats dense from **kv=1024** (1.07×); XAttention only from kv=2048 (1.03×). The
+kv=512 row loses for both, and for a reason neither scorer controls: 25% of 8 blocks is
+`u=2`, i.e. `kv_eff=128`, below `FA_MIN_KV_BLOCKS*64 = 192`, so the kernel runs
+single-threaded and non-pipelined. That is the density floor, and it binds before any
+scoring question does.
+
+With scoring at 7–12%, the remaining cost is the attention kernel — which relocates the open
+work back onto the per-query-block tax and the fork/join barriers priced in
+`flash-attn-htp-anatomy.md`, where the ceiling is ~1.2× and ~1.9× respectively. Neither was
+worth much when scoring was 60% of the pass; both are now the main event.
