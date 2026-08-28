@@ -281,8 +281,38 @@ Two structural facts make the frontier this steep:
 
 ### Where the remaining loss actually is
 
-At this operating point the scorer contributes **1.0 point** of the loss. The oracle itself
-sits at 0.892 absolute recall (k=4, 25%), and coarsening to chunk-wide at the same density
-costs another 4.4. So of the ~15 points of recall a deployment gives up against exact
-attention, roughly **1 is the scorer, 3 is the merge, and 11 is the budget**. Every remaining
-lever is `u`, not scoring.
+One configuration, Qwen3-1.7B at 25% density, `bs=64`, `k=4`, meanpool_s4 — each step
+measured against the one above it, so the terms add:
+
+| | recall | this step costs |
+|:--|--:|--:|
+| exact attention | 1.000 | — |
+| per-block oracle at `u = NBk/4` | 0.921 | **7.9 pts** — the budget |
+| merged oracle at `k=4` | 0.915 | **0.6 pts** — the merge |
+| meanpool_s4, 99.0% of it | 0.906 | **0.9 pts** — the scorer |
+| | | **9.4 pts total** |
+
+**The budget is 84% of the loss.** The scorer and the merge together are 1.5 points. Going
+chunk-wide instead (`k=32`) would make the merge term 4.2 rather than 0.6 — still under the
+budget's 7.9, but no longer negligible.
+
+> An earlier version of this section said "~15 points total: 1 scorer, 3 merge, 11 budget".
+> Two of those were wrong. The 3-point merge came from the merge table's oracle column
+> *averaged over all four densities* rather than the 25% row — at 25% specifically, `k=4`
+> costs 0.6. And the 11-point budget was `1 − 0.892`, which already contains the merge, so it
+> was double-counted. The corrected figures are above.
+
+### Note on scope: why `u` and `k` appear in a scorer comparison
+
+`u` has to. Recall is *defined* at a budget — "what fraction of the mass does the top-`u`
+capture" — so there is no scorer comparison without one. It is a parameter of the metric,
+not a variable under study, and it is swept over four densities only to confirm the scorer
+ranking does not depend on it. It does not.
+
+`k` did **not** have to. It was added because the NPU result rests on a chunk-wide selection
+whose quality had never been measured, and folding it into the same sweep was the cheapest
+way to close that gap. But it is a *deployment* question, not a scoring one, and the table
+above is a deployment accounting rather than a result of the scorer comparison — it imports
+a density, a merge factor and a scorer that the scoring question does not fix. Read the
+quality/cost table for "which scorer"; read this section only as "what one particular
+configuration gives up".
