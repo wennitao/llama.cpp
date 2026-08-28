@@ -239,3 +239,50 @@ coarsening dominates everything the scorer could contribute.
 
 > `xattn` at 100.7% is not an error: the merged oracle ranks by *summed* mass over the group,
 > which is not optimal for per-block recall, so a scorer can occasionally beat it.
+
+## The table: quality against cost
+
+Quality is the ratio to the merged oracle at `k=4`, 25% density, 11 RULER/LongBench
+datasets × all layers × 2 instances. Cost is the **selection leg on the HTP** at
+`Lq=2048, Lk=4096, u=16, bs=64` — the whole-graph time minus the ~620 µs per-call constant,
+K pre-pooled, measured in one invocation so every row shares `C` and the thermal window.
+Both axes are for the same algorithm; nothing is modelled.
+
+| scorer | Qwen3-1.7B | Llama-3.2-1B | **NPU µs** | vs XAttention |
+|:--|--:|--:|--:|--:|
+| xattn | **99.4%** | **99.3%** | 7505 | 1.0× |
+| meanpool | 99.2% | 99.1% | 2489 | 3.0× |
+| **meanpool_s8** | 99.1% | 99.1% | **727** | **10.3×** |
+| **meanpool_s4** | 99.0% | 99.0% | **378** | **19.9×** |
+| meanpool_s2 | 98.8% | 98.9% | not built | — |
+| quoka_str | 97.3% | 98.7% | 799 | 9.4× |
+| quoka | 96.6% | 98.4% | — | — |
+| maxpool | 97.4% | 98.2% | — | — |
+| recent | 96.8% | 97.3% | ~80 (argsort only) | — |
+| random | 89.5% | 91.2% | ~80 (argsort only) | — |
+
+`meanpool_sN` = block mean over `N` evenly spaced rows of each 64-token block instead of all
+64. `quoka_str` = QUOKA with the same substitution on its query axis.
+
+**`meanpool_s4` is the operating point: 99.0% of oracle on both models, 378 µs, 19.9× cheaper
+than the XAttention scorer.** It dominates `quoka_str` on both axes — better quality *and*
+half the cost — and buying the last 0.4 points of quality by going to XAttention costs **20×**.
+
+Two structural facts make the frontier this steep:
+
+- **Cost is Q-bound, so it tracks the subsample directly.** meanpool 2489 → 727 → 378 µs at
+  64 → 8 → 4 rows, while the matmul (4.19 MFLOP) and the argsort (~80 µs) never move. At
+  `Lq=512` the `s8` and `s4` graphs measure 614 and 547 µs whole-graph, i.e. *at or below the
+  per-call constant* — the scorer has become too cheap for this method to resolve.
+- **Quality is flat in the subsample.** 64 → 2 rows costs 0.4 points on Qwen and 0.2 on
+  Llama. A block's 64 query rows are near-redundant for the purpose of ranking KV blocks,
+  which is the same redundancy QUOKA exploits — but an evenly spaced sample extracts it more
+  cheaply, and better, than a cosine ranking.
+
+### Where the remaining loss actually is
+
+At this operating point the scorer contributes **1.0 point** of the loss. The oracle itself
+sits at 0.892 absolute recall (k=4, 25%), and coarsening to chunk-wide at the same density
+costs another 4.4. So of the ~15 points of recall a deployment gives up against exact
+attention, roughly **1 is the scorer, 3 is the merge, and 11 is the budget**. Every remaining
+lever is `u`, not scoring.

@@ -254,6 +254,12 @@ def sc_quoka_strided(q, k, bs, NQ=16, **kw):
         out[bi] = sc.view(Hkv, -1, NB, bs).amax(-1).amax(1)
     return out
 
+def sc_meanpool_s4(q, k, bs, **kw):
+    return sc_meanpool_sub(q, k, bs, QSUB=4)
+
+def sc_meanpool_s2(q, k, bs, **kw):
+    return sc_meanpool_sub(q, k, bs, QSUB=2)
+
 def sc_meanpool_sub(q, k, bs, QSUB=8, **kw):
     """meanpool over a subsample: mean of QSUB evenly spaced rows per block, not all bs.
 
@@ -269,7 +275,7 @@ def sc_meanpool_sub(q, k, bs, QSUB=8, **kw):
     kb = kz.view(Hkv, NB, bs, d).mean(2)
     return torch.einsum('hnd,hmd->hnm', qb, kb).permute(1, 0, 2).contiguous() / math.sqrt(d)
 
-SCORERS = {'xattn': sc_xattn, 'quoka_str': sc_quoka_strided, 'meanpool_s8': sc_meanpool_sub, 'quoka': sc_quoka, 'meanpool': sc_meanpool,
+SCORERS = {'xattn': sc_xattn, 'quoka_str': sc_quoka_strided, 'meanpool_s8': sc_meanpool_sub, 'meanpool_s4': sc_meanpool_s4, 'meanpool_s2': sc_meanpool_s2, 'quoka': sc_quoka, 'meanpool': sc_meanpool,
            'maxpool': sc_maxpool, 'recent': sc_recent, 'random': sc_random}
 
 

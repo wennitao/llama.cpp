@@ -9560,6 +9560,12 @@ struct test_meanpool_block : public test_case {
     const int64_t d, Hq, Hkv, Lq, Lk, Bl, u;
     const int     stage;   // 0 = block scores, 1 = selection, 2 = end-to-end with FA
     const bool    kmean;   // true = pool K inline, false = K arrives pre-pooled
+    // Rows of each query block actually averaged. Bl = all of them; anything less is a
+    // strided sample. On GPU, 8 rows of 64 lands within 0.1-0.2 points of the full mean at
+    // every merge factor on both models (oracle-block-scoring.md), and since this scorer's
+    // whole NPU cost is the Q block-mean, it is a near-linear cut in the only term that
+    // costs anything.
+    const int64_t qsub;
 
     int64_t G()   const { return Hq / Hkv; }
     int64_t NBq() const { return Lq / Bl; }
@@ -9568,7 +9574,7 @@ struct test_meanpool_block : public test_case {
     std::string op_desc(ggml_tensor *) override {
         return stage == 0 ? "MEANPOOL_SCORE" : stage == 1 ? "MEANPOOL_SELECT" : "MEANPOOL_E2E";
     }
-    std::string vars() override { return VARS_TO_STR9(d, Hq, Hkv, Lq, Lk, Bl, u, stage, kmean); }
+    std::string vars() override { return VARS_TO_STR10(d, Hq, Hkv, Lq, Lk, Bl, u, qsub, stage, kmean); }
 
     bool run_whole_graph()  override { return true; }
     bool perf_whole_graph() override { return true; }
@@ -9582,8 +9588,9 @@ struct test_meanpool_block : public test_case {
 
     test_meanpool_block(int64_t d = 128, int64_t Hq = 16, int64_t Hkv = 8, int64_t Lq = 512,
                         int64_t Lk = 4096, int64_t Bl = 64, int64_t u = 16,
-                        int stage = 0, bool kmean = false)
-        : d(d), Hq(Hq), Hkv(Hkv), Lq(Lq), Lk(Lk), Bl(Bl), u(u), stage(stage), kmean(kmean) {}
+                        int stage = 0, bool kmean = false, int64_t qsub = 0)
+        : d(d), Hq(Hq), Hkv(Hkv), Lq(Lq), Lk(Lk), Bl(Bl), u(u), stage(stage), kmean(kmean),
+          qsub(qsub ? qsub : Bl) {}
 
     // Sum over ne1 by halving. Both halves are contiguous blocks at the natural stride, so
     // every step is a plain elementwise add on non-permuted operands -- the one shape this
@@ -9623,11 +9630,21 @@ struct test_meanpool_block : public test_case {
         // Q: mean over the Bl rows of each block, then over the G query heads sharing a KV
         // head. Both scales fold into one, and into the 1/sqrt(d) below.
         ggml_tensor * q4 = ggml_reshape_4d(ctx, q, d, Bl, NBq(), Hq);
-        ggml_tensor * qm = halve_ne1(ctx, q4, Bl);                         // [d,1,NBq,Hq]
+        int64_t nsum = Bl;
+        if (qsub < Bl) {
+            // Strided sample of the block's rows, made contiguous once. The cont moves
+            // qsub/Bl of Q; everything after it is that much smaller too, so the whole
+            // Q-side cost scales with qsub rather than with Bl.
+            GGML_ASSERT(Bl % qsub == 0 && xattn_is_pow2(qsub));
+            q4 = ggml_cont(ctx, ggml_view_4d(ctx, q4, d, qsub, NBq(), Hq,
+                                             (size_t) (Bl/qsub) * q4->nb[1], q4->nb[2], q4->nb[3], 0));
+            nsum = qsub;
+        }
+        ggml_tensor * qm = halve_ne1(ctx, q4, nsum);                       // [d,1,NBq,Hq]
         qm = ggml_reshape_4d(ctx, qm, d, NBq(), G(), Hkv);
         qm = halve_ne2(ctx, qm, G());                                      // [d,NBq,1,Hkv]
         qm = ggml_reshape_3d(ctx, qm, d, NBq(), Hkv);
-        qm = ggml_scale(ctx, qm, 1.0f / ((float) Bl * (float) G() * sqrtf((float) d)));
+        qm = ggml_scale(ctx, qm, 1.0f / ((float) nsum * (float) G() * sqrtf((float) d)));
         ggml_set_name(qm, "meanpool_q");
 
         // K: pooled inline, or arriving already pooled from the cache-write path.
@@ -12917,6 +12934,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_meanpool_block(128, 4, 2, 128,  512, 64, 4, /*stage=*/0, /*kmean=*/false));
     test_cases.emplace_back(new test_meanpool_block(128, 8, 2, 256, 1024, 64, 8, /*stage=*/0, /*kmean=*/true));
+    test_cases.emplace_back(new test_meanpool_block(128, 4, 2, 256,  512, 64, 4, /*stage=*/0, /*kmean=*/false, /*qsub=*/8));
 
     // The QUOKA-scored BLOCK selection. Stage 0 only: stage 1 adds an argsort whose ties
     // are backend-dependent, and stage 2's src[5] is invisible to the CPU reference.
@@ -14186,6 +14204,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_meanpool_block(128, 16, 8, lq, kv, 64, u, st, /*kmean=*/false));
             }
             test_cases.emplace_back(new test_meanpool_block(128, 16, 8, lq, kv, 64, u, /*stage=*/1, /*kmean=*/true));
+        }
+    }
+
+    // THE COST AXIS of the quality/cost table. Every scorer's SELECTION leg at two chunk
+    // sizes and one cache, registered adjacently so they share C and the thermal window.
+    // Quality for the same scorers is in oracle-block-scoring.md.
+    for (int lq : { 512, 2048 }) {
+        const int kv = 4096, u = 16;
+        test_cases.emplace_back(new test_xattn_select (128, 16, 8, lq, kv, 16, 64, lq/64, u, /*stage=*/2));
+        test_cases.emplace_back(new test_meanpool_block(128, 16, 8, lq, kv, 64, u, /*stage=*/1, /*kmean=*/false, /*qsub=*/64));
+        test_cases.emplace_back(new test_meanpool_block(128, 16, 8, lq, kv, 64, u, /*stage=*/1, /*kmean=*/false, /*qsub=*/8));
+        test_cases.emplace_back(new test_meanpool_block(128, 16, 8, lq, kv, 64, u, /*stage=*/1, /*kmean=*/false, /*qsub=*/4));
+        test_cases.emplace_back(new test_quoka_block  (128, 16, 8, lq, kv, 16, 64, u, /*stage=*/1, /*blk_max=*/false, /*subsel=*/2));
+        if (lq <= 512) {   // QUOKA's own sub-selection overflows the harness context at 2048
+            test_cases.emplace_back(new test_quoka_block(128, 16, 8, lq, kv, 16, 64, u, /*stage=*/1, /*blk_max=*/false, /*subsel=*/1));
         }
     }
 
