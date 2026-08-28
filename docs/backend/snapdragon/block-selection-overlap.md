@@ -474,3 +474,69 @@ not shrink the budget. Pick the smallest `u` that is **≥ 3 blocks and has a di
 leaves 3–6 chunks**, and take the extra density for free. For a naive union this is a
 sharper constraint than the density penalty itself — the union hands you `u = 2.4` or `6.7`,
 and rounding to 3 or to 6 is the difference between 1.25× and 0.83×.
+
+### A predictor for `u`, and what its coefficients mean
+
+`u` is the **size of the selection list** handed to the kernel — `sel->ne[0]`, so
+`kv_eff = u * bs`. In union terms it is the size of the *result*, not the number of lists
+combined: unioning `R` fine selections of `k` blocks each gives `k <= u <= R*k`.
+
+Cost is **not** a function of `u` alone, which is why the linear fit failed at short context.
+It is a function of two things `u` determines: the KV chunk count and the effective KV length.
+`n_kv_blocks(u)` is deterministic — it is what `hmx_fa_find_chunk_size` returns, and it can be
+computed on the host without touching the device:
+
+```
+kv      = u * bs
+cap     = align_down((kv - 1) / (FA_MIN_KV_BLOCKS - 1), bs)     # pipelined
+m       = max{ m : m | u,  m <= FA_SPARSE_MAX_M,  m*bs <= cap }
+n_kv_blocks = ceil(kv / (m*bs))
+```
+
+Fitting the seven measured pipelined points against that:
+
+```
+cost(u) = 121 + 161 * n_kv_blocks(u) + 0.554 * kv_eff(u)      µs, nb=512
+```
+
+| u | m | chunks | kv_eff | measured | predicted | err |
+|--:|--:|--:|--:|--:|--:|--:|
+| 3 | 1 | 3 | 192 | 746 | 710 | −4.9% |
+| 4 | 1 | 4 | 256 | 927 | 906 | −2.3% |
+| 5 | 1 | 5 | 320 | 1112 | 1102 | −0.9% |
+| 6 | 2 | 3 | 384 | 784 | 816 | +4.1% |
+| 7 | 1 | 7 | 448 | 1492 | 1494 | +0.1% |
+| 8 | 2 | 4 | 512 | 985 | 1048 | +6.4% |
+| 16 | 4 | 4 | 1024 | 1360 | 1331 | −2.1% |
+
+`R² = 0.984`, max error 6.4%. **Held out** — the five real two-way unions measured at
+`kv=2048, bq=128` (multiply by the 1.514× tax), none of which was used in the fit:
+
+| u | chunks | predicted | measured | err |
+|--:|--:|--:|--:|--:|
+| 16 | 4 | 2015 | 2153 | +6.8% |
+| 14 | 7 | 2638 | 2454 | −7.0% |
+| 12 | 3 | 1557 | 1651 | +6.0% |
+| 10 | 5 | 1937 | 1806 | −6.7% |
+| 8 | 4 | 1586 | 1486 | −6.3% |
+
+Within ±7% everywhere, **including `u = 14`, which the naive `610 + 46.9u` line missed by
+28%.** The sawtooth is not noise and not a special case; it is `n_kv_blocks` moving.
+
+Two coefficients worth reading:
+
+- **161 µs per KV chunk.** This is a *fixed* cost per chunk, independent of how much KV the
+  chunk holds — the fork/join and HMX-queue handoff structure priced in
+  `flash-attn-htp-anatomy.md`. It arrives independently at the `~190 µs` figure already
+  recorded in `flash-attn-ops.h:401` from a different measurement. At `u=7` you pay it seven
+  times (1127 of 1492 µs); at `u=6` three times (483 of 784). **That is the whole sawtooth.**
+- **0.554 µs per KV row** is the actual streaming and arithmetic — a third of the cost at
+  `u=16`, and under a fifth at `u=3`.
+
+Below three chunks the model does not apply at all: `u=2` gives one chunk, one thread, no
+pipeline, and costs **3.85×** what the pipelined fit predicts.
+
+So the design rule is mechanical. Enumerate `u`, compute `n_kv_blocks(u)`, and take the
+smallest `u` meeting the quality budget that also minimises `161*n_kv_blocks + 0.554*u*bs`.
+For `bs=64` the good sizes are those with a divisor near `u/3`: 3, 6, 8, 12, 16, 24, 32 —
+and the ones to avoid are the primes and near-primes: 5, 7, 11, 13, 14.
