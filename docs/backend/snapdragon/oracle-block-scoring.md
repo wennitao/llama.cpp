@@ -117,3 +117,62 @@ target.
   ratio is not a claim about accuracy; it is a claim about mass.
 - **`bs = 64` on both axes**, matching the kernel. The block-size surface is measured
   separately in `block-selection-overlap.md`.
+
+## meanpool on the NPU
+
+Implemented as `test_meanpool_block` and measured on SM8750. 2/2 against CPU, zero
+`NO-SUPPORT` fallbacks. `bs=64`, `Hq=16`, `Hkv=8`, `d=128`, K arriving pre-pooled (its block
+means are a cache-write cost, the same amortisation applied to XAttention's K-side reversal).
+
+| Lq | Lk | score | +argsort | **selection leg** | K pooled inline | extra | XAttention | cheaper by |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 512 | 2048 | 664 | 33 | **697** | 1515 | +817 | 1553 | 2.23× |
+| 2048 | 2048 | 2383 | 56 | **2440** | 3205 | +766 | 4652 | 1.91× |
+| 512 | 4096 | 656 | 46 | **702** | 2143 | +1440 | 2530 | **3.60×** |
+| 2048 | 4096 | 2362 | 82 | **2444** | 3837 | +1393 | 7477 | **3.06×** |
+
+All values whole-graph minus the ~620 µs per-call constant.
+
+**meanpool is 1.9–3.6× cheaper than the XAttention scorer** at the same shapes, and the
+argsort is free (33–82 µs) as it is for every block-granularity selector.
+
+### But the cost is reading Q, not scoring it
+
+Two readings of the table matter more than the ratio:
+
+- **The cost does not depend on `Lk` at all.** 702 µs at Lk=4096 against 697 at Lk=2048 — a
+  2× cache for 0.7% more time. The matmul is 4.19 MFLOP; it is invisible.
+- **The cost scales with `Lq`.** 702 → 2444 µs for a 4× chunk.
+
+So essentially all of it is the Q block-mean: a halving-add tree over the token axis, touching
+every element of a `[d, Lq, Hq]` tensor about twice. The 512× FLOP advantage over XAttention
+buys only 1.9–3.6×, because neither scorer was ever FLOP-bound — this backend charges for
+*touching Q*, and meanpool touches all of it.
+
+Pooling K inline instead of at cache-write time adds **766–1440 µs**, roughly doubling the
+leg and confirming the amortisation is load-bearing rather than a modelling convenience.
+
+### Which is why it still loses to a subsampled scorer
+
+At Lq=2048, Lk=4096 the selection legs line up as:
+
+| scorer | selection leg | quality (ratio to oracle) |
+|:--|--:|--:|
+| XAttention | 7477 | 99.3–99.5% |
+| **meanpool** | **2444** | **99.1–99.2%** |
+| QUOKA + strided sample + block selection | **690** | not measured at this configuration |
+
+QUOKA-strided is 3.5× cheaper than meanpool for the same reason meanpool is 3× cheaper than
+XAttention: it never reads most of Q. It scores `N_Q = 16` sampled query rows per chunk
+instead of all `Lq`, so its cost is independent of the chunk as well as of the cache.
+
+**The synthesis is the obvious one and is not yet measured: meanpool over a subsample.** Take
+the mean of 4 or 8 rows per block rather than all 64 — an 8–16× cut in the only term that
+costs anything — and check on GPU whether the ratio-to-oracle holds. That is one parameter in
+the harness on each side, and it is the next experiment.
+
+> The `MEANPOOL_E2E` rows are *not* comparable to the QUOKA end-to-end figures: meanpool
+> emits one selection row per 64-token query block, so `op_params[5] = 64` and `Br` is pinned
+> to 64, paying the full 1.9× query-block tax. Merging its score rows over `k` adjacent blocks
+> — the `(k, u)` surface in `block-selection-overlap.md` — is what makes it comparable, and
+> `k = 4` is the optimum there.

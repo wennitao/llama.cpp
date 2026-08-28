@@ -9536,6 +9536,143 @@ struct test_quoka_block : public test_case {
     }
 };
 
+// MEANPOOL: block-mean of Q dotted with block-mean of K, driving the block selection.
+//
+// On GPU this measured within 0.2 points of XAttention's ratio-to-oracle on average and
+// 0.9 at its worst, across two architectures and 11 RULER/LongBench datasets
+// (docs/backend/snapdragon/oracle-block-scoring.md). It is by far the cheapest scorer that
+// uses the data at all: one d-vector per block per side, and a matmul of
+// [d, NBq, Hkv] x [d, NBk, Hkv] -- 4.2 MFLOP at Lq=2048/Lk=4096 against XAttention's
+// 2.15 GFLOP, a 512x reduction. No antidiagonal reversal, no softmax, and no reduction
+// over 4-element rows.
+//
+// The one thing that is NOT obviously cheaper is the pooling itself. Both means reduce over
+// the TOKEN axis, which is ne1, and ggml only reduces ne0 -- reaching it needs a transposing
+// cont, which this backend rejects for these shapes. So the mean is a halving-add tree:
+// log2(Bl) steps whose sizes fall geometrically, ~2x the input in reads. Against
+// XAttention's reversal, which is a single gather of the same tensor at 31.5 GB/s, that is
+// not a free win, and measuring it is the point of this arm.
+//
+// kmean=false models the deployable form: K's block means are computed once when K is
+// written to the cache and read by every later chunk, exactly the amortisation argument
+// applied to XAttention's K-side reversal and QUOKA's K normalisation.
+struct test_meanpool_block : public test_case {
+    const int64_t d, Hq, Hkv, Lq, Lk, Bl, u;
+    const int     stage;   // 0 = block scores, 1 = selection, 2 = end-to-end with FA
+    const bool    kmean;   // true = pool K inline, false = K arrives pre-pooled
+
+    int64_t G()   const { return Hq / Hkv; }
+    int64_t NBq() const { return Lq / Bl; }
+    int64_t NBk() const { return Lk / Bl; }
+
+    std::string op_desc(ggml_tensor *) override {
+        return stage == 0 ? "MEANPOOL_SCORE" : stage == 1 ? "MEANPOOL_SELECT" : "MEANPOOL_E2E";
+    }
+    std::string vars() override { return VARS_TO_STR9(d, Hq, Hkv, Lq, Lk, Bl, u, stage, kmean); }
+
+    bool run_whole_graph()  override { return true; }
+    bool perf_whole_graph() override { return true; }
+    double max_nmse_err()   override { return 5e-4; }
+
+    uint64_t op_flops(ggml_tensor *) override {
+        const uint64_t score = 2ull * Hkv * NBq() * NBk() * d;
+        const uint64_t fa    = stage == 2 ? 2ull * Hq * Lq * (2 * d) * (uint64_t) (u * Bl) : 0;
+        return score + fa;
+    }
+
+    test_meanpool_block(int64_t d = 128, int64_t Hq = 16, int64_t Hkv = 8, int64_t Lq = 512,
+                        int64_t Lk = 4096, int64_t Bl = 64, int64_t u = 16,
+                        int stage = 0, bool kmean = false)
+        : d(d), Hq(Hq), Hkv(Hkv), Lq(Lq), Lk(Lk), Bl(Bl), u(u), stage(stage), kmean(kmean) {}
+
+    // Sum over ne1 by halving. Both halves are contiguous blocks at the natural stride, so
+    // every step is a plain elementwise add on non-permuted operands -- the one shape this
+    // backend's binary ops accept without falling back.
+    static ggml_tensor * halve_ne1(ggml_context * ctx, ggml_tensor * a, int64_t n) {
+        for (; n > 1; n /= 2) {
+            ggml_tensor * lo = ggml_view_4d(ctx, a, a->ne[0], n/2, a->ne[2], a->ne[3],
+                                            a->nb[1], a->nb[2], a->nb[3], 0);
+            ggml_tensor * hi = ggml_view_4d(ctx, a, a->ne[0], n/2, a->ne[2], a->ne[3],
+                                            a->nb[1], a->nb[2], a->nb[3], (size_t) (n/2) * a->nb[1]);
+            a = ggml_cont(ctx, ggml_add(ctx, lo, hi));
+        }
+        return a;
+    }
+    static ggml_tensor * halve_ne2(ggml_context * ctx, ggml_tensor * a, int64_t n) {
+        for (; n > 1; n /= 2) {
+            ggml_tensor * lo = ggml_view_4d(ctx, a, a->ne[0], a->ne[1], n/2, a->ne[3],
+                                            a->nb[1], a->nb[2], a->nb[3], 0);
+            ggml_tensor * hi = ggml_view_4d(ctx, a, a->ne[0], a->ne[1], n/2, a->ne[3],
+                                            a->nb[1], a->nb[2], a->nb[3], (size_t) (n/2) * a->nb[2]);
+            a = ggml_cont(ctx, ggml_add(ctx, lo, hi));
+        }
+        return a;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_ASSERT(Hq % Hkv == 0 && xattn_is_pow2(G()));
+        GGML_ASSERT(Lq % Bl == 0 && Lk % Bl == 0 && xattn_is_pow2(Bl));
+        GGML_ASSERT(Bl >= 64 && Bl % 64 == 0);
+        GGML_ASSERT(u >= 1 && u <= NBk() && Lk >= Lq);
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, Lq, Hq, 1);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, Lk, Hkv, 1);
+        ggml_set_name(k, "k");
+
+        // Q: mean over the Bl rows of each block, then over the G query heads sharing a KV
+        // head. Both scales fold into one, and into the 1/sqrt(d) below.
+        ggml_tensor * q4 = ggml_reshape_4d(ctx, q, d, Bl, NBq(), Hq);
+        ggml_tensor * qm = halve_ne1(ctx, q4, Bl);                         // [d,1,NBq,Hq]
+        qm = ggml_reshape_4d(ctx, qm, d, NBq(), G(), Hkv);
+        qm = halve_ne2(ctx, qm, G());                                      // [d,NBq,1,Hkv]
+        qm = ggml_reshape_3d(ctx, qm, d, NBq(), Hkv);
+        qm = ggml_scale(ctx, qm, 1.0f / ((float) Bl * (float) G() * sqrtf((float) d)));
+        ggml_set_name(qm, "meanpool_q");
+
+        // K: pooled inline, or arriving already pooled from the cache-write path.
+        ggml_tensor * km;
+        if (kmean) {
+            ggml_tensor * k4 = ggml_reshape_4d(ctx, k, d, Bl, NBk(), Hkv);
+            km = ggml_reshape_3d(ctx, halve_ne1(ctx, k4, Bl), d, NBk(), Hkv);
+        } else {
+            km = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, NBk(), Hkv, 1);
+            ggml_set_name(km, "k_pooled");
+        }
+
+        ggml_tensor * sc = ggml_mul_mat(ctx, km, qm);                      // [NBk,NBq,Hkv]
+        ggml_mul_mat_set_prec(sc, GGML_PREC_F32);
+        ggml_set_name(sc, "meanpool_scores");
+        ggml_tensor * mr = ggml_reshape_4d(ctx, sc, NBk(), NBq(), Hkv, 1);
+        if (stage == 0) {
+            return mr;
+        }
+
+        // Selection: same contract as every other scorer here -- sink/diagonal bias, full
+        // argsort, strided view of the first u.
+        ggml_tensor * bias = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, NBk(), NBq(), 1, 1);
+        ggml_set_name(bias, "xattn_bias");
+        ggml_tensor * scores = ggml_add(ctx, mr, bias);
+        ggml_tensor * ranked = ggml_argsort(ctx, scores, GGML_SORT_ORDER_DESC);
+        ggml_set_name(ranked, "meanpool_ranked");
+        ggml_tensor * sel = ggml_view_4d(ctx, ranked, u, NBq(), Hkv, 1,
+                                         ranked->nb[1], ranked->nb[2], ranked->nb[3], 0);
+        if (stage == 1) {
+            return ranked;
+        }
+
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, Lk, Hkv, 1);
+        ggml_set_name(v, "v");
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f/sqrtf((float) d), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        out->src[5]       = sel;
+        out->op_params[4] = (int32_t) Bl;
+        out->op_params[5] = (int32_t) Bl;      // per-query-block: one sel row per Bl queries
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_flash_attn_ext_gather : public test_case {
     const int64_t hs;      // head size (DK == DV)
     const int64_t nh;      // number of KV heads
@@ -12778,6 +12915,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_xattn_select(128, 2, 2, 256, 1024, 8, 64, /*R=*/2, 8, /*stage=*/2, plant));
     }
 
+    test_cases.emplace_back(new test_meanpool_block(128, 4, 2, 128,  512, 64, 4, /*stage=*/0, /*kmean=*/false));
+    test_cases.emplace_back(new test_meanpool_block(128, 8, 2, 256, 1024, 64, 8, /*stage=*/0, /*kmean=*/true));
+
     // The QUOKA-scored BLOCK selection. Stage 0 only: stage 1 adds an argsort whose ties
     // are backend-dependent, and stage 2's src[5] is invisible to the CPU reference.
     test_cases.emplace_back(new test_quoka_block(128, 4, 2, 128,  512, 16, 64, 4, /*stage=*/0, /*blk_max=*/true,  /*subsel=*/0));
@@ -14030,6 +14170,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, 512, 64, u, /*mask=*/false,
                                                                        /*per_head_sel=*/true, 64*k, /*per_qblock=*/true));
             }
+        }
+    }
+
+    // MEANPOOL against the XAttention and QUOKA scorers already measured, same shapes.
+    // kmean=0 is the deployable form (K pooled at cache-write time); kmean=1 prices doing
+    // it inline so the amortisation is measured rather than assumed.
+    for (int kv : { 2048, 4096 }) {
+        const int u = kv / 64 / 4;
+        for (int lq : { 512, 2048 }) {
+            if (lq > kv) {
+                continue;
+            }
+            for (int st = 0; st <= 2; st++) {
+                test_cases.emplace_back(new test_meanpool_block(128, 16, 8, lq, kv, 64, u, st, /*kmean=*/false));
+            }
+            test_cases.emplace_back(new test_meanpool_block(128, 16, 8, lq, kv, 64, u, /*stage=*/1, /*kmean=*/true));
         }
     }
 
