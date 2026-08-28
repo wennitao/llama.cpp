@@ -420,3 +420,57 @@ Three qualifications, and the last one is specific to *naive* union:
    whatever `u` the data gives, per query block and per KV head, so it will land on bad
    divisors routinely. Any deployment must **round the union up** to a divisor-friendly size,
    which erodes part of the 1.49×.
+
+### Short context: the model breaks, and the sawtooth dominates
+
+`cost_shared(u) = 610 + 46.9u` must not be extrapolated below its `u = 8..16` calibration.
+Measured directly (`nb=512`, `bs=64`, shared selection, device `eb49fb9d`, whose dense rows
+match the other units to 0.5%):
+
+| u | kv_eff | µs | what the chunk rule gives |
+|--:|--:|--:|:--|
+| 2 | 128 | **1360** | below `FA_MIN_KV_BLOCKS*64` → 1 thread, no pipeline |
+| 3 | 192 | **746** | `m=1` → 3 chunks, 6 threads — the fastest point measured |
+| 4 | 256 | 927 | 4 chunks |
+| 5 | 320 | 1112 | prime → 5 chunks |
+| 6 | 384 | **784** | 3 or 6 chunks |
+| 7 | 448 | **1492** | prime → 7 chunks |
+
+The curve is **not monotone in the work done**. `u=6` costs 784 µs and `u=7` costs 1492 —
+17% more work for 90% more time. `u=5` costs 1112 and `u=6` costs 784 — 20% more work for
+30% *less* time. The fit would have predicted 704/751/798/845/892/938.
+
+The per-query-block tax, by contrast, is completely stable across all of them and matches the
+long-context values: **1.10–1.16× at `bq=256`, 1.43–1.53× at `bq=128`, 1.78–1.89× at `bq=64`.**
+It is a property of the schedule, not of the shape.
+
+### Against dense at short context
+
+Dense `nb=512`: kv=512 → 933 µs, kv=1024 → 1244 µs.
+
+| kv | u | density | shared | **vs dense** | bq=256 | bq=128 | bq=64 |
+|--:|--:|--:|--:|--:|--:|--:|--:|
+| 512 | 2 | 25% | 1360 | **0.69×** | 0.66× | 0.62× | 0.55× |
+| 512 | **3** | 37.5% | **746** | **1.25×** | 1.12× | 0.88× | 0.70× |
+| 512 | 4 | 50% | 927 | 1.01× | 0.89× | 0.68× | 0.55× |
+| 1024 | 4 | 25% | 930 | **1.34×** | 1.19× | 0.90× | 0.73× |
+| 1024 | 5 | 31% | 1113 | 1.12× | 0.97× | 0.74× | 0.60× |
+| 1024 | **6** | 37.5% | **784** | **1.59×** | 1.45× | 1.08× | 0.85× |
+| 1024 | 7 | 44% | 1492 | 0.83× | 0.72× | 0.54× | 0.44× |
+
+**At kv=512, selecting *more* blocks is both faster and better.** `u=3` beats `u=2` by 1.82×
+while being a strict superset — 37.5% density is 1.25× dense where 25% density is 0.69×. The
+25% budget is simply on the wrong side of the threading cliff.
+
+**At kv=1024 the best point is `u=6`, not the nominal `u=4`**: 1.59× against 1.34×, again
+for *more* selected KV.
+
+**Per-query-block loses to dense everywhere below kv=2048.** The best `bq=64` cell in the
+whole table is 0.85×. A faithful XAttention query block is not deployable at short context on
+this kernel at any density.
+
+So the short-context rule is the opposite of the intuition the long-context tables build: do
+not shrink the budget. Pick the smallest `u` that is **≥ 3 blocks and has a divisor ≤ 8 that
+leaves 3–6 chunks**, and take the extra density for free. For a naive union this is a
+sharper constraint than the density penalty itself — the union hands you `u = 2.4` or `6.7`,
+and rounding to 3 or to 6 is the difference between 1.25× and 0.83×.

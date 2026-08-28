@@ -13949,6 +13949,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // ---------------------------------------------------------------------------------
+    // SHORT CONTEXT, measured rather than modelled. The cost_shared(u) = 610 + 46.9u fit in
+    // block-selection-overlap.md was calibrated at u=8 and u=16 and must NOT be extrapolated
+    // down: 25% of kv=512 is u=2, i.e. kv_eff=128, below FA_MIN_KV_BLOCKS*64 = 192, where
+    // the kernel loses five of six threads and the pipeline (ggml-hexagon.cpp:2139). The fit
+    // predicts 704 us there; the measured value is ~1365. The curve is not even monotone --
+    // u=2 costs MORE than u=4 -- so every short-context point has to come from the device.
+    //
+    // n_sel spans the union sizes R = 1..8 implies at these contexts: k=2 grows to 2.4/2.8/3.3
+    // at kv=512, and k=4 grows to 4.7/5.6/6.7 at kv=1024.
+    for (int kv : { 512, 1024 }) {
+        const int lo = kv / 64 / 4;                      // 25% fine density: 2 or 4
+        for (int u = lo; u <= lo + 3; u++) {
+            if (u > kv / 64) {
+                continue;
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, 512, 64, u, /*mask=*/false));
+            for (int bq : { 64, 128, 256 }) {
+                test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, 512, 64, u, /*mask=*/false,
+                                                                       /*per_head_sel=*/true, bq, /*per_qblock=*/true));
+            }
+        }
+    }
+
     // Attribute the per-query-block penalty. The MAC count is identical across every
     // row here -- only the SCHEDULE changes -- so any difference is tiling cost alone.
     //
