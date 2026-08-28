@@ -176,3 +176,66 @@ the harness on each side, and it is the next experiment.
 > to 64, paying the full 1.9× query-block tax. Merging its score rows over `k` adjacent blocks
 > — the `(k, u)` surface in `block-selection-overlap.md` — is what makes it comparable, and
 > `k = 4` is the optimum there.
+
+## The strided sample, and what a chunk-wide selection costs
+
+Two configurations the NPU work depends on had never been measured for quality: the
+**evenly spaced query sample** that replaced QUOKA's cosine ranking, and the **chunk-wide
+selection** that makes `Br` large. Both are measured here, plus `meanpool_s8` — meanpool over
+8 sampled rows per block instead of all 64, the synthesis the NPU cost model pointed at.
+
+`merge = k` collapses `k` adjacent query blocks onto one shared list, as a chunk-wide
+selection does. The oracle is merged too (by summed mass — the best list a group could
+share), so a merged scorer is not charged for coarsening twice. Recall is still scored per
+original query block against that block's own mass.
+
+Ratio to the merged oracle, 11 datasets × 4 densities, all layers, 2 instances:
+
+| | | Qwen3-1.7B | | | | Llama-3.2-1B | | | |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| k | oracle | xattn | meanpool | **meanpool_s8** | **quoka_str** | xattn | meanpool | **meanpool_s8** | **quoka_str** |
+| 1 | .899/.905 | 99.3% | 99.1% | **99.0%** | 96.8% | 99.5% | 99.2% | **99.2%** | 98.8% |
+| 4 | .892/.898 | 99.4% | 99.1% | **99.0%** | 97.3% | 99.5% | 99.4% | **99.3%** | 98.9% |
+| 32 | .786/.803 | 92.6% | 92.5% | 92.4% | 92.0% | 95.1% | 95.1% | 95.1% | 94.9% |
+
+### 1. Subsampling Q is free
+
+`meanpool_s8` reads **1/8 of Q** and lands within **0.1–0.2 points** of full meanpool on both
+models at every merge factor. On the NPU meanpool's entire cost is the Q block-mean — 702 µs
+at Lq=512 and 2444 at Lq=2048, independent of `Lk` — so this is an ~8× cut in the only term
+that costs anything, for no measurable quality.
+
+### 2. The strided sample beats QUOKA's own ranking
+
+`quoka_str` scores **96.8% against QUOKA's 95.8%** on Qwen3 and **98.8% against 98.5%** on
+Llama. Replacing the cosine-dissimilarity query selection with an evenly spaced sample was
+adopted purely because it made the scorer chunk-independent (15227 → 1399 µs); it turns out
+to be *better*, on both architectures. The paper's central claim — that low
+cosine-similarity-to-mean queries are the informative ones — does not reproduce as a ranking
+signal at block granularity here.
+
+### 3. Chunk-wide selection is a density decision, and this is the number that was missing
+
+Merging is nearly free at `k = 4` — the oracle loses 0.7 points of absolute recall — which is
+exactly where the `(k, u)` cost surface puts its optimum. At `k = 32` it depends entirely on
+the budget:
+
+| density | u | oracle recall, k=1 | oracle recall, k=32 | best scorer @ k=32 |
+|--:|--:|--:|--:|--:|
+| 6.25% | 8 | 0.842 | **0.608** | 84.4% |
+| 12.5% | 16 | 0.884 | **0.740** | 87.8% |
+| 25% | 32 | 0.922 | **0.878** | 98.4% |
+| 50% | 64 | 0.958 | 0.933 | 100.7% |
+
+Thirty-two query blocks sharing one list of 8 blocks cannot serve them all: the oracle itself
+falls from 0.842 to 0.608. By 25% the union fits and the loss is 4.4 points; by 50% it is
+2.5. **The 2.67× end-to-end NPU result uses chunk-wide selection at 25% density**, so it sits
+in the benign part of this curve — but it costs 4.4 points of absolute recall, and the same
+configuration at 6.25% would lose 23.
+
+**And at `k = 32` the scorer stops mattering** — all seven land within 1.2 points of each
+other. If the selection is going to be chunk-wide, use the cheapest scorer available; the
+coarsening dominates everything the scorer could contribute.
+
+> `xattn` at 100.7% is not an error: the merged oracle ranks by *summed* mass over the group,
+> which is not optimal for per-block recall, so a scorer can occasionally beat it.

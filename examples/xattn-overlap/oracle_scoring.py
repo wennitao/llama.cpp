@@ -229,7 +229,47 @@ def sc_random(q, k, bs, **kw):
     g = torch.Generator(device=q.device); g.manual_seed(0)
     return torch.rand(NB, Hkv, NB, device=q.device, generator=g)
 
-SCORERS = {'xattn': sc_xattn, 'quoka': sc_quoka, 'meanpool': sc_meanpool,
+def sc_quoka_strided(q, k, bs, NQ=16, **kw):
+    """QUOKA with the cosine query ranking replaced by an evenly spaced sample.
+
+    This is the configuration that wins on the NPU (690 us against meanpool's 2444 and
+    XAttention's 7477 at Lq=2048/Lk=4096), because it never reads most of Q. Its cost is
+    independent of both the chunk and the cache. Its QUALITY has never been measured --
+    that is what this scorer exists for. It keeps QUOKA's l2 normalisation, GQA
+    pre-aggregation and max-over-queries, and discards only the claim that low
+    cosine-similarity-to-mean queries are the informative ones.
+    """
+    Hq, T, d = q.shape; Hkv = k.shape[0]; G = Hq // Hkv; NB = _blocks(T, bs)
+    kn = torch.nn.functional.normalize(k.float(), dim=-1)
+    out = torch.empty(NB, Hkv, NB, device=q.device, dtype=torch.float32)
+    step = max(1, bs // NQ)
+    for bi in range(NB):
+        s, e = bi * bs, min((bi + 1) * bs, T)
+        sel = q[:, s:e:step, :].float()                              # [Hq,<=NQ,d]
+        sel = torch.nn.functional.normalize(sel, dim=-1)
+        qbar = sel.view(Hkv, G, -1, d).mean(1)
+        sc = torch.einsum('hnd,hmd->hnm', qbar, kn)
+        pad = NB * bs - T
+        if pad: sc = torch.nn.functional.pad(sc, (0, pad), value=-1e30)
+        out[bi] = sc.view(Hkv, -1, NB, bs).amax(-1).amax(1)
+    return out
+
+def sc_meanpool_sub(q, k, bs, QSUB=8, **kw):
+    """meanpool over a subsample: mean of QSUB evenly spaced rows per block, not all bs.
+
+    The synthesis the NPU numbers point at -- meanpool's cost is entirely reading Q, so
+    reading 1/8 of it is an 8x cut in the only term that costs anything.
+    """
+    Hq, T, d = q.shape; Hkv = k.shape[0]; G = Hq // Hkv; NB = _blocks(T, bs)
+    pad = NB * bs - T
+    qz = torch.nn.functional.pad(q.float(), (0, 0, 0, pad))
+    kz = torch.nn.functional.pad(k.float(), (0, 0, 0, pad))
+    step = max(1, bs // QSUB)
+    qb = qz.view(Hkv, G, NB, bs, d)[:, :, :, ::step, :].mean(3).mean(1)   # [Hkv,NB,d]
+    kb = kz.view(Hkv, NB, bs, d).mean(2)
+    return torch.einsum('hnd,hmd->hnm', qb, kb).permute(1, 0, 2).contiguous() / math.sqrt(d)
+
+SCORERS = {'xattn': sc_xattn, 'quoka_str': sc_quoka_strided, 'meanpool_s8': sc_meanpool_sub, 'quoka': sc_quoka, 'meanpool': sc_meanpool,
            'maxpool': sc_maxpool, 'recent': sc_recent, 'random': sc_random}
 
 
@@ -253,6 +293,25 @@ def force_sink_diag(scores):
 
 
 # ------------------------------------------------------------------------- evaluation
+
+def merge_rows(scores, k, how='amax'):
+    """Collapse k adjacent query blocks onto one shared list, as a chunk-wide selection does.
+
+    The merged row must serve every block in the group, so its causal reach is the LAST
+    block's -- earlier queries simply mask the extra blocks off, which is what the kernel
+    does anyway. Recall is still scored per original query block against that block's own
+    mass, so this measures exactly what coarsening costs.
+    """
+    if k <= 1:
+        return scores
+    NBq, Hkv, NBk = scores.shape
+    pad = (-NBq) % k
+    if pad:
+        scores = torch.cat([scores, scores[-1:].expand(pad, -1, -1)], 0)
+    g = scores.view(-1, k, Hkv, NBk)
+    m = g.amax(1) if how == 'amax' else g.sum(1)
+    return m.repeat_interleave(k, dim=0)[:NBq]
+
 
 def recall_at(scores, mass, rows, u, bs, slack=2.0):
     """Fraction of true mass captured by the top-u blocks of `scores`.
@@ -291,6 +350,8 @@ def main():
     ap.add_argument('--densities', type=float, nargs='*', default=[0.0625, 0.125, 0.25, 0.5])
     ap.add_argument('--force', type=int, default=1)
     ap.add_argument('--slack', type=float, default=2.0)
+    ap.add_argument('--merge', type=int, nargs='*', default=[1],
+                    help='k adjacent query blocks sharing one list (1 = per-block)')
     ap.add_argument('--out', default='oracle_scoring.json')
     a = ap.parse_args()
 
@@ -315,34 +376,42 @@ def main():
                     sc[n] = f(q, k, a.bs)
                 if a.force:
                     sc = {n: (v if n == 'oracle' else force_sink_diag(v)) for n, v in sc.items()}
-                for dens in a.densities:
-                    u = max(1, int(round(dens * NB)))
-                    r = {n: recall_at(v, mass, rows, u, a.bs, a.slack) for n, v in sc.items()}
-                    if r['oracle'] != r['oracle'] or r['oracle'] <= 0:
-                        continue
-                    for n, v in r.items():
-                        acc.setdefault((spec, dens, n), []).append(v / r['oracle'])
-                        absacc.setdefault((spec, dens, n), []).append(v)
+                for mk in a.merge:
+                    # The oracle is merged too, by SUM of mass -- the best list a group of
+                    # k blocks could share. Comparing a merged scorer against the per-block
+                    # oracle would charge it for coarsening twice.
+                    scm = {n: merge_rows(v, mk, 'sum' if n == 'oracle' else 'amax')
+                           for n, v in sc.items()}
+                    for dens in a.densities:
+                        u = max(1, int(round(dens * NB)))
+                        r = {n: recall_at(v, mass, rows, u, a.bs, a.slack) for n, v in scm.items()}
+                        if r['oracle'] != r['oracle'] or r['oracle'] <= 0:
+                            continue
+                        key = (spec, dens, mk)
+                        for n, v in r.items():
+                            acc.setdefault(key + (n,), []).append(v / r['oracle'])
+                            absacc.setdefault(key + (n,), []).append(v)
                 del mass, rows, sc
                 torch.cuda.empty_cache()
             print(f'  doc {di} (T={T}) done', flush=True)
 
     names = ['oracle'] + list(SCORERS)
     print(f'\n=== {a.model}, bs={a.bs}, T={a.tokens}, mean over layers x instances ===')
-    hdr = f"{'dataset':<26}{'dens':>7}{'oracle':>8}" + ''.join(f'{n:>10}' for n in names[1:])
+    hdr = f"{'dataset':<22}{'merge':>5}{'dens':>6}{'oracle':>8}" + ''.join(f'{n:>12}' for n in names[1:])
     print(hdr); print('-' * len(hdr))
     for spec in a.data:
+      for mk in a.merge:
         for dens in a.densities:
-            k0 = (spec, dens, 'oracle')
+            k0 = (spec, dens, mk, 'oracle')
             if k0 not in absacc: continue
             o = sum(absacc[k0]) / len(absacc[k0])
-            cells = ''.join(f'{100*sum(acc[(spec,dens,n)])/len(acc[(spec,dens,n)]):9.1f}%'
+            cells = ''.join(f'{100*sum(acc[(spec,dens,mk,n)])/len(acc[(spec,dens,mk,n)]):9.1f}%'
                             for n in names[1:])
-            print(f'{spec:<26}{dens:>7}{o:>8.3f}{cells}')
+            print(f'{spec:<22}{"k="+str(mk):>5}{dens:>6}{o:>8.3f}{cells}')
     out = {'model': a.model, 'T': a.tokens, 'bs': a.bs, 'force': a.force,
-           'ratio': {f'{s}|{d}|{n}': sum(v)/len(v) for (s,d,n), v in acc.items()},
-           'recall': {f'{s}|{d}|{n}': sum(v)/len(v) for (s,d,n), v in absacc.items()},
-           'n': {f'{s}|{d}|{n}': len(v) for (s,d,n), v in acc.items()}}
+           'ratio': {f'{s}|{d}|{m}|{n}': sum(v)/len(v) for (s,d,m,n), v in acc.items()},
+           'recall': {f'{s}|{d}|{m}|{n}': sum(v)/len(v) for (s,d,m,n), v in absacc.items()},
+           'n': {f'{s}|{d}|{m}|{n}': len(v) for (s,d,m,n), v in acc.items()}}
     json.dump(out, open(a.out, 'w'), indent=1)
     print(f'\nwrote {a.out}')
 
