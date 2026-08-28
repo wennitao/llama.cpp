@@ -1,8 +1,8 @@
 # Sparse attention on the Hexagon HTP: vocabulary, constants, and the deployment table
 
 Entry point for the block-sparse attention work. Everything here is measured on SM8750 /
-Hexagon v79 (6 HVX threads, 1 HMX unit, 8 MB VTCM) across four physical units, whose dense
-reference rows agree to within 1.4%. The detailed studies are indexed at the end.
+Hexagon v79 (6 HVX threads, 1 HMX unit, 8 MB VTCM) across four physical units. Where units were
+cross-checked, dense reference rows agree to within **0.5%** and scoring rows to within 1.4%. The detailed studies are indexed at the end.
 
 ## 1. Vocabulary
 
@@ -12,10 +12,10 @@ confusion in this project traced to conflating two of them.
 | symbol | what it is | set by | typical |
 |:--|:--|:--|:--|
 | `bs` (= `Bl`, `Bk`) | **KV block** the selection *names* | `op_params[4]` | 64 |
-| `bq` | **query block** one selection list *serves* | `op_params[5]`; `0` = chunk-wide | 0, 64…512 |
+| `bq` | **query block** one selection list *serves* | `op_params[5]`, where `0` means **"same as `bs`"**, *not* chunk-wide | 64…512 |
 | `k` | query blocks merged under one list; `bq = k·bs` | the scorer | 1, 2, 4, 8 |
 | `u` | **size of the selection list**, `sel->ne[0]` | the scorer | 3…32 |
-| `Br` | kernel's **query tile** height | chunk-size search; pinned to `bq` when `bq≠0` | 64…1152 |
+| `Br` | kernel's **query tile** height | chunk-size search; pinned to `bq` when the selection is per-query-block | 64…1152 |
 | `Bc` | kernel's **KV chunk** width, `= m·bs` | chunk-size search | 64…512 |
 
 Two derived quantities do all the work:
@@ -38,9 +38,18 @@ for each query tile (Br rows):
 n_kv_blocks = kv_eff / Bc = u / m
 m = largest divisor of u with m <= FA_SPARSE_MAX_M (8) and m*bs <= Bc_cap
 ```
-`m` must **divide** `u` or the last chunk is ragged and the staging buffers carry stale rows;
-`Bc_cap` is derived so `n_kv_blocks >= FA_MIN_KV_BLOCKS` (3) and the pipeline can run
-([flash-attn-ops.h:436-446](../../../ggml/src/ggml-hexagon/htp/flash-attn-ops.h#L436)).
+`m` must **divide** `u` or the last chunk is ragged and the staging buffers carry stale rows
+([flash-attn-ops.h:440-446](../../../ggml/src/ggml-hexagon/htp/flash-attn-ops.h#L440)). The cap
+on `Bc` is derived so `n_kv_blocks >= FA_MIN_KV_BLOCKS` (3) and the pipeline can run —
+`Bc_search = align_down((kv_len-1)/(FA_MIN_KV_BLOCKS-1), 64)`
+([flash-attn-ops.h:396-406](../../../ggml/src/ggml-hexagon/htp/flash-attn-ops.h#L396)). Note the
+kernel's own `bc_cap` argument is a *different* bound, `min(u, FA_SPARSE_MAX_M)*bs`.
+
+> **Chunk-wide is a property of `sel`, not of `op_params[5]`.** `ggml_hexagon_fa_sparse_bq`
+> resolves `0` to `bs` ([:1981-1987](../../../ggml/src/ggml-hexagon/ggml-hexagon.cpp#L1981)), and
+> `br_align` is gated on `sel->ne[1] > 1` ([:2120](../../../ggml/src/ggml-hexagon/ggml-hexagon.cpp#L2120)).
+> A scorer that emits `op_params[5] = 0` *with* a query-block axis gets `Br` pinned to 64 — the
+> most expensive configuration in this document — and it fails silently.
 
 ## 2. Measured constants
 
@@ -96,27 +105,35 @@ The harness counts *useful* FLOPs (selected blocks only), so these are real rate
 
 | kv | kv_eff | attn µs | GFLOP | TF/s | dense @ full kv | dense @ `kv_eff` | **% of ceiling** |
 |--:|--:|--:|--:|--:|--:|--:|--:|
-| 512 | 128 | 1633 | 0.54 | 0.33 | 2.32 | 0.40 | 83% |
-| 1024 | 256 | 2058 | 2.15 | 1.04 | 3.52 | 1.24 | 84% |
-| 2048 | 512 | 3955 | 8.59 | 2.17 | 4.01 | 2.42 | 90% |
-| 4096 | 1024 | 5276 | 17.18 | **3.26** | 4.31 | 3.43 | **95%** |
+| 512† | 128 | 1633 | 0.54 | 0.33 | 2.32 | 0.40 | 83% |
+| 1024 | 256 | 2058 | 2.15 | 1.04 | 3.52 | 1.25 | 83% |
+| 2048 | 512 | 3955 | 8.59 | 2.17 | 4.01 | 2.46 | 88% |
+| 4096 | 1024 | 5276 | 17.18 | **3.26** | 4.31 | 3.52 | **92%** |
+
+`attn µs` and `dense @ full kv` are the `Qs` arm of the full-method run
+(`quoka-on-htp.md`); `dense @ kv_eff` is the `ideal` column of the fixed-25% run
+(`xattn-scoring.md`) — 1356 / 1715 / 3496 / 4877 µs — the only table covering all four shapes
+at this density. † The kv=512 row is the `u=2` density floor Rule 3 says to override: one
+chunk, one thread, no pipeline. At `u=3` the same shape costs 747 µs.
 
 "% of dense at full `kv`" is the wrong denominator — a sparse kernel does the work of a
 *shorter* KV, and short KV is intrinsically harder to run fast here. Against **dense at the
-same `kv_eff`** the kernel reaches **83–95%**, consistent with the 91–102%-of-ceiling result
+same `kv_eff`** the kernel reaches **83–92%**, consistent with the 91–102%-of-ceiling result
 obtained by a different route in `xattn-scoring.md`. **Block-sparse indexing costs essentially
 nothing; what costs is having less work.**
 
 The query block shows up directly as a rate collapse, identical arithmetic throughout:
 
+All three rows are `kv=2048`, `nb=2048`, `u=16` — 17.18 GFLOP of useful work in every one:
+
 | selection | µs | TF/s |
 |:--|--:|--:|
 | chunk-wide | 5181 | **3.32** |
 | `bq=128` | 8856 | 1.94 |
-| `bq=64` | 10696 | 1.61 |
+| `bq=64` | 10718 | 1.60 |
 
 For scale: dense FA peaks at 4.31 TF/s here, and mllm's GEMM study on the same die puts
-practical HMX fp16 peak near 7 TF/s for a large square, falling to 1.6–2.1 TF/s at `K=128` —
+practical HMX fp16 peak near 7 TF/s for a large square, falling to **0.57–2.1 TF/s** at `K=128` (2.1 at Sq=512, 1.6 at 1024, 0.57–0.61 at 2048–4096) —
 which *is* attention's QK shape. Both FA kernels sit above that because the fused kernel keeps
 the score tile in VTCM instead of round-tripping it.
 
