@@ -13973,6 +13973,46 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // ---------------------------------------------------------------------------------
+    // THE (k, u) GRID: the real deployment surface for a union pipeline.
+    //
+    // The scorer's block size is fixed at 64 on BOTH axes. k adjacent query blocks are
+    // merged and served by ONE list, so the attention query block is bq = k*64 and the
+    // kernel's query tile Br is pinned to it (br_align, flash-attn-ops.h:436). Their
+    // selections union to u KV blocks, which is a data-dependent number the pipeline does
+    // not choose freely -- so what a deployment needs is the whole surface, not a corner.
+    //
+    // Both axes are varied independently here, which is the point: every earlier table
+    // fixed one of them. u spans the sawtooth (primes 5/7/11/13 and the divisor-rich
+    // 8/12/16/24/32) and the realistic union range, since at 25% fine density the union of
+    // k blocks lands near k_fine * {1, 1.18, 1.41, 1.67} for k = 1/2/4/8.
+    //
+    // k = 8 at nb = 512 is bq = nb, i.e. one query block for the whole chunk -- the
+    // chunk-wide case, included so the grid contains its own upper bound.
+    for (int kv : { 2048, 4096 }) {
+        for (int k : { 1, 2, 4, 8 }) {
+            // u comes from the MEASURED union growth, not a synthetic grid:
+            // block-selection-overlap.md's diagonal at B=64 gives u/k_fine = 1.000 / 1.183 /
+            // 1.412 / 1.672 for k = 1 / 2 / 4 / 8 adjacent query blocks. At 25% fine density
+            // (k_fine = NBk/4) that is u = 8.0 / 9.5 / 11.3 / 13.4 at kv=2048 and
+            // 16.0 / 18.9 / 22.6 / 26.8 at kv=4096. Each is measured at both roundings plus
+            // the next divisor-friendly size, because the union is a MEAN -- a deployment
+            // sizes one buffer and rounds, and the sawtooth makes that choice worth pricing.
+            const int uset2048[] = { 8, 9, 10, 11, 12, 13, 14, 16 };
+            const int uset4096[] = { 16, 18, 19, 20, 22, 23, 24, 26, 27, 28, 32 };
+            const int * uset = kv == 2048 ? uset2048 : uset4096;
+            const int nu     = kv == 2048 ? 8 : 11;
+            for (int iu = 0; iu < nu; iu++) {
+                const int u = uset[iu];
+                if (u > kv / 64) {
+                    continue;
+                }
+                test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, 512, 64, u, /*mask=*/false,
+                                                                       /*per_head_sel=*/true, 64*k, /*per_qblock=*/true));
+            }
+        }
+    }
+
     // Attribute the per-query-block penalty. The MAC count is identical across every
     // row here -- only the SCHEDULE changes -- so any difference is tiling cost alone.
     //

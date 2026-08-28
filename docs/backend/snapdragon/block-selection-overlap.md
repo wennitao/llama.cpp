@@ -566,3 +566,69 @@ So the design rule is mechanical. Enumerate `u`, compute `n_kv_blocks(u)`, and t
 smallest `u` meeting the quality budget that also minimises `161*n_kv_blocks + 0.554*u*bs`.
 For `bs=64` the good sizes are those with a divisor near `u/3`: 3, 6, 8, 12, 16, 24, 32 —
 and the ones to avoid are the primes and near-primes: 5, 7, 11, 13, 14.
+
+## 6. The (k, u) surface: k merged query blocks, `Br = k*64`, measured
+
+The deployment shape. Scorer block fixed at 64 on both axes; `k` adjacent query blocks merged
+under one list, so `bq = Br = k*64`; their selections union to `u` KV blocks. Both axes varied
+independently — every earlier table fixed one of them. `nb=512`, `bs=64`, maskless.
+
+### kv=2048 (dense 2077 µs)
+
+| u | chunks | k=1 (Br=64) | k=2 (Br=128) | k=4 (Br=256) | k=8 (Br=512) |
+|--:|--:|--:|--:|--:|--:|
+| 8 | 4 | 1871 | 1482 | 1087 | 982 |
+| 9 | 3 | 1971 | 1585 | 1149 | 1028 |
+| 10 | 5 | 2276 | 1807 | 1316 | 1180 |
+| **11** | **11** | **4266** | **3440** | **2604** | **2250** |
+| 12 | 3 | 2029 | 1668 | **1188** | 1062 |
+| **13** | **13** | **5016** | **3995** | **3045** | **2629** |
+| 14 | 7 | 3096 | 2463 | 1766 | 1579 |
+| 16 | 4 | 2621 | 2150 | 1510 | 1349 |
+
+### kv=4096 (dense 4286 µs)
+
+| u | chunks | k=1 | k=2 | k=4 | k=8 |
+|--:|--:|--:|--:|--:|--:|
+| 16 | 4 | 2617 | 2150 | 1512 | 1353 |
+| 18 | 3 | 2769 | 2202 | 1549 | 1371 |
+| **19** | **19** | **7295** | **5867** | **4379** | **3759** |
+| 20 | 4 | 3218 | 2623 | 1891 | 1701 |
+| 22 | 11 | 4698 | 3732 | 2698 | 2381 |
+| **23** | **23** | **8759** | **7021** | **5264** | **4519** |
+| 24 | 3 | 3177 | 2533 | **1823** | 1640 |
+| 26 | 13 | 5487 | 4380 | 3161 | 2781 |
+| 27 | 9 | 5366 | 4360 | 3034 | 2689 |
+| 28 | 4 | 3883 | 3149 | 2284 | 2056 |
+| 32 | 4 | 4121 | 3277 | 2344 | 2098 |
+
+### Reading it with the profiled union sizes
+
+`u` must round **up** — the buffer has to hold the union, so a `u` below the measured mean is
+not a legal choice. Union growth from §2 (`u/k_fine` = 1.000 / 1.183 / 1.412 / 1.672):
+
+| kv | k | Br | union needs u ≥ | legal roundings | best | **vs dense** |
+|--:|--:|--:|--:|:--|--:|--:|
+| 2048 | 1 | 64 | 8.0 | 8 → 1871 | 1871 | 1.11× |
+| 2048 | 2 | 128 | 9.5 | 10 → 1807, 12 → 1668 | 1668 | 1.25× |
+| 2048 | **4** | **256** | 11.3 | **12 → 1188** | **1188** | **1.75×** |
+| 2048 | 8 | 512 | 13.4 | 14 → 1579, 16 → 1349 | 1349 | 1.54× |
+| 4096 | 1 | 64 | 16.0 | 16 → 2617 | 2617 | 1.64× |
+| 4096 | 2 | 128 | 18.9 | 20 → 2623, 24 → 2533 | 2533 | 1.69× |
+| 4096 | **4** | **256** | 22.6 | **24 → 1823** | **1823** | **2.35×** |
+| 4096 | 8 | 512 | 26.8 | 28 → 2056, 32 → 2098 | 2056 | 2.08× |
+
+**`k = 4` is the optimum at both contexts**, and it is a genuine interior maximum: for any
+*fixed* `u` a larger `k` is always cheaper (the tax falls monotonically along a row), but the
+union grows with `k` and at `k=8` it grows past what the tax saves.
+
+**The rounding matters more than `k` does.** At `k=4`, `u=11` costs **2604** and `u=12` costs
+**1188** — 2.2× for one fewer block. At kv=4096, `u=23` costs 5264 and `u=24` costs 1823, a
+**2.9×** cliff. And the profiled union sizes land near primes with uncomfortable regularity:
+9.5, 11.3, 13.4, 18.9, 22.6, 26.8 round naturally to 10, 11, 13, 19, 23, 27 — of which 11, 13,
+19, 23 are prime and 27 is 3^3 (9 chunks). **Round to the next size with a divisor near u/3,
+never to the nearest integer.**
+
+Practical rule, at 25% fine density with `Bl = 64`: merge `k = 4` query blocks, size the
+selection buffer at `u = 12` (kv=2048) or `u = 24` (kv=4096), and take 1.75×/2.35× over dense
+on the attention kernel.
