@@ -71,11 +71,48 @@ cost of extra blocks is sub-linear and the cost of a bad `u` is a 2.9× cliff.
 Layer 2 is the hardest layer for every policy, and it is the oracle that is hard there
 (0.704 at 6.25%), not the scorers: their ratios to it hold up.
 
+## Generalisation: two models, 11 datasets
+
+Extended to **RULER** (real instances from `simonjegou/ruler` at 8192, not regenerated) and
+**LongBench**, two instances each, all layers, four densities — 44 (dataset, density) cells
+per model.
+
+| | Qwen3-1.7B | | | Llama-3.2-1B-Instruct | | |
+|:--|--:|--:|:--|--:|--:|:--|
+| scorer | mean | min | worst case | mean | min | worst case |
+| **xattn** | **99.3%** | 98.9% | cwe @ 25% | **99.5%** | 99.1% | cwe @ 25% |
+| **meanpool** | **99.1%** | 98.6% | multiquery @ 50% | **99.2%** | 98.6% | cwe @ 50% |
+| maxpool | 97.2% | 95.2% | cwe @ 6.25% | 98.3% | 97.5% | cwe @ 12.5% |
+| recent | 96.4% | **81.3%** | **vt @ 50%** | 97.1% | **89.2%** | **vt @ 50%** |
+| quoka | 95.8% | 92.3% | lcc @ 6.25% | 98.5% | 97.8% | lcc @ 6.25% |
+| random | 84.7% | 80.5% | lcc @ 12.5% | 87.1% | 83.9% | lcc @ 12.5% |
+
+Datasets: `niah_single_1`, `niah_multikey_2`, `niah_multiquery`, `vt`, `cwe`, `qa_1` from
+RULER; `narrativeqa`, `qasper`, `gov_report`, `lcc`, `passage_retrieval_en` from LongBench.
+Oracle absolute recall spans 0.798–0.979 (Qwen) and 0.827–0.979 (Llama).
+
+**The tie holds everywhere.** `meanpool` is within **0.2 points of XAttention on average and
+0.9 at its worst**, across two architectures, retrieval and aggregation and summarisation and
+code, and an 8× density range. XAttention is consistently very slightly ahead — it never
+loses — but the margin never exceeds 0.9 points of oracle.
+
+**Positional selection is not safe.** `recent` looks fine on average (96–97%) and collapses to
+**81.3%** on RULER `vt`, where the answer is a chain of variable assignments scattered through
+the context — exactly the structure a recency prior cannot see. Any policy without data
+dependence carries that tail risk.
+
+**QUOKA is architecture-sensitive**: 95.8% mean on Qwen3 against 98.5% on Llama, and the gap
+is widest at low density. Qwen3 applies QK-norm before RoPE, which changes the cosine geometry
+its query sub-selection depends on. That is a hypothesis, not a measurement.
+
+**`cwe` and `vt` are the hard tasks** for every scorer, and `passage_retrieval_en` the easiest
+— which is the expected ordering: aggregation over the whole context versus a single localised
+target.
+
 ## Limits
 
-- **One document, one model, one context length.** LongBench narrativeqa[0] at T=8192 on
-  Qwen3-1.7B. The per-layer spread is tight, but document-to-document and model-to-model
-  variation is unmeasured.
+- **Two models, both small.** 1–1.7B. Larger models and different GQA ratios are unmeasured.
+- **Two instances per dataset**, 8192 tokens.
 - **Recall is a proxy.** No downstream quality number is attached to any row here. A 99.4%
   ratio is not a claim about accuracy; it is a claim about mass.
 - **`bs = 64` on both axes**, matching the kernel. The block-size surface is measured

@@ -20,36 +20,80 @@ import torch
 
 # --------------------------------------------------------------------------- capture
 
-def capture_qk(model_id, text, n_tokens, device, dtype, layers=None):
-    """Run a prefill and return post-RoPE q,k per layer: q[L] = [Hq,T,d], k[L] = [Hkv,T,d]."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from transformers.models.qwen3 import modeling_qwen3 as M
+ROPE_MODULE = {
+    'qwen3': 'transformers.models.qwen3.modeling_qwen3',
+    'qwen2': 'transformers.models.qwen2.modeling_qwen2',
+    'llama': 'transformers.models.llama.modeling_llama',
+    'mistral': 'transformers.models.mistral.modeling_mistral',
+}
 
-    tok = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, dtype=dtype, device_map=device, attn_implementation="sdpa")
-    model.eval()
+class Capturer:
+    """Holds a model once and yields post-RoPE Q/K for each prompt.
 
-    ids = tok(text, return_tensors="pt").input_ids[:, :n_tokens].to(device)
-    T = ids.shape[1]
+    The hook is on apply_rotary_pos_emb rather than on the attention module, because
+    that is the exact tensor the scorer would see in a runtime: after q_norm/k_norm and
+    after RoPE, before the attention interface. Which module owns that symbol depends on
+    the architecture, hence the table above.
+    """
+    def __init__(self, model_id, device='cuda', dtype=torch.bfloat16):
+        import importlib
+        from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+        cfg = AutoConfig.from_pretrained(model_id)
+        mt = cfg.model_type
+        if mt not in ROPE_MODULE:
+            raise SystemExit(f'no RoPE hook registered for model_type={mt}; add one to ROPE_MODULE')
+        self.M = importlib.import_module(ROPE_MODULE[mt])
+        self.tok = AutoTokenizer.from_pretrained(model_id)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id, dtype=dtype, device_map=device, attn_implementation='sdpa').eval()
+        self.device = device
+        self.name = model_id
+        self.geom = (cfg.num_attention_heads, cfg.num_key_value_heads,
+                     getattr(cfg, 'head_dim', cfg.hidden_size // cfg.num_attention_heads),
+                     cfg.num_hidden_layers)
 
-    grabbed, orig = [], M.apply_rotary_pos_emb
-    def patched(q, k, cos, sin, *a, **kw):
-        qr, kr = orig(q, k, cos, sin, *a, **kw)
-        grabbed.append((qr.detach()[0].clone(), kr.detach()[0].clone()))   # [H,T,d]
-        return qr, kr
-    M.apply_rotary_pos_emb = patched
-    try:
-        with torch.no_grad():
-            model(ids, use_cache=False)
-    finally:
-        M.apply_rotary_pos_emb = orig
+    def __call__(self, text, n_tokens, layers=None):
+        ids = self.tok(text, return_tensors='pt').input_ids[:, :n_tokens].to(self.device)
+        T = ids.shape[1]
+        grabbed, orig = [], self.M.apply_rotary_pos_emb
+        def patched(q, k, cos, sin, *a, **kw):
+            qr, kr = orig(q, k, cos, sin, *a, **kw)
+            grabbed.append((qr.detach()[0].clone(), kr.detach()[0].clone()))
+            return qr, kr
+        self.M.apply_rotary_pos_emb = patched
+        try:
+            with torch.no_grad():
+                self.model(ids, use_cache=False)
+        finally:
+            self.M.apply_rotary_pos_emb = orig
+        if layers is not None:
+            grabbed = [grabbed[i] for i in layers]
+        return grabbed, T
 
-    del model
-    torch.cuda.empty_cache()
-    if layers is not None:
-        grabbed = [grabbed[i] for i in layers]
-    return grabbed, T
+
+def load_texts(spec, n, min_chars=20000):
+    """spec is `ruler:<task>` or `longbench:<subset>`; returns up to n prompt strings.
+
+    RULER instances are already length-calibrated, so context+question is used verbatim.
+    LongBench documents vary wildly, so short ones are skipped -- a document that cannot
+    fill the context would silently make every policy look identical.
+    """
+    from datasets import load_dataset
+    kind, name = spec.split(':', 1)
+    if kind == 'ruler':
+        d = load_dataset('simonjegou/ruler', '8192', split='test')
+        d = d.filter(lambda r: r['task'] == name)
+        return [r['context'] + '\n' + r['question'] for r in d.select(range(min(n, len(d))))]
+    if kind == 'longbench':
+        d = load_dataset('THUDM/LongBench', name, split='test')
+        out = []
+        for r in d:
+            if len(r['context']) >= min_chars:
+                out.append(r['context'] + '\n' + r.get('input', ''))
+            if len(out) >= n:
+                break
+        return out
+    raise SystemExit(f'unknown data spec {spec}')
 
 
 # ------------------------------------------------------------------- oracle + scorers
@@ -238,58 +282,68 @@ def recall_at(scores, mass, rows, u, bs, slack=2.0):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--model', default='Qwen/Qwen3-1.7B')
+    ap.add_argument('--data', nargs='+', default=['longbench:narrativeqa'],
+                    help='ruler:<task> or longbench:<subset>')
+    ap.add_argument('--docs', type=int, default=3, help='instances per dataset')
     ap.add_argument('--tokens', type=int, default=8192)
     ap.add_argument('--bs', type=int, default=64)
     ap.add_argument('--layers', type=int, nargs='*', default=None)
-    ap.add_argument('--densities', type=float, nargs='*', default=[0.125, 0.25, 0.5])
-    ap.add_argument('--force', type=int, default=1,
-                    help='1 = force sink+diagonal into every selection (what deployments do)')
-    ap.add_argument('--slack', type=float, default=2.0,
-                    help='only score query blocks with avail >= slack*u available blocks')
+    ap.add_argument('--densities', type=float, nargs='*', default=[0.0625, 0.125, 0.25, 0.5])
+    ap.add_argument('--force', type=int, default=1)
+    ap.add_argument('--slack', type=float, default=2.0)
     ap.add_argument('--out', default='oracle_scoring.json')
-    ap.add_argument('--text-file', default=None)
     a = ap.parse_args()
 
-    dev = 'cuda'
-    if a.text_file:
-        text = open(a.text_file).read()
-    else:
-        from datasets import load_dataset
-        ds = load_dataset('THUDM/LongBench', 'narrativeqa', split='test')
-        text = ds[0]['context']
-    t0 = time.time()
-    qk, T = capture_qk(a.model, text, a.tokens, dev, torch.bfloat16, a.layers)
-    NB = _blocks(T, a.bs)
-    print(f'captured {len(qk)} layers, T={T}, NB={NB}, {time.time()-t0:.1f}s', flush=True)
+    cap = Capturer(a.model)
+    Hq, Hkv, d, L = cap.geom
+    print(f'{a.model}: Hq={Hq} Hkv={Hkv} d={d} layers={L}', flush=True)
 
-    res = {}
-    for li, (q, k) in enumerate(qk):
-        lname = a.layers[li] if a.layers else li
-        mass, rows = oracle_and_mass(q, k, a.bs)
-        sc = {'oracle': sc_oracle(mass)}
-        for n, f in SCORERS.items():
-            sc[n] = f(q, k, a.bs)
-        if a.force:
-            sc = {n: (v if n == 'oracle' else force_sink_diag(v)) for n, v in sc.items()}
+    acc = {}          # (data, density, scorer) -> [ratios]
+    absacc = {}       # (data, density, scorer) -> [recalls]
+    for spec in a.data:
+        texts = load_texts(spec, a.docs)
+        print(f'\n### {spec}: {len(texts)} instances', flush=True)
+        for di, text in enumerate(texts):
+            qk, T = cap(text, a.tokens, a.layers)
+            NB = _blocks(T, a.bs)
+            if NB < 8:
+                print(f'  doc {di}: only T={T}, skipped', flush=True); continue
+            for li, (q, k) in enumerate(qk):
+                mass, rows = oracle_and_mass(q, k, a.bs)
+                sc = {'oracle': sc_oracle(mass)}
+                for n, f in SCORERS.items():
+                    sc[n] = f(q, k, a.bs)
+                if a.force:
+                    sc = {n: (v if n == 'oracle' else force_sink_diag(v)) for n, v in sc.items()}
+                for dens in a.densities:
+                    u = max(1, int(round(dens * NB)))
+                    r = {n: recall_at(v, mass, rows, u, a.bs, a.slack) for n, v in sc.items()}
+                    if r['oracle'] != r['oracle'] or r['oracle'] <= 0:
+                        continue
+                    for n, v in r.items():
+                        acc.setdefault((spec, dens, n), []).append(v / r['oracle'])
+                        absacc.setdefault((spec, dens, n), []).append(v)
+                del mass, rows, sc
+                torch.cuda.empty_cache()
+            print(f'  doc {di} (T={T}) done', flush=True)
+
+    names = ['oracle'] + list(SCORERS)
+    print(f'\n=== {a.model}, bs={a.bs}, T={a.tokens}, mean over layers x instances ===')
+    hdr = f"{'dataset':<26}{'dens':>7}{'oracle':>8}" + ''.join(f'{n:>10}' for n in names[1:])
+    print(hdr); print('-' * len(hdr))
+    for spec in a.data:
         for dens in a.densities:
-            u = max(1, int(round(dens * NB)))
-            for n, s in sc.items():
-                r = recall_at(s, mass, rows, u, a.bs, slack=a.slack)
-                res.setdefault(f'{dens}', {}).setdefault(n, []).append(r)
-            print(f'  layer {lname} d={dens} u={u}  ' +
-                  '  '.join(f'{n}={res[str(dens)][n][-1]:.4f}' for n in sc), flush=True)
-        del mass, rows, sc
-        torch.cuda.empty_cache()
-
-    summary = {d: {n: sum(v)/len(v) for n, v in m.items()} for d, m in res.items()}
-    print('\n=== mean recall over layers ===')
-    for d, m in sorted(summary.items(), key=lambda t: float(t[0])):
-        o = m['oracle']
-        print(f'density {d}:  ' + '  '.join(
-            f'{n}={v:.4f}' + (f' ({v/o*100:.1f}% of oracle)' if n != 'oracle' else '')
-            for n, v in sorted(m.items(), key=lambda t: -t[1])))
-    json.dump({'T': T, 'bs': a.bs, 'per_layer': res, 'summary': summary},
-              open(a.out, 'w'), indent=1)
+            k0 = (spec, dens, 'oracle')
+            if k0 not in absacc: continue
+            o = sum(absacc[k0]) / len(absacc[k0])
+            cells = ''.join(f'{100*sum(acc[(spec,dens,n)])/len(acc[(spec,dens,n)]):9.1f}%'
+                            for n in names[1:])
+            print(f'{spec:<26}{dens:>7}{o:>8.3f}{cells}')
+    out = {'model': a.model, 'T': a.tokens, 'bs': a.bs, 'force': a.force,
+           'ratio': {f'{s}|{d}|{n}': sum(v)/len(v) for (s,d,n), v in acc.items()},
+           'recall': {f'{s}|{d}|{n}': sum(v)/len(v) for (s,d,n), v in absacc.items()},
+           'n': {f'{s}|{d}|{n}': len(v) for (s,d,n), v in acc.items()}}
+    json.dump(out, open(a.out, 'w'), indent=1)
     print(f'\nwrote {a.out}')
 
 if __name__ == '__main__':
