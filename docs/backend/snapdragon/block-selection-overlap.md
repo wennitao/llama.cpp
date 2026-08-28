@@ -525,16 +525,42 @@ Within ±7% everywhere, **including `u = 14`, which the naive `610 + 46.9u` line
 
 Two coefficients worth reading:
 
-- **161 µs per KV chunk.** This is a *fixed* cost per chunk, independent of how much KV the
-  chunk holds — the fork/join and HMX-queue handoff structure priced in
-  `flash-attn-htp-anatomy.md`. It arrives independently at the `~190 µs` figure already
-  recorded in `flash-attn-ops.h:401` from a different measurement. At `u=7` you pay it seven
-  times (1127 of 1492 µs); at `u=6` three times (483 of 784). **That is the whole sawtooth.**
+- **161 µs per KV chunk**, *fixed* — independent of how much KV the chunk holds, since `Bc`
+  varies 64→256 across these points while the coefficient does not. It arrives independently
+  at the `~190 µs` already recorded in `flash-attn-ops.h:401` from a different measurement.
+  At `u=7` you pay it seven times (1127 of 1492 µs); at `u=6` three times (483 of 784).
+  **That is the whole sawtooth.**
+
+  > **What it is made of is NOT established, and an earlier version of this section claimed
+  > it was the fork/join and HMX-queue handoff. That claim does not survive its own
+  > evidence:** these are *shared-selection* rows, and `flash-attn-htp-anatomy.md:931-941`
+  > measures fully-idle time at **7.6% of wall** in exactly that configuration. Barriers
+  > cannot be 48–68% of a kernel whose machine is idle 7.6% of the time. The likelier
+  > dominant term is the online-softmax **O-accumulator rescale**, which runs once per
+  > (query tile, chunk) over `Br*G*DV` elements *regardless of `Bc`* — 131072 elements at
+  > `Br=512, G=2, DV=128`, the right order for 161 µs. That predicts the coefficient should
+  > scale with `Br` rather than with anything KV-side, which is testable and untested: the
+  > two available `nb=2048` points both have 4 chunks, so they cannot separate it.
+  > Treat 161 as an empirical constant of this kernel at `nb=512`, not as an attribution.
 - **0.554 µs per KV row** is the actual streaming and arithmetic — a third of the cost at
   `u=16`, and under a fifth at `u=3`.
 
 Below three chunks the model does not apply at all: `u=2` gives one chunk, one thread, no
 pipeline, and costs **3.85×** what the pipelined fit predicts.
+
+### How much of this transfers
+
+Almost none of the numbers, and all of the structure. Kernel-specific: the `m <= 8` cap
+(`FA_SPARSE_MAX_M`), the `>= 3 chunks` pipeline rule (`FA_MIN_KV_BLOCKS`), the downward `Bc`
+walk, and all three coefficients — which are tied to `nb=512`, `Hq=16/Hkv=8`, `d=128`, f16,
+and this silicon. Change `bs` and every good `u` changes with it.
+
+What transfers is the *shape*: a tiled sparse-attention kernel whose chunk count comes from a
+divisibility rule will have a sawtooth in `u`, and its cost will be
+`fixed_per_chunk * chunks(u) + per_row * u * bs`. Fitting those two coefficients on any such
+kernel takes about seven measurements, and the second one is what tells you whether you are
+streaming-bound or overhead-bound. Here it is overhead-bound: the fixed term is **48% of the
+cost at `u=16` and 68% at `u=3`**, which is why the divisor structure dominates the density.
 
 So the design rule is mechanical. Enumerate `u`, compute `n_kv_blocks(u)`, and take the
 smallest `u` meeting the quality budget that also minimises `161*n_kv_blocks + 0.554*u*bs`.
