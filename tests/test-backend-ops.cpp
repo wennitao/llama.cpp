@@ -13989,6 +13989,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     //
     // k = 8 at nb = 512 is bq = nb, i.e. one query block for the whole chunk -- the
     // chunk-wide case, included so the grid contains its own upper bound.
+    // Short contexts get their own u sets: at 25% fine density k_fine is 2 at kv=512 and 4
+    // at kv=1024, so the profiled unions are 2.0/2.4/2.8/3.3 and 4.0/4.7/5.7/6.7 -- entirely
+    // inside the region where FA_MIN_KV_BLOCKS and the divisor rule dominate, and where the
+    // 25% budget itself lands on the single-thread cliff (u=2 -> 1 chunk).
+    for (int kv : { 512, 1024 }) {
+        for (int k : { 1, 2, 4, 8 }) {
+            const int uset512[]  = { 2, 3, 4, 5, 6, 8 };
+            const int uset1024[] = { 4, 5, 6, 7, 8, 9, 10, 12, 16 };
+            const int * us = kv == 512 ? uset512 : uset1024;
+            const int nus  = kv == 512 ? 6 : 9;
+            for (int iu = 0; iu < nus; iu++) {
+                const int u = us[iu];
+                if (u > kv / 64) {
+                    continue;
+                }
+                test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, 512, 64, u, /*mask=*/false,
+                                                                       /*per_head_sel=*/true, 64*k, /*per_qblock=*/true));
+            }
+        }
+    }
     for (int kv : { 2048, 4096 }) {
         for (int k : { 1, 2, 4, 8 }) {
             // u comes from the MEASURED union growth, not a synthetic grid:

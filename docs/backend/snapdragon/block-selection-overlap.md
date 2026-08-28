@@ -632,3 +632,59 @@ never to the nearest integer.**
 Practical rule, at 25% fine density with `Bl = 64`: merge `k = 4` query blocks, size the
 selection buffer at `u = 12` (kv=2048) or `u = 24` (kv=4096), and take 1.75×/2.35× over dense
 on the attention kernel.
+
+### Short context: the same surface at kv = 512 and 1024
+
+`k_fine` is 2 and 4 here, so the profiled unions are 2.0 / 2.4 / 2.8 / 3.3 and
+4.0 / 4.7 / 5.7 / 6.7 — entirely inside the region where `FA_MIN_KV_BLOCKS` and the divisor
+rule dominate.
+
+#### kv=512 (dense 933 µs)
+
+| u | chunks | k=1 (Br=64) | k=2 (Br=128) | k=4 (Br=256) | k=8 (Br=512) |
+|--:|--:|--:|--:|--:|--:|
+| **2** | **1** | 1710 | 1516 | 1414 | **1364** |
+| 3 | 3 | 1319 | 1073 | 824 | **747** |
+| 4 | 4 | 1706 | 1379 | 1043 | 928 |
+| 5 | 5 | 2059 | 1671 | 1267 | 1117 |
+| 6 | 3 | 1476 | 1181 | 862 | 781 |
+| 8 | 4 | 1862 | 1481 | 1094 | 980 |
+
+#### kv=1024 (dense 1244 µs)
+
+| u | chunks | k=1 | k=2 | k=4 | k=8 |
+|--:|--:|--:|--:|--:|--:|
+| 4 | 4 | 1701 | 1371 | 1045 | 921 |
+| 5 | 5 | 2071 | 1676 | 1271 | 1113 |
+| 6 | 3 | 1470 | 1167 | **860** | 782 |
+| **7** | **7** | 2794 | 2260 | 1717 | 1492 |
+| 8 | 4 | 1872 | 1505 | 1087 | 981 |
+| 9 | 3 | 1977 | 1581 | 1151 | 1028 |
+| 10 | 5 | 2263 | 1807 | 1314 | 1179 |
+| 12 | 3 | 2025 | 1652 | 1192 | 1064 |
+| 16 | 4 | 2630 | 2134 | 1514 | 1349 |
+
+### The complete deployment table
+
+Best legal `u` per `(kv, k)` — rounding up to hold the profiled union, then to a
+divisor-friendly size:
+
+| kv | dense | k=1 | k=2 | k=4 | k=8 | best |
+|--:|--:|--:|--:|--:|--:|:--|
+| 512 | 933 | 0.71× (u=3) | 0.87× (u=3) | 1.13× (u=3) | **1.19× (u=6)** | **k=8** |
+| 1024 | 1244 | 0.85× (u=6) | 1.07× (u=6) | **1.45× (u=6)** | 1.27× (u=8) | **k=4** |
+| 2048 | 2077 | 1.11× (u=8) | 1.25× (u=12) | **1.75× (u=12)** | 1.54× (u=16) | **k=4** |
+| 4096 | 4286 | 1.64× (u=16) | 1.69× (u=24) | **2.35× (u=24)** | 2.08× (u=28) | **k=4** |
+
+**`k = 4` is optimal from kv=1024 up; kv=512 shifts to `k = 8`.** The reason is visible in
+the u column: at kv=512 every `k` rounds to the same `u=3`, so the union costs nothing and
+the tax reduction runs unopposed all the way to `k=8`. From kv=1024 the union at `k=8`
+finally needs a bigger `u` than at `k=4` (8 vs 6, 16 vs 12, 28 vs 24) and the trade turns.
+
+**`k = 1` — the faithful per-query-block selection — never beats dense below kv=2048**, at
+any `u`. Its best cells are 0.71× and 0.85×.
+
+**The `u=2` row is the density floor in the open.** At `k=8` it costs 1364 µs against 747 for
+`u=3`: **1.83× slower for 33% fewer blocks**, because two blocks give one chunk, one thread
+and no pipeline. A 25% budget at kv=512 lands exactly there, which is why the nominal density
+must be overridden at short context.
