@@ -27,7 +27,13 @@ scorer (see below for why):
 | 6.25% | 8 | **0.842** | 99.4% | **99.4%** | 98.8% | 96.4% | 94.4% | 85.2% |
 | 12.5% | 16 | **0.884** | 99.4% | **99.4%** | 98.3% | 96.9% | 95.0% | 83.8% |
 | 25% | 32 | **0.922** | 99.4% | **99.3%** | 97.6% | 97.6% | 96.4% | 84.4% |
-| 50% | 64 | **0.958** | 99.4% | **99.3%** | 98.4% | 98.3% | 97.5% | 84.7% |
+| 50% † | 64 | **0.958** | 99.4% | **99.3%** | 98.4% | 98.3% | 97.5% | 84.7% |
+
+> † **The 50% row is one query block.** `recall_at` skips blocks with `avail < 2u`; at
+> `u = NB/2` only `a = NB-1` survives — and none do when `NB` is odd, which dropped
+> `niah_single_1` from the cell entirely. 6.25 / 12.5 / 25% score 113 / 97 / 65 of 128 blocks
+> and are sound. Do not quote the 50% row; measuring it needs a longer context, not a
+> different scorer.
 
 - **xattn** — XAttention: antidiagonal packing at stride 16, softmax at `1/(√d·S)`, block-pool,
   max over the GQA group.
@@ -62,7 +68,8 @@ it is mostly measuring whether the sink was found, not scoring quality.
 
 ### What limits recall is the budget, not the scorer
 
-The oracle itself is only **0.842 / 0.884 / 0.922 / 0.958** at these densities. The distance
+The oracle itself is only **0.842 / 0.884 / 0.922** at these densities (the 50% figure is the
+single-row cell flagged above). The distance
 from a good cheap scorer to the oracle is 0.6% of oracle; the distance from the oracle to 1.0
 is 4–16%. **Raising `u` buys an order of magnitude more recall than improving the scorer** —
 which is the same conclusion the kernel measurements reached from the other side, where the
@@ -117,6 +124,15 @@ target.
   ratio is not a claim about accuracy; it is a claim about mass.
 - **`bs = 64` on both axes**, matching the kernel. The block-size surface is measured
   separately in `block-selection-overlap.md`.
+- **50% density is unmeasurable here** at `T = 8192` with `slack = 2` — one query block
+  survives the filter. Everything at 50% in this document should be read as unsupported.
+- **The density label is per-document, not per-op.** `u = density × NB` is taken over the
+  whole 8192-token capture and applied to every query block, so the harness models one
+  flash-attention op over the entire prompt. The kernel's density is per-op
+  (`kv_eff / nek1`, `ggml-hexagon.cpp:2095`) and a chunked prefill scales `u` with each
+  chunk's cache. The mean *local* budget fraction the harness evaluates is 0.150 / 0.232 /
+  0.347 against labels 0.0625 / 0.125 / 0.25 — those factors are exact; the resulting recall
+  overstatement is estimated at ~3 / 2 / 1 points and has **not** been measured.
 
 ## meanpool on the NPU
 
@@ -189,14 +205,60 @@ selection does. The oracle is merged too (by summed mass — the best list a gro
 share), so a merged scorer is not charged for coarsening twice. Recall is still scored per
 original query block against that block's own mass.
 
-Ratio to the merged oracle, 11 datasets × 4 densities, all layers, 2 instances:
+### First: what a shared list actually costs (`--faithful 1`)
+
+Getting the *cost* of merging right needed two corrections, both found by auditing the
+harness against the kernel rather than by looking at the numbers. Both made merging look
+cheaper than it is, and both grow with `k`.
+
+**The kernel cuts the list once, over the group's reach.** `n_sel` is "deliberately NOT a
+function of the query block" (`ggml/src/ggml-hexagon/htp/flash-attn-ops.c:219-230`): every row
+of the group gets the same `u` indices, all of them staged and computed, and entries past an
+individual row's diagonal are killed only by the per-row mask (`:1477-1493`). Those slots are
+spent and return nothing. `recall_at` used to re-cut a fresh top-`u` inside each fine block's
+*own* causal prefix, which silently refunded them.
+
+**The bias leaf is indexed by the coarse query block.** It forces exactly two entries per
+group — block 0 and the group's last reachable block
+(`tests/test-backend-ops.cpp:8478`). Applying `force_sink_diag` per fine block *before* the
+merge instead put `k` forced diagonals into the shared row; at `k=32` that is 32 forced
+entries competing for a 32-slot budget.
+
+`--faithful 1` does what the kernel does: cut once over the group reach, force sink and
+group-last only. No causal mask is needed to charge for the waste — `mass[a,:,j]` is exactly
+0 for `j > a`, so a slot spent on a future block gathers nothing on its own. At `k=1` the two
+paths are identical by construction and reproduce to four decimals on both models at every
+density, which is the check that nothing else moved.
+
+What moved, absolute oracle recall at 25%:
+
+| | `k=4` | `k=32` |
+|:--|--:|--:|
+| Qwen3-1.7B, refunding metric | .915 | .878 |
+| Qwen3-1.7B, **faithful** | **.911** | **.831** |
+| Llama-3.2-1B, refunding metric | .915 | .875 |
+| Llama-3.2-1B, **faithful** | **.911** | **.830** |
+
+`k=4` was roughly right. **`k=32` was credited with about 4.5 points it does not have** — and
+chunk-wide selection is what the end-to-end NPU result runs. Everything below is the faithful
+metric.
+
+### The scorer table
+
+Ratio to the merged oracle, 11 datasets × 3 densities, all layers, 2 instances:
 
 | | | Qwen3-1.7B | | | | Llama-3.2-1B | | | |
 |--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
 | k | oracle | xattn | meanpool | **meanpool_s8** | **quoka_str** | xattn | meanpool | **meanpool_s8** | **quoka_str** |
-| 1 | .899/.905 | 99.3% | 99.1% | **99.0%** | 96.8% | 99.5% | 99.2% | **99.2%** | 98.8% |
-| 4 | .892/.898 | 99.4% | 99.1% | **99.0%** | 97.3% | 99.5% | 99.4% | **99.3%** | 98.9% |
-| 32 | .786/.803 | 92.6% | 92.5% | 92.4% | 92.0% | 95.1% | 95.1% | 95.1% | 94.9% |
+| 1 | .881/.887 | 99.3% | 99.1% | **99.0%** | 96.4% | 99.5% | 99.2% | **99.2%** | 98.7% |
+| 4 | .864/.871 | 99.0% | 98.7% | **98.6%** | 94.2% | 99.4% | 99.1% | **99.0%** | 98.7% |
+| 32 | .676/.706 | 96.1% | 96.0% | 95.9% | 92.5% | 97.7% | 97.0% | 96.9% | 97.4% |
+
+> 50% density is **not measurable on this harness at T=8192**. `recall_at` skips query blocks
+> with `avail < 2u`, and at `u = NB/2` that leaves exactly one block (`a = NB-1`) per
+> layer-instance — and none at all when `NB` is odd, which silently dropped `niah_single_1`
+> from every 50% cell. The four-density tables earlier in this document carry that defect in
+> their 50% row; 6.25 / 12.5 / 25% score 113 / 97 / 65 of 128 blocks and are sound.
 
 ### 1. Subsampling Q is free
 
@@ -216,29 +278,28 @@ signal at block granularity here.
 
 ### 3. Chunk-wide selection is a density decision, and this is the number that was missing
 
-Merging is nearly free at `k = 4` — the oracle loses 0.7 points of absolute recall — which is
-exactly where the `(k, u)` cost surface puts its optimum. At `k = 32` it depends entirely on
-the budget:
+Merging costs about a point at `k = 4` — which is exactly where the `(k, u)` cost surface
+puts its optimum. At `k = 32` it depends entirely on the budget. Oracle absolute recall,
+Qwen3-1.7B / Llama-3.2-1B:
 
-| density | u | oracle recall, k=1 | oracle recall, k=32 | best scorer @ k=32 |
-|--:|--:|--:|--:|--:|
-| 6.25% | 8 | 0.842 | **0.608** | 84.4% |
-| 12.5% | 16 | 0.884 | **0.740** | 87.8% |
-| 25% | 32 | 0.922 | **0.878** | 98.4% |
-| 50% | 64 | 0.958 | 0.933 | 100.7% |
+| density | u | oracle, k=1 | oracle, k=32 | the merge costs | best scorer @ k=32 |
+|--:|--:|--:|--:|--:|--:|
+| 6.25% | 8 | .840 / .852 | **.542 / .598** | **29.8 / 25.4 pts** | 95.8% / 97.2% |
+| 12.5% | 16 | .883 / .888 | **.655 / .690** | **22.8 / 19.8 pts** | 95.2% / 96.9% |
+| 25% | 32 | .921 / .922 | **.831 / .830** | **8.9 / 9.2 pts** | 98.0% / 99.1% |
 
-Thirty-two query blocks sharing one list of 8 blocks cannot serve them all: the oracle itself
-falls from 0.842 to 0.608. By 25% the union fits and the loss is 4.4 points; by 50% it is
-2.5. **The 2.67× end-to-end NPU result uses chunk-wide selection at 25% density**, so it sits
-in the benign part of this curve — but it costs 4.4 points of absolute recall, and the same
-configuration at 6.25% would lose 23.
+Thirty-two query blocks sharing one list of 8 cannot be served at all: the oracle itself falls
+from 0.840 to 0.542, and no scorer can recover what the budget never had. **The 2.67×
+end-to-end NPU result uses chunk-wide selection at 25% density**, the benign end of this
+curve — but it gives up **8.9 points** of absolute recall to the coarsening alone, and the
+same configuration at 6.25% would give up 30.
 
-**And at `k = 32` the scorer stops mattering** — all seven land within 1.2 points of each
-other. If the selection is going to be chunk-wide, use the cheapest scorer available; the
-coarsening dominates everything the scorer could contribute.
-
-> `xattn` at 100.7% is not an error: the merged oracle ranks by *summed* mass over the group,
-> which is not optimal for per-block recall, so a scorer can occasionally beat it.
+**The earlier claim that the scorer stops mattering at `k = 32` does not survive the metric
+fix.** It was an artifact of the refund. On Qwen3 the real scorers now spread **7.3 points**
+at `k=32`/25% (xattn 98.0%, meanpool 97.6%, recent 96.6%, maxpool 93.3%, quoka_str 92.5%)
+against 1.2 before. On Llama the spread is 1.7 points and the old reading broadly holds. So:
+coarsening still dominates, but on at least one architecture a bad scorer compounds it rather
+than being masked by it.
 
 ## The table: quality against cost
 
@@ -250,23 +311,25 @@ Both axes are for the same algorithm; nothing is modelled.
 
 | scorer | Qwen3-1.7B | Llama-3.2-1B | **NPU µs** | vs XAttention |
 |:--|--:|--:|--:|--:|
-| xattn | **99.4%** | **99.3%** | 7505 | 1.0× |
-| meanpool | 99.2% | 99.1% | 2489 | 3.0× |
-| **meanpool_s8** | 99.1% | 99.1% | **727** | **10.3×** |
-| **meanpool_s4** | 99.0% | 99.0% | **378** | **19.9×** |
-| meanpool_s2 | 98.8% | 98.9% | not built | — |
-| quoka_str | 97.3% | 98.7% | 799 | 9.4× |
-| quoka | 96.6% | 98.4% | — | — |
-| maxpool | 97.4% | 98.2% | — | — |
+| xattn | **99.2%** | **99.3%** | 7505 | 1.0× |
+| meanpool | 99.0% | 99.0% | 2489 | 3.0× |
+| **meanpool_s8** | 98.9% | 99.0% | **727** | **10.3×** |
+| **meanpool_s4** | 98.8% | 98.9% | **378** | **19.9×** |
+| meanpool_s2 | 98.5% | 98.8% | not built | — |
+| quoka_str | 96.2% | 98.6% | 799 | 9.4× |
+| quoka | 94.6% | 98.3% | — | — |
+| maxpool | 96.5% | 98.0% | — | — |
 | recent | 96.8% | 97.3% | ~80 (argsort only) | — |
-| random | 89.5% | 91.2% | ~80 (argsort only) | — |
+| random | 70.6% | 75.8% | ~80 (argsort only) | — |
 
 `meanpool_sN` = block mean over `N` evenly spaced rows of each 64-token block instead of all
 64. `quoka_str` = QUOKA with the same substitution on its query axis.
 
-**`meanpool_s4` is the operating point: 99.0% of oracle on both models, 378 µs, 19.9× cheaper
-than the XAttention scorer.** It dominates `quoka_str` on both axes — better quality *and*
-half the cost — and buying the last 0.4 points of quality by going to XAttention costs **20×**.
+**`meanpool_s4` is the operating point: 98.8 / 98.9% of oracle, 378 µs, 19.9× cheaper than
+the XAttention scorer.** It dominates `quoka_str` on both axes — better quality *and* half the
+cost — and buying the last 0.4 points of quality by going to XAttention costs **20×**. Under
+the faithful metric `quoka_str` is 2.6 points behind on Qwen3 rather than 1.7, so the margin
+widened; the ordering did not change.
 
 Two structural facts make the frontier this steep:
 
@@ -288,19 +351,38 @@ measured against the one above it, so the terms add:
 |:--|--:|--:|
 | exact attention | 1.000 | — |
 | per-block oracle at `u = NBk/4` | 0.921 | **7.9 pts** — the budget |
-| merged oracle at `k=4` | 0.915 | **0.6 pts** — the merge |
-| meanpool_s4, 99.0% of it | 0.906 | **0.9 pts** — the scorer |
-| | | **9.4 pts total** |
+| merged oracle at `k=4` | 0.911 | **1.0 pts** — the merge |
+| meanpool_s4, 98.8% of it | 0.900 | **1.1 pts** — the scorer |
+| | | **10.0 pts total** |
 
-**The budget is 84% of the loss.** The scorer and the merge together are 1.5 points. Going
-chunk-wide instead (`k=32`) would make the merge term 4.2 rather than 0.6 — still under the
-budget's 7.9, but no longer negligible.
+**The budget is 79% of the loss.** The scorer and the merge together are 2.1 points. Llama
+gives 7.8 / 1.1 / 1.0 for 9.9 — the same shape.
 
-> An earlier version of this section said "~15 points total: 1 scorer, 3 merge, 11 budget".
-> Two of those were wrong. The 3-point merge came from the merge table's oracle column
-> *averaged over all four densities* rather than the 25% row — at 25% specifically, `k=4`
-> costs 0.6. And the 11-point budget was `1 − 0.892`, which already contains the merge, so it
-> was double-counted. The corrected figures are above.
+Chunk-wide is a different accounting entirely. At `k=32`, same density and scorer:
+
+| | recall | this step costs |
+|:--|--:|--:|
+| per-block oracle | 0.921 | **7.9 pts** — the budget |
+| merged oracle at `k=32` | 0.831 | **8.9 pts** — the merge |
+| meanpool_s4 | 0.811 | **2.0 pts** — the scorer |
+| | | **18.9 pts total** |
+
+The merge now costs as much as the budget, and the scorer term doubles because a shared list
+is harder to rank well. Chunk-wide is the fastest configuration measured and the most
+expensive in recall by a factor of two.
+
+**And a mean over 28 layers hides a lot.** Per-layer recall is now persisted (`bylayer` in the
+json). At `k=4`/25%, `meanpool_s4` averages 0.900 on Qwen3 but its worst layer (6) is
+**0.829**; on Llama the mean is 0.901 and layer 0 is **0.781**. At `k=32` the worst layers are
+0.702 and 0.631. Quote the mean and you are quoting something no layer necessarily
+experiences.
+
+> Two earlier versions of this section were wrong. The first said "~15 points total: 1 scorer,
+> 3 merge, 11 budget" — the 3-point merge came from a density-*averaged* column rather than
+> the 25% row, and the 11-point budget was `1 − 0.892`, which already contained the merge and
+> so double-counted it. The correction to "9.4 total: 7.9 / 0.6 / 0.9" fixed the arithmetic
+> but still used the refunding merge metric; with `--faithful 1` the merge term is 1.0, not
+> 0.6, and the scorer term 1.1, not 0.9.
 
 ### Note on scope: why `u` and `k` appear in a scorer comparison
 

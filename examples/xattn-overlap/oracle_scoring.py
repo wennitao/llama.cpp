@@ -298,6 +298,24 @@ def force_sink_diag(scores):
     return out
 
 
+def force_shared(scores, k):
+    """The deployment's forcing, for a list shared by k query blocks.
+
+    The bias leaf is indexed by the COARSE query block: it adds +BIG on block 0 and on
+    `navail - 1`, the group's LAST reachable block (tests/test-backend-ops.cpp:8478).
+    That is TWO forced entries per group -- not one diagonal per fine block. Forcing each
+    fine block's own diagonal before the merge, as force_sink_diag does, puts k diagonals
+    into the shared row, which no deployment does. At k=1 this is identical to
+    force_sink_diag.
+    """
+    NBq, Hkv, NBk = scores.shape
+    out = scores.clone()
+    out[:, :, 0] = 1e9
+    a = torch.arange(NBq, device=scores.device)
+    last = torch.clamp((a // k + 1) * k - 1, max=NBq - 1)
+    out[a, :, last] = 1e9 + 1.0                                   # diagonal outranks sink
+    return out
+
 # ------------------------------------------------------------------------- evaluation
 
 def merge_rows(scores, k, how='amax'):
@@ -319,13 +337,24 @@ def merge_rows(scores, k, how='amax'):
     return m.repeat_interleave(k, dim=0)[:NBq]
 
 
-def recall_at(scores, mass, rows, u, bs, slack=2.0):
+def recall_at(scores, mass, rows, u, bs, slack=2.0, k=1, faithful=False):
     """Fraction of true mass captured by the top-u blocks of `scores`.
 
     Causally impossible blocks are excluded from both the ranking and the denominator:
     a query block a can only reach blocks 0..a, so n_avail = a+1, and rows where
     n_avail <= u have no choice to make and are skipped (every policy is identical
     there, so including them would compress all differences toward 1).
+
+    `faithful` changes what a shared list costs, and only matters for k > 1. The kernel
+    hands every query block of a group ONE list, cut once over the GROUP's causal reach
+    (`n_sel` is "deliberately NOT a function of the query block",
+    ggml/src/ggml-hexagon/htp/flash-attn-ops.c:219-230); entries past an individual row's
+    diagonal are staged and computed, then killed by the per-row mask. Those are wasted
+    budget. The default path instead re-cuts a fresh top-u inside each fine block's own
+    prefix, which silently refunds that waste and understates the cost of coarsening.
+
+    No explicit mask is needed to charge for it: mass[a, :, j] is exactly 0 for j > a, so
+    a slot spent on a future block gathers nothing.
     """
     NBq, Hkv, NBk = mass.shape
     num = den = 0.0
@@ -336,9 +365,10 @@ def recall_at(scores, mass, rows, u, bs, slack=2.0):
         # dominate the average and compress every difference toward the oracle.
         if avail < slack * u:
             continue
-        sc = scores[a, :, :avail]
-        idx = sc.topk(u, dim=-1).indices                          # [Hkv,u]
-        got = torch.gather(mass[a, :, :avail], 1, idx).sum()
+        reach = min((a // k + 1) * k, NBq) if (faithful and k > 1) else avail
+        sc = scores[a, :, :reach]
+        idx = sc.topk(min(u, reach), dim=-1).indices              # [Hkv,u]
+        got = torch.gather(mass[a, :, :reach], 1, idx).sum()
         num += got.item()
         den += rows[a].sum().item()
     return num / den if den else float('nan')
@@ -358,6 +388,9 @@ def main():
     ap.add_argument('--slack', type=float, default=2.0)
     ap.add_argument('--merge', type=int, nargs='*', default=[1],
                     help='k adjacent query blocks sharing one list (1 = per-block)')
+    ap.add_argument('--faithful', type=int, default=0,
+                    help='model the shared list the way the kernel does: cut once over the '
+                         'group reach, force sink + group-last only. Only affects k > 1.')
     ap.add_argument('--out', default='oracle_scoring.json')
     a = ap.parse_args()
 
@@ -367,6 +400,7 @@ def main():
 
     acc = {}          # (data, density, scorer) -> [ratios]
     absacc = {}       # (data, density, scorer) -> [recalls]
+    bylayer = {}      # + layer -> [recalls]; a bad layer is invisible in a 28-layer mean
     for spec in a.data:
         texts = load_texts(spec, a.docs)
         print(f'\n### {spec}: {len(texts)} instances', flush=True)
@@ -380,23 +414,38 @@ def main():
                 sc = {'oracle': sc_oracle(mass)}
                 for n, f in SCORERS.items():
                     sc[n] = f(q, k, a.bs)
+                raw = dict(sc)
                 if a.force:
                     sc = {n: (v if n == 'oracle' else force_sink_diag(v)) for n, v in sc.items()}
                 for mk in a.merge:
                     # The oracle is merged too, by SUM of mass -- the best list a group of
                     # k blocks could share. Comparing a merged scorer against the per-block
-                    # oracle would charge it for coarsening twice.
-                    scm = {n: merge_rows(v, mk, 'sum' if n == 'oracle' else 'amax')
-                           for n, v in sc.items()}
+                    # oracle would charge it for coarsening twice. Under `faithful` that
+                    # merged oracle is exactly the optimal shared list, so ratio-to-oracle
+                    # is a true <=100% scale again at every k.
+                    if a.faithful:
+                        # Merge FIRST, then apply the coarse-indexed bias leaf. Forcing per
+                        # fine block before the merge (the default path) puts k diagonals in
+                        # the shared row; the deployment puts two entries in it.
+                        scm = {n: merge_rows(v, mk, 'sum' if n == 'oracle' else 'amax')
+                               for n, v in raw.items()}
+                        if a.force:
+                            scm = {n: (v if n == 'oracle' else force_shared(v, mk))
+                                   for n, v in scm.items()}
+                    else:
+                        scm = {n: merge_rows(v, mk, 'sum' if n == 'oracle' else 'amax')
+                               for n, v in sc.items()}
                     for dens in a.densities:
                         u = max(1, int(round(dens * NB)))
-                        r = {n: recall_at(v, mass, rows, u, a.bs, a.slack) for n, v in scm.items()}
+                        r = {n: recall_at(v, mass, rows, u, a.bs, a.slack, mk, a.faithful)
+                             for n, v in scm.items()}
                         if r['oracle'] != r['oracle'] or r['oracle'] <= 0:
                             continue
                         key = (spec, dens, mk)
                         for n, v in r.items():
                             acc.setdefault(key + (n,), []).append(v / r['oracle'])
                             absacc.setdefault(key + (n,), []).append(v)
+                            bylayer.setdefault(key + (n, li), []).append(v)
                 del mass, rows, sc
                 torch.cuda.empty_cache()
             print(f'  doc {di} (T={T}) done', flush=True)
@@ -417,6 +466,8 @@ def main():
     out = {'model': a.model, 'T': a.tokens, 'bs': a.bs, 'force': a.force,
            'ratio': {f'{s}|{d}|{m}|{n}': sum(v)/len(v) for (s,d,m,n), v in acc.items()},
            'recall': {f'{s}|{d}|{m}|{n}': sum(v)/len(v) for (s,d,m,n), v in absacc.items()},
+           'bylayer': {f'{s}|{d}|{m}|{n}|{li}': sum(v)/len(v) for (s,d,m,n,li), v in bylayer.items()},
+           'faithful': a.faithful,
            'n': {f'{s}|{d}|{m}|{n}': len(v) for (s,d,m,n), v in acc.items()}}
     json.dump(out, open(a.out, 'w'), indent=1)
     print(f'\nwrote {a.out}')

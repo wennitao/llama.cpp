@@ -173,11 +173,14 @@ production graph *inverts* it, because there the `nqb = Sq/BQ` batch items are w
 
 ## 6. What is not measured
 
-Every number here is latency. **No accuracy result exists for any configuration in this
-document.** The configurations that win are also the coarsest: chunk-wide selection means one
-KV set for up to 2048 query tokens, and the best end-to-end result additionally replaces
-QUOKA's query sub-selection with an evenly spaced sample, discarding its central claim. Read
-every speedup as an upper bound conditional on a quality result nobody has produced.
+Every number here is latency. **No downstream accuracy result exists for any configuration in
+this document** — no task score, no perplexity. What does now exist is a *recall* proxy, in
+`oracle-block-scoring.md`, and it is not kind to the coarsest configurations: chunk-wide
+selection (`k=32`) at 25% density gives up **8.9 points** of absolute attention mass to the
+coarsening alone, against 1.0 at `k=4`, and at 6.25% it gives up 30. The evenly spaced query
+sample that replaces QUOKA's cosine ranking costs nothing and is slightly better. Read every
+speedup here as an upper bound conditional on a task-level quality result nobody has produced,
+and read the chunk-wide rows as trading roughly twice the recall of `k=4` for their speed.
 
 ## 7. Index
 
