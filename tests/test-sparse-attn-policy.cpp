@@ -48,8 +48,26 @@ int main() {
                 printf("FAIL chunks: NBk=%u d=%u u0=%u u=%u made it worse\n", n_bk, d, u0, u);
                 bad++;
             }
+            // The kernel drops to n_threads=1, pipeline=0 below FA_MIN_KV_BLOCKS = 3
+            // (ggml-hexagon.cpp:2139). It cannot be reached from u -- the chunk-size
+            // search caps Bc at align_down((kv_eff-1)/2, bs) precisely to prevent it --
+            // but that is a property of the search, so assert it rather than assume it.
+            if (llama_sparse_attn_nkvb(u, LLAMA_SPARSE_ATTN_BS) < 3) {
+                printf("FAIL cliff: NBk=%u d=%u u=%u gives %u chunks\n", n_bk, d, u,
+                       llama_sparse_attn_nkvb(u, LLAMA_SPARSE_ATTN_BS));
+                bad++;
+            }
         }
     }
+
+    // NOT asserted: that u is monotone in n_kv. It is not, and deliberately so. At
+    // NBk=28 the naive u0=7 has seven chunks, so the policy moves it to 9 (three
+    // chunks); at NBk=32 the naive u0=8 is already fine and stays. So u dips 9 -> 8 as
+    // the cache grows past 1792 -> 2048, eight times over n_kv up to 16384. The dip is
+    // always from a BOOSTED u back to a naive one -- u >= u0 always holds, which is the
+    // invariant that matters -- and the alternative is either giving up a 2x on the
+    // anomalous shapes or carrying the previous u across ubatches, which would stop u
+    // being a pure function of n_kv and break the can_reuse shape check.
 
     printf("%s\n", bad ? "FAILED" : "OK");
     return bad != 0;
