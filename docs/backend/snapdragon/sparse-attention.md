@@ -126,6 +126,41 @@ which measured 2.49x the cost of `u=18`.
 | 5888 | 92 | 23 | 23 | **24** | 3 |
 | 7936 | 124 | 31 | 31 | **32** | 4 |
 
+## 2c. End to end: the pipeline running in llama.cpp
+
+`LLAMA_SPARSE_ATTN=<density percent>` attaches a selection to `FLASH_ATTN_EXT`'s `src[5]`
+during prefill. Qwen3-1.7B **Q4_0** on 41c5710f, `-ub 1024`, `bs=64`, `bq=256` (k=4),
+selection = sink + most recent reachable blocks (no scorer yet). Arms alternated three
+times; every rep favours sparse at every length.
+
+| | dense t/s | sparse 25% | |
+|:--|--:|--:|--:|
+| pp2048 | 2044.9 | 2285.0 | **1.12x** |
+| pp4096 | 1761.2 | 2129.6 | **1.21x** |
+| pp8192 | 1325.9 | 1914.9 | **1.44x** |
+
+The gain grows with context because attention is the only `O(N^2)` term: at 2048 it is a
+small share of prefill, by 8192 it dominates. Extrapolating past 8192 from three points is
+not supported by this data.
+
+> **Use a legacy quant, or you are benchmarking the CPU.**
+> `ggml_hexagon_supported_mul_mat` accepts Q4_0/Q4_1/Q8_0/IQ4_NL/MXFP4/F16 and **not
+> K-quants**. A `Q4_K_M` model puts every MUL_MAT on the CPU while norms, RoPE and
+> flash-attention still run on the NPU -- nothing errors, and llama-bench still prints
+> `backend HTP`. Measured on the same model at pp1024: **Q4_K_M 230 t/s, Q4_0 2242 t/s**.
+> Attention is then a couple of percent of prefill and any attention result measures as
+> noise. Verify with `GGML_HEXAGON_VERBOSE=1 ... -v` and count
+> `supports-op MUL_MAT|...|yes` against `|no`.
+>
+> Note `llama-bench` installs `llama_null_log_callback` unless `-v`
+> (`llama-bench.cpp:2223`), so without it every llama and backend log line is discarded.
+
+> **Alternate and repeat every A/B on this device.** It throttles progressively, so
+> whichever arm runs second loses, by more than most effects being measured: a sparse arm
+> run straight after a 10-minute dense sweep measured 179 t/s against dense's 228, and the
+> two were 178.2 vs 177.8 under identical conditions. A stable *ratio* across reps with
+> drifting absolutes is the signature of a real effect.
+
 ## 3. The deployment table
 
 Attention kernel only, `bs=64`, 25% fine density, `u` rounded **up** to hold the measured
