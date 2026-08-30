@@ -214,6 +214,8 @@ public:
     void set_input_k_shift(ggml_tensor * dst) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    // Block-sparse FA: fill an I32 [u, NBq, 1, 1] selection. See llama-sparse-attn.h.
+    void set_input_sparse_sel(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t bs, uint32_t bq) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -396,6 +398,8 @@ public:
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    // Block-sparse FA: fill an I32 [u, NBq, 1, 1] selection. See llama-sparse-attn.h.
+    void set_input_sparse_sel(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t bs, uint32_t bq) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;

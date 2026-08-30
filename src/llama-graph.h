@@ -338,11 +338,16 @@ public:
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
+    // Block-sparse FA selection, or null when sparsity is off / not applicable.
+    ggml_tensor * get_sparse_sel() const { return self_sparse_sel; }
+
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    ggml_tensor * self_sparse_sel  = nullptr; // I32 [u, NBq, 1, 1], experimental
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -1172,7 +1177,13 @@ struct llm_graph_context {
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            // Block-sparse FA: an I32 [u, NBq, 1, 1] list of KV blocks and the
+            // query-block size its rows are expressed in. Null on every path but the
+            // plain-KV one. A backend that does not implement the indirection rejects
+            // the op and it runs dense, so this can only cost speed. llama-sparse-attn.h.
+            ggml_tensor * sparse_sel = nullptr,
+                    int   sparse_bq  = 0) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

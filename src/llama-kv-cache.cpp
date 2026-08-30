@@ -1761,6 +1761,66 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+void llama_kv_cache::set_input_sparse_sel(ggml_tensor * dst, const llama_ubatch * ubatch,
+                                          uint32_t bs, uint32_t bq) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(n_stream == 1 && "sparse FA: multi-stream selection not implemented");
+
+    const auto & cells = v_cells[0];
+
+    const uint32_t u    = (uint32_t) dst->ne[0];
+    const uint32_t n_qb = (uint32_t) dst->ne[1];
+    const uint32_t n_kv = (uint32_t) cells.size();
+    const uint32_t n_bk = (n_kv + bs - 1) / bs;
+
+    int32_t * data = (int32_t *) dst->data;
+
+    for (uint32_t qb = 0; qb < n_qb; ++qb) {
+        // How far this query block can causally reach. The list is shared by all bq
+        // queries in the block, so its reach is the LAST one's -- which is what the
+        // kernel assumes too: n_sel is fixed across query blocks and out-of-reach
+        // entries are killed by the per-row mask, not by a shorter list.
+        llama_pos pmax = -1;
+        for (uint32_t i = qb * bq; i < (qb + 1) * bq && i < ubatch->n_tokens; ++i) {
+            if (ubatch->pos[i] > pmax) {
+                pmax = ubatch->pos[i];
+            }
+        }
+
+        uint32_t n_avail = 0;               // KV blocks with at least one reachable cell
+        for (uint32_t j = 0; j < n_kv; ++j) {
+            if (!cells.is_empty(j) && cells.pos_get(j) <= pmax) {
+                n_avail = j / bs + 1;
+            }
+        }
+        if (n_avail == 0) {
+            n_avail = 1;
+        }
+
+        // Sink + the most recent reachable blocks. This is the P4 placeholder: it is
+        // what `recent` scores in the oracle study, which reaches 96-97% of the oracle
+        // on average but collapses to 81% on RULER vt -- good enough to prove the path,
+        // not good enough to ship. The scorer replaces this, not the plumbing.
+        int32_t * row = data + (size_t) qb * u;
+        uint32_t n = 0;
+        row[n++] = 0;
+        for (uint32_t b = n_avail; b-- > 1 && n < u; ) {
+            row[n++] = (int32_t) b;
+        }
+        // Pad with blocks BEYOND this query block's reach. They are fully masked, so
+        // they contribute exactly nothing -- but they must still be DISTINCT: the
+        // kernel never deduplicates (fa_chunk_block_idx, flash-attn-ops.c:250), so a
+        // repeated block would be accumulated twice into both the numerator and the
+        // softmax denominator and silently reweight the output.
+        for (uint32_t b = n_avail; b < n_bk && n < u; ++b) {
+            row[n++] = (int32_t) b;
+        }
+        // Only reachable if u > n_bk, which the caller does not allow.
+        GGML_ASSERT(n == u && "sparse FA: could not fill a distinct selection row");
+    }
+}
+
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -2637,6 +2697,11 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_sparse_sel(ggml_tensor * dst, const llama_ubatch * ubatch,
+                                                  uint32_t bs, uint32_t bq) const {
+    kv->set_input_sparse_sel(dst, ubatch, bs, bq);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

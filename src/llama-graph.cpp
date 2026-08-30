@@ -24,6 +24,8 @@
 #include <string>
 #include <unordered_set>
 
+#include "llama-sparse-attn.h"
+
 // dedup helpers
 
 static ggml_tensor * build_attn_inp_kq_mask(
@@ -41,6 +43,85 @@ static ggml_tensor * build_attn_inp_kq_mask(
     ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
     ggml_set_input(res);
     ggml_set_name(res, "attn_inp_kq_mask");
+
+    return res;
+}
+
+// Build the block-sparse FA selection leaf, or null when sparsity does not apply.
+//
+// Off unless LLAMA_SPARSE_ATTN=<density percent> is set. Also requires flash attention
+// (the selection rides on FLASH_ATTN_EXT's src[5]), a causal single-stream batch, and a
+// ubatch of more than BQ tokens -- at n_tokens <= BQ there is one query block, the
+// selection degenerates to the shared layout, and the kernel's Br|BQ constraint is not
+// even applied, so it proves nothing and buys nothing.
+static ggml_tensor * build_attn_inp_sparse_sel(
+        ggml_context * ctx,
+        const llama_kv_cache_context * mctx,
+        const llama_ubatch & ubatch,
+        const llama_cparams & cparams) {
+    const uint32_t density = llama_sparse_attn_density();
+    if (density == 0) {
+        return nullptr;
+    }
+
+    // The user asked for this explicitly, so every bail says why -- once per reason.
+    // The failure this guards against is silence: a path that quietly declines is
+    // indistinguishable from one that ran and did not help.
+    #define SPARSE_BAIL(fmt, ...) do {                                        \
+        static bool once = false;                                             \
+        if (!once) { once = true;                                             \
+            LLAMA_LOG_WARN("sparse-attn: off, " fmt "\n", __VA_ARGS__); }      \
+        return nullptr;                                                       \
+    } while (0)
+
+    if (!cparams.flash_attn) {
+        SPARSE_BAIL("needs flash attention (-fa 1)%s", "");
+    }
+    if (!cparams.causal_attn) {
+        SPARSE_BAIL("needs causal attention%s", "");
+    }
+    // Both conditions, not just the stream count. With kv_unified the stream count is 1
+    // even for many sequences, but the cache then interleaves them -- and the selection
+    // built in set_input_sparse_sel decides reachability from POSITION alone, so it
+    // would happily hand one sequence another's blocks. The mask would still zero them,
+    // making it a silent quality loss rather than a crash.
+    if (ubatch.n_seqs_unq != 1 || (cparams.kv_unified ? 1 : ubatch.n_seqs_unq) != 1) {
+        SPARSE_BAIL("only single-sequence batches (n_seqs_unq %u)", ubatch.n_seqs_unq);
+    }
+
+    const uint32_t bs = LLAMA_SPARSE_ATTN_BS;
+    const uint32_t bq = LLAMA_SPARSE_ATTN_BQ;
+
+    const uint32_t n_tokens = ubatch.n_tokens;
+    if (n_tokens <= bq) {
+        // At n_tokens <= bq there is one query block, the selection degenerates to the
+        // shared layout, and the kernel's Br|BQ constraint is not even applied -- it
+        // would prove nothing and buy nothing. Decode always lands here.
+        SPARSE_BAIL("ubatch %u <= bq %u (raise -ub)", n_tokens, bq);
+    }
+
+    const uint32_t n_kv = mctx->get_n_kv();
+    const uint32_t n_bk = (n_kv + bs - 1) / bs;
+
+    const uint32_t u = llama_sparse_attn_pick_u(n_bk, density, bs);
+    if (u == 0) {
+        SPARSE_BAIL("no useful u at n_kv %u (NBk %u, %u%%)", n_kv, n_bk, density);
+    }
+    #undef SPARSE_BAIL
+
+    ggml_tensor * res = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, u, (n_tokens + bq - 1) / bq, 1, 1);
+    ggml_set_input(res);
+    ggml_set_name(res, "attn_inp_sparse_sel");
+
+    {
+        static uint32_t last_n_kv = 0, last_nq = 0;
+        if (n_kv != last_n_kv || (uint32_t) res->ne[1] != last_nq) {
+            last_n_kv = n_kv;
+            last_nq   = (uint32_t) res->ne[1];
+            LLAMA_LOG_WARN("sparse-attn: n_kv %u NBk %u u %u (%.1f%%) NBq %u bs %u bq %u\n",
+                           n_kv, n_bk, u, 100.0*u/n_bk, last_nq, bs, bq);
+        }
+    }
 
     return res;
 }
@@ -477,6 +558,10 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
     }
 
+    if (self_sparse_sel && self_sparse_sel->buffer) {
+        mctx->set_input_sparse_sel(self_sparse_sel, ubatch, LLAMA_SPARSE_ATTN_BS, LLAMA_SPARSE_ATTN_BQ);
+    }
+
     if (self_k_rot && self_k_rot->buffer) {
         mctx->set_input_k_rot(self_k_rot);
     }
@@ -497,6 +582,14 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    // u is a pure function of n_kv, which can_reuse_kq_mask already pins. NBq is not --
+    // it follows n_tokens. A stale selection is not a wrong shape that fails loudly, it
+    // is a wrong ANSWER that still runs, so check it explicitly.
+    if (self_sparse_sel) {
+        res &= self_sparse_sel->ne[1] ==
+               (params.ubatch.n_tokens + LLAMA_SPARSE_ATTN_BQ - 1) / LLAMA_SPARSE_ATTN_BQ;
+    }
 
     return res;
 }
@@ -2547,7 +2640,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * sparse_sel,
+                 int   sparse_bq) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2584,6 +2679,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+
+        if (sparse_sel) {
+            ggml_flash_attn_ext_set_sparse(cur, sparse_sel, LLAMA_SPARSE_ATTN_BS, sparse_bq);
+        }
 
         if (v_mla) {
 #if 0
@@ -2767,6 +2866,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
+
+        inp->self_sparse_sel = build_attn_inp_sparse_sel(ctx0, mctx_cur, ubatch, cparams);
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -2831,7 +2932,8 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il,
+                                       inp->get_sparse_sel(), LLAMA_SPARSE_ATTN_BQ);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
