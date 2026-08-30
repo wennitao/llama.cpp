@@ -5479,6 +5479,35 @@ enum ggml_prec ggml_flash_attn_ext_get_prec(
     return (enum ggml_prec) prec_i32;
 }
 
+void ggml_flash_attn_ext_set_sparse(
+        struct ggml_tensor * a,
+        struct ggml_tensor * sel,
+        int32_t              bs,
+        int32_t              bq) {
+    if (!sel) {
+        a->src[5] = NULL;
+        return;
+    }
+
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] == NULL);
+    GGML_ASSERT(sel->type == GGML_TYPE_I32);
+    // The backend indexes sel as base + kv_head*nb[2] + ib3*nb[3], then list[i], so it
+    // needs unit stride within a row and nothing else. Requiring full contiguity would
+    // reject the natural output of ggml_argsort_top_k, which is a strided view.
+    GGML_ASSERT(sel->nb[0] == sizeof(int32_t));
+
+    // Deliberately NOT asserted here: bs % 64, bq % 32, n_sel <= ceil(kv/bs), and the
+    // ne[1..3] shape rules. Every one of them is a soft reject in the backend's
+    // supports_op, where failing means "run this op densely somewhere else" -- a correct,
+    // recoverable outcome. Promoting them to GGML_ASSERT would abort the process on
+    // exactly the benign cases, e.g. a short prompt whose padded n_kv leaves fewer
+    // blocks than the caller's rounded-up n_sel.
+    a->src[5] = sel;
+    ggml_set_op_params_i32(a, 4, bs);
+    ggml_set_op_params_i32(a, 5, bq);
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {

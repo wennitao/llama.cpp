@@ -2445,6 +2445,25 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // Block-sparse flash attention: attend only to the KV *blocks* named by `sel`
+    // instead of the full [0, kv_len) range. Backends that do not implement the
+    // indirection reject the op (it then falls back to a dense backend, which
+    // ignores src[5] and computes the exact result), so this is an optimisation
+    // hint and never changes what the graph means.
+    //
+    //   sel: I32, nb[0] == 4, ne = [n_sel, NBq or 1, n_kv_heads or 1, n_seqs or 1]
+    //   bs:  KV block size, multiple of 64. Index i selects K/V rows [i*bs, i*bs + bs).
+    //   bq:  query-block size the sel rows are expressed in; 0 means "same as bs".
+    //        NBq = ceil(q->ne[1] / bq). ne[1] == 1 broadcasts one list to every query.
+    //
+    // n_sel must be FIXED across query blocks -- top-k, not a threshold. Backends
+    // derive chunk count, pipelining and scratch sizing from sel->ne[0] alone.
+    GGML_API void ggml_flash_attn_ext_set_sparse(
+            struct ggml_tensor * a,
+            struct ggml_tensor * sel,
+            int32_t              bs,
+            int32_t              bq);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

@@ -2242,11 +2242,15 @@ static bool ggml_hexagon_supported_fa_sparse(const struct ggml_tensor * op) {
     // strided view of the argsort result, and would silently drop the whole FA op
     // to a dense CPU fallback.
     if (sel->type != GGML_TYPE_I32 || sel->nb[0] != sizeof(int32_t)) {
+        HEX_VERBOSE("ggml-hex: fa-sparse no : sel type %s nb0 %zu (want I32, 4)\n",
+                    ggml_type_name(sel->type), (size_t) sel->nb[0]);
         return false;
     }
 
     const int64_t bs = ggml_hexagon_fa_sparse_bs(op);
     if (bs < 64 || (bs % 64) != 0 || bs > k->ne[1]) {
+        HEX_VERBOSE("ggml-hex: fa-sparse no : bs %lld (want multiple of 64, <= kv %lld)\n",
+                    (long long) bs, (long long) k->ne[1]);
         return false;
     }
 
@@ -2257,18 +2261,30 @@ static bool ggml_hexagon_supported_fa_sparse(const struct ggml_tensor * op) {
     // field cannot hold would silently truncate on the way to the device.
     const int64_t bq = ggml_hexagon_fa_sparse_bq(op);
     if (bq < 32 || (bq % 32) != 0 || bq > UINT16_MAX) {
+        HEX_VERBOSE("ggml-hex: fa-sparse no : bq %lld (want multiple of 32, <= %u)\n",
+                    (long long) bq, (unsigned) UINT16_MAX);
         return false;
     }
     if (sel->ne[1] != 1 && sel->ne[1] != (q->ne[1] + bq - 1) / bq) {
+        HEX_VERBOSE("ggml-hex: fa-sparse no : sel nq %lld (want 1 or ceil(%lld/%lld) = %lld)\n",
+                    (long long) sel->ne[1], (long long) q->ne[1], (long long) bq,
+                    (long long) ((q->ne[1] + bq - 1) / bq));
         return false;
     }
     if (sel->ne[2] != 1 && sel->ne[2] != k->ne[2]) {
+        HEX_VERBOSE("ggml-hex: fa-sparse no : sel nh %lld (want 1 or n_kv_heads %lld)\n",
+                    (long long) sel->ne[2], (long long) k->ne[2]);
         return false;
     }
     if (sel->ne[3] != 1 && sel->ne[3] != q->ne[3]) {
+        HEX_VERBOSE("ggml-hex: fa-sparse no : sel ns %lld (want 1 or n_seqs %lld)\n",
+                    (long long) sel->ne[3], (long long) q->ne[3]);
         return false;
     }
     if (sel->ne[0] < 1 || sel->ne[0] > (k->ne[1] + bs - 1) / bs) {
+        HEX_VERBOSE("ggml-hex: fa-sparse no : n_sel %lld (want 1..%lld = ceil(kv %lld / bs %lld))\n",
+                    (long long) sel->ne[0], (long long) ((k->ne[1] + bs - 1) / bs),
+                    (long long) k->ne[1], (long long) bs);
         return false;
     }
 

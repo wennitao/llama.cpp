@@ -7491,9 +7491,7 @@ struct test_flash_attn_ext_sparse : public test_case {
                                full->nb[1], full->nb[2], full->nb[3], 0);
             ggml_set_name(sel, "sel_view");
         }
-        out->src[5] = sel;
-        out->op_params[4] = (int32_t) bs;
-        out->op_params[5] = (int32_t) (per_qblock ? bq_eff() : 0);
+        ggml_flash_attn_ext_set_sparse(out, sel, (int32_t) bs, (int32_t) (per_qblock ? bq_eff() : 0));
 
         ggml_set_name(out, "out");
 
@@ -7852,8 +7850,7 @@ struct test_flash_attn_ext_qsubsample_topk : public test_case {
             ggml_set_name(lsel, "sel");
             ggml_tensor * o = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f/sqrtf((float) hs), 0.0f, 0.0f);
             ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
-            o->src[5] = lsel;
-            o->op_params[4] = (int32_t) bs;
+            ggml_flash_attn_ext_set_sparse(o, lsel, (int32_t) bs, 0);
             ggml_set_name(o, "out");
             return o;
         }
@@ -7903,8 +7900,7 @@ struct test_flash_attn_ext_qsubsample_topk : public test_case {
         // 17: block-sparse FA consuming a COMPUTED selection
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f/sqrtf((float) hs), 0.0f, 0.0f);
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
-        out->src[5] = sel;
-        out->op_params[4] = (int32_t) bs;
+        ggml_flash_attn_ext_set_sparse(out, sel, (int32_t) bs, 0);
         ggml_set_name(out, "out");
         return out;
     }
@@ -9054,9 +9050,8 @@ struct test_xattn_e2e : public test_case {
 
         ggml_tensor * out = ggml_flash_attn_ext(ctx, n.q, kfa, v, m, 1.0f/sqrtf((float) d), 0.0f, 0.0f);
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
-        out->src[5]       = n.sel;
-        out->op_params[4] = (int32_t) Bl;         // bs
-        out->op_params[5] = (int32_t) gm.Bq();    // bq; 0 would mean "== bs"
+        // bq; 0 would mean "== bs"
+        ggml_flash_attn_ext_set_sparse(out, n.sel, (int32_t) Bl, (int32_t) gm.Bq());
         ggml_set_name(out, "out");
         return out;
     }
@@ -9528,9 +9523,8 @@ struct test_quoka_block : public test_case {
         ggml_set_name(v, "v");
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f/sqrtf((float) d), 0.0f, 0.0f);
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
-        out->src[5]       = sel;
-        out->op_params[4] = (int32_t) Bl;
-        out->op_params[5] = 0;             // chunk-wide selection: Br is unconstrained
+        // chunk-wide selection: Br is unconstrained
+        ggml_flash_attn_ext_set_sparse(out, sel, (int32_t) Bl, 0);
         ggml_set_name(out, "out");
         return out;
     }
@@ -9682,9 +9676,8 @@ struct test_meanpool_block : public test_case {
         ggml_set_name(v, "v");
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f/sqrtf((float) d), 0.0f, 0.0f);
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
-        out->src[5]       = sel;
-        out->op_params[4] = (int32_t) Bl;
-        out->op_params[5] = (int32_t) Bl;      // per-query-block: one sel row per Bl queries
+        // per-query-block: one sel row per Bl queries
+        ggml_flash_attn_ext_set_sparse(out, sel, (int32_t) Bl, (int32_t) Bl);
         ggml_set_name(out, "out");
         return out;
     }
