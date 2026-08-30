@@ -362,7 +362,13 @@ struct htp_opformat {
             } else if (type == HTP_FA_KERNEL_HVX) {
                 path = "hvx";
             }
-            snprintf(str, max_size, "%s vtcm %d", path, (int) kparams->vtcm_size);
+            // Br/Bc/n_kv_blocks are what separate a sparse op from a dense one at a
+            // glance: dense has n_kv_blocks = ceil(kv/Bc), sparse has u/m, and a
+            // per-query-block selection pins Br to bq. Without them the line is the
+            // same string either way, and a silently-dense run is invisible.
+            snprintf(str, max_size, "%s vtcm %d Br %u Bc %u nkvb %u nth %u", path,
+                     (int) kparams->vtcm_size, (unsigned) kparams->Br, (unsigned) kparams->Bc,
+                     (unsigned) kparams->n_kv_blocks, (unsigned) kparams->n_threads);
         } else if (htp_op_is_unary(node.opcode)) {
             const auto * kparams = (const struct htp_unary_kernel_params *) node.kernel_params;
             snprintf(str, max_size, "%s vtcm %d", kparams->col_tile ? "wide-row" : "row-block", (int) kparams->vtcm_size);

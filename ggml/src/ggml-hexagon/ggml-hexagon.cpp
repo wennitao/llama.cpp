@@ -72,6 +72,12 @@ static int    opt_hostbuf = 1; // hostbuf ON by default
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
+// Block-sparse flash attention. 1 = honour src[5], 0 = ignore it and run the op densely.
+// This is the ONLY clean sparse-off A/B on a single binary: FA_SELECT cannot serve,
+// because 0 and 1 disable the HMX path entirely (:2006) and sparse is HMX-only, so
+// lowering it sends the whole op to CPU rather than to a dense HTP kernel. Without a
+// same-binary A/B every speedup number needs two builds and stops being trustworthy.
+static int    opt_fa_sparse = 1;
 // KV block residency map in the sparse HMX flash-attention kernel; see enum
 // htp_fa_res_mode. Default AUTO. Exposed so the feature can be A/B'd on one binary --
 // without that the perf comparison needs two builds and stops being trustworthy.
@@ -2232,6 +2238,13 @@ static bool ggml_hexagon_precompute_flash_attn_params(
 // Only the HMX kernel implements the indirection; anything else rejects the op
 // so it falls back to a dense backend rather than silently ignoring src[5].
 static bool ggml_hexagon_supported_fa_sparse(const struct ggml_tensor * op) {
+    if (!opt_fa_sparse) {
+        // Reject the sparse op so the node drops to a dense backend, which ignores
+        // src[5] and computes the exact same result. This is the A/B baseline.
+        HEX_VERBOSE("ggml-hex: fa-sparse no : disabled by GGML_HEXAGON_FA_SPARSE=0\n");
+        return false;
+    }
+
     const struct ggml_tensor * k   = op->src[1];
     const struct ggml_tensor * q   = op->src[0];
     const struct ggml_tensor * sel = op->src[5];
@@ -4757,6 +4770,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_mm_select = getenv("GGML_HEXAGON_MM_SELECT");
     const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
     const char * str_fa_kvres = getenv("GGML_HEXAGON_FA_KV_RESIDENCY");
+    const char * str_fa_sparse = getenv("GGML_HEXAGON_FA_SPARSE");
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
     const char * str_vmem     = getenv("GGML_HEXAGON_VMEM");
@@ -4810,6 +4824,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
     opt_fa_kv_residency = str_fa_kvres ? atoi(str_fa_kvres)               : opt_fa_kv_residency;
+    opt_fa_sparse = str_fa_sparse ? atoi(str_fa_sparse)                   : opt_fa_sparse;
     opt_ndev      = str_ndev     ? strtoul(str_ndev, NULL, 0)             : opt_ndev;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf)                      : opt_hostbuf;
     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;
