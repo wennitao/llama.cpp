@@ -564,7 +564,8 @@ Measured, kv=2048, bs=64, n_sel=8, Bl=64. Baseline is exact per-scorer-block sel
 ### The union size must be chosen for smoothness, not minimality
 
 `hmx_fa_find_chunk_size` requires `m = Bc/bs` to divide the selected-block count
-(`flash-attn-ops.h:444`), with `m <= 8`. So `n_kv_blocks = u / (largest divisor of u that is
+(`flash-attn-ops.h:444`), with `m <= 8` AND `m*bs <= align_down((u*bs-1)/2, bs)` — the
+pipeline cap, which binds more often than the 8. So `n_kv_blocks = u / (largest divisor of u that is
 <= 8)` -- a number-theoretic sawtooth. A prime `u` runs one chunk per block:
 
 | f | u | chunks | GFLOP | time µs |

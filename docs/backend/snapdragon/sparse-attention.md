@@ -74,6 +74,58 @@ costs **3.85×** the prediction.
 > term is the online-softmax O-accumulator rescale, which runs once per (query tile, chunk)
 > over `Br·G·DV` elements regardless of `Bc`. Untested.
 
+## 2b. `n_kv_blocks(u)`, validated on device, and the `u` policy
+
+The host can compute what `hmx_fa_find_chunk_size` will return without touching the device:
+
+```
+kv_eff = u * bs
+Bc     = max(bs, align_down(min(align_down((kv_eff-1)/2, bs), min(u,8)*bs), bs))
+m      = max{ d : d | u,  d*bs <= Bc }
+n_kv_blocks = u / m
+```
+
+Checked against the `fa-params` line for **20 values of `u`** at `kv=4096, nb=2048, bq=256`:
+**20/20 exact** on both `m` and `n_kv_blocks`. Two things this settles:
+
+- **The shorthand `m = largest divisor of u <= 8` is wrong**, because the pipeline cap
+  `align_down((kv_eff-1)/2, bs)` usually binds first. At `u=16` it gives `m=4` and **4
+  chunks**, not `m=8` and 2.
+- **The `FA_MIN_KV_BLOCKS = 3` cliff cannot be reached from `u`.** That same cap exists to
+  keep `n_kv_blocks >= 3`, and every one of the 20 rows came back `n_threads 6, pipeline 1`
+  — including `u=9`. The cliff is a short-`kv` phenomenon, not a `u` phenomenon.
+
+### The policy: move only for an anomalous chunk count
+
+`u` here is a top-k budget, not a data-dependent union, so it is a free parameter and the
+sawtooth can simply be avoided. The rule is *not* "minimise the cost model": the fit is good
+to 3% but its 16% worst case is the same size as the gap between adjacent good `u`, and it
+gets `u=16` vs `u=18` backwards (it predicts 18 is cheaper; measured, 16 is, 6339 vs 6451).
+
+What the model does get right is order-of-magnitude chunk anomalies. So:
+
+```
+u0  = max(3, ceil(density * NBk))
+win = [u0, min(NBk, u0+8)]
+u   = u0  if n_kv_blocks(u0) <= 2*min(n_kv_blocks over win)
+      else the smallest u in win attaining that minimum
+```
+
+Against all 20 measured points this fires 8 times, gains **1.32x to 3.00x** every time, and
+never fires on a `u` that was already good — so it cannot lose.
+
+**It is load-bearing, not insurance.** `n_kv` is padded to a multiple of 256, so `NBk` is a
+multiple of 4 and `u0 = NBk/4` walks *every* integer, primes included. Of the 64 padded `n_kv`
+values up to 16384, **28 have an anomalous `u0`** — `n_kv=4352` gives `u0=17` and 17 chunks,
+which measured 2.49x the cost of `u=18`.
+
+| n_kv | NBk | u0 | chunks | → u | chunks |
+|--:|--:|--:|--:|--:|--:|
+| 1792 | 28 | 7 | 7 | **9** | 3 |
+| 4352 | 68 | 17 | 17 | **18** | 3 |
+| 5888 | 92 | 23 | 23 | **24** | 3 |
+| 7936 | 124 | 31 | 31 | **32** | 4 |
+
 ## 3. The deployment table
 
 Attention kernel only, `bs=64`, 25% fine density, `u` rounded **up** to hold the measured

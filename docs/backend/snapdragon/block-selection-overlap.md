@@ -415,7 +415,8 @@ Three qualifications, and the last one is specific to *naive* union:
    other reasons, `R = 4` captures 1.49× of the available 1.51×.
 3. **The union size is data-dependent, and the kernel is not smooth in it.** A union landing
    on `u = 14` measured **2454 µs against 2149 µs for `u = 16`** — 12% less work, 14% more
-   time — because `n_kv_blocks = u / (largest divisor of u <= 8)` is a sawtooth. Confirmed
+   time — because `n_kv_blocks(u)` is a sawtooth (the full rule is below; the shorthand
+   `u / largest divisor <= 8` drops the pipeline cap and is wrong for `u = 16`). Confirmed
    twice in the same sweep (`u=10` at 1806 against `u=12` at 1651). A naive union produces
    whatever `u` the data gives, per query block and per KV head, so it will land on bad
    divisors routinely. Any deployment must **round the union up** to a divisor-friendly size,
