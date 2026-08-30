@@ -12708,6 +12708,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // chunks and additionally exercises the fallback's next-chunk K/V prefetch.
     test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1024, 256, 64, 2, true, true,  64, true));
     test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 1, 1024, 256, 64, 2, true, true,  64, true));
+    // ---------------------------------------------------------------------------------
+    // THE DEPLOYMENT GEOMETRY, and the capability cliff it has to clear.
+    //
+    // Qwen3-1.7B is n_head 16 / n_head_kv 8, so G = 2 and head_dim = 128. The planned
+    // pipeline runs bs = 64 with bq = 256 (k = 4 query blocks per list) at ubatch 1024.
+    //
+    // bq = 256 IS NOT AVAILABLE FOR EVERY MODEL. hmx_fa_find_chunk_size walks Br down
+    // from br_align in steps of br_unit = ceil(32/G) (flash-attn-ops.h:391, :434) and
+    // requires br_align % Br == 0, so a legal Br exists only where ceil(32/G) is a power
+    // of two. That holds for G in {1,2,4,8,9,10,16..32} and FAILS for G in {3,5,6,7,
+    // 11..15} -- Llama-3.2-3B is G = 3 and can never run this shape. The kernel says so
+    // itself at flash-attn-ops.h:430. The failure is fail-closed and silent: the op just
+    // drops to a dense backend.
+    //
+    // These rows are the gate. They must be read at nb = 1024, NOT at nb <= bq: with
+    // nb <= 256 there is one query block, sel->ne[1] == 1, per_qblock is false
+    // (ggml-hexagon.cpp:1991), br_align is 0 (:2120) and the Br | bq constraint is not
+    // applied at all -- a pass there proves nothing about the deployment.
+    //                                                     hs  nh nr    kv    nb  bs n_sel mask  perhd   bq  perqb
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, 1024, 1024, 64,  4, true, true, 256, true));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, 1024, 1024, 64,  9, true, true, 256, true));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, 2048, 1024, 64,  8, true, true, 256, true));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, 2048, 1024, 64, 12, true, true, 256, true));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, 4096, 1024, 64, 16, true, true, 256, true));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, 4096, 1024, 64, 18, true, true, 256, true));
+    // G = 4 (Llama-3.2-1B, 32/8): br_unit = 8, also legal. The other model the recall
+    // numbers were measured on, so the pipeline must work on both.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 4, 4096, 1024, 64, 16, true, true, 256, true));
+    // G = 3: br_unit = 11 divides no power of two, so this MUST come back unsupported.
+    // Registered deliberately -- it is the only row that proves the cliff is real and
+    // fails closed rather than silently mis-tiling.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 3, 4096, 1024, 64, 16, true, true, 256, true));
+
     // KV length that is not a multiple of bs: partial tail block x query axis.
     test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1000, 256, 64, 4, true, true,  64, true));
     // nb not a multiple of bq: the last query block is short.
