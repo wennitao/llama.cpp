@@ -14132,6 +14132,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // ---------------------------------------------------------------------------------
+    // THE THREADING CLIFF AT THE PIPELINE'S OWN OPERATING POINT.
+    //
+    // The planned pipeline is meanpool_s8 + k=4 (bq=256) + top-u, at kv=4096, nb=2048.
+    // 25% density there is u = 16, and n_kv_blocks(16) = 16/8 = 2 -- BELOW
+    // FA_MIN_KV_BLOCKS = 3, so the op runs n_threads=1, pipeline=0 (ggml-hexagon.cpp:2139).
+    // cost(u) = 121 + 161*n_kv_blocks + 0.554*kv_eff was never validated below 3 chunks
+    // (block-selection-overlap.md), and the one point that exists off-model, u=2 at kv=512,
+    // came in at 3.85x the prediction.
+    //
+    // Because u here is a top-k budget and not a data-dependent union, u is a FREE
+    // parameter: the pipeline may pick any value. So the only question that matters is
+    // which u is actually cheapest at this shape. This sweep answers it by measurement
+    // rather than by extrapolating the fit across its own validity boundary. u is chosen
+    // to straddle the cliff (9/15 give 3 chunks at a SMALLER u than 16's 2) and to span
+    // the divisor structure: m = largest divisor <= 8 is 3,4,5,8,6,5,7,8,5,7,6,8.
+    for (int u : { 9, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27, 28, 30, 31, 32 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, 4096, 2048, 64, u, /*mask=*/false,
+                                                               /*per_head_sel=*/true, 256, /*per_qblock=*/true));
+    }
+
+    // ---------------------------------------------------------------------------------
     // THE (k, u) GRID: the real deployment surface for a union pipeline.
     //
     // The scorer's block size is fixed at 64 on BOTH axes. k adjacent query blocks are

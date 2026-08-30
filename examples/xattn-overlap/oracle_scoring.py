@@ -333,7 +333,11 @@ def merge_rows(scores, k, how='amax'):
     if pad:
         scores = torch.cat([scores, scores[-1:].expand(pad, -1, -1)], 0)
     g = scores.view(-1, k, Hkv, NBk)
-    m = g.amax(1) if how == 'amax' else g.sum(1)
+    # 'mean' is not a third opinion -- it is what a scorer that pools Q at the COARSE
+    # granularity emits. meanpool's score is (mean Q)*(mean K), so averaging the group's
+    # Q block-means is algebraically identical to averaging their scores. That version
+    # needs no merge step in the graph at all; 'amax' needs a max-reduce over k rows.
+    m = g.amax(1) if how == 'amax' else (g.mean(1) if how == 'mean' else g.sum(1))
     return m.repeat_interleave(k, dim=0)[:NBq]
 
 
@@ -388,6 +392,9 @@ def main():
     ap.add_argument('--slack', type=float, default=2.0)
     ap.add_argument('--merge', type=int, nargs='*', default=[1],
                     help='k adjacent query blocks sharing one list (1 = per-block)')
+    ap.add_argument('--merge-how', dest='merge_how', default='amax', choices=['amax', 'mean'],
+                    help="how a group's k rows collapse to one. 'mean' == pooling Q at the "
+                         "coarse block, which costs one fewer graph op.")
     ap.add_argument('--faithful', type=int, default=0,
                     help='model the shared list the way the kernel does: cut once over the '
                          'group reach, force sink + group-last only. Only affects k > 1.')
@@ -427,7 +434,7 @@ def main():
                         # Merge FIRST, then apply the coarse-indexed bias leaf. Forcing per
                         # fine block before the merge (the default path) puts k diagonals in
                         # the shared row; the deployment puts two entries in it.
-                        scm = {n: merge_rows(v, mk, 'sum' if n == 'oracle' else 'amax')
+                        scm = {n: merge_rows(v, mk, 'sum' if n == 'oracle' else a.merge_how)
                                for n, v in raw.items()}
                         if a.force:
                             scm = {n: (v if n == 'oracle' else force_shared(v, mk))
