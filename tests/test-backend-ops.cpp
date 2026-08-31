@@ -9683,6 +9683,100 @@ struct test_meanpool_block : public test_case {
     }
 };
 
+// meanpool exactly as llama.cpp would build it, from the tensors it actually has.
+//
+// test_meanpool_block pools K from a freshly allocated [d, Lk, Hkv] tensor. The deployment
+// has no such tensor: the KV cache is [n_embd_k_gqa, kv_size] (llama-kv-cache.cpp:231) and
+// Q arrives as [d, n_head, n_tokens]. In BOTH the head index lives INSIDE the row, so the
+// [d, rows, blocks, heads] view that test_meanpool_block reshapes to for free is permuted
+// here -- nb[3] (the head stride, d elements) is smaller than nb[1] (the row stride, a whole
+// n_embd_gqa) -- and ggml_hexagon_supported_binary rejects a permuted operand outright
+// (ggml-hexagon.cpp), so every add in the reduction would fall to the CPU.
+//
+// The fix is to reduce with the WHOLE ROW as the unit: view as [n_embd_gqa, rows, blocks],
+// whose strides are strictly increasing, and let all heads pool inside one row. The head
+// axis is recovered afterwards by a reshape, and only the small final [d, N, H] transpose
+// costs a copy.
+//
+// This case exists to prove that shape stays on the NPU and still matches the CPU. A pass
+// in test_meanpool_block does not imply a pass here.
+struct test_meanpool_deploy : public test_case {
+    const int64_t d, Hq, Hkv, Lq, Lk, Bl, Bq, u, qsub, ksub;
+
+    int64_t G()   const { return Hq / Hkv; }
+    int64_t NBq() const { return Lq / Bq; }
+    int64_t NBk() const { return Lk / Bl; }
+
+    std::string op_desc(ggml_tensor *) override { return "MEANPOOL_DEPLOY"; }
+    std::string vars()  override { return VARS_TO_STR10(d, Hq, Hkv, Lq, Lk, Bl, Bq, u, qsub, ksub); }
+    bool run_whole_graph()  override { return true; }
+    bool perf_whole_graph() override { return true; }
+    double max_nmse_err()   override { return 5e-4; }
+
+    test_meanpool_deploy(int64_t d = 128, int64_t Hq = 16, int64_t Hkv = 8, int64_t Lq = 1024,
+                         int64_t Lk = 4096, int64_t Bl = 64, int64_t Bq = 256, int64_t u = 16,
+                         int64_t qsub = 4, int64_t ksub = 8)
+        : d(d), Hq(Hq), Hkv(Hkv), Lq(Lq), Lk(Lk), Bl(Bl), Bq(Bq), u(u), qsub(qsub), ksub(ksub) {}
+
+    // Sum over ne[1] by halving. Every operand is a contiguous block at the natural stride,
+    // so no step is permuted and none falls back.
+    static ggml_tensor * halve1(ggml_context * ctx, ggml_tensor * a, int64_t n) {
+        for (; n > 1; n /= 2) {
+            ggml_tensor * lo = ggml_view_4d(ctx, a, a->ne[0], n/2, a->ne[2], a->ne[3],
+                                            a->nb[1], a->nb[2], a->nb[3], 0);
+            ggml_tensor * hi = ggml_view_4d(ctx, a, a->ne[0], n/2, a->ne[2], a->ne[3],
+                                            a->nb[1], a->nb[2], a->nb[3], (size_t)(n/2)*a->nb[1]);
+            a = ggml_cont(ctx, ggml_add(ctx, lo, hi));
+        }
+        return a;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_ASSERT(Hq % Hkv == 0 && xattn_is_pow2(G()));
+        GGML_ASSERT(Bl % ksub == 0 && Bq % qsub == 0);
+        GGML_ASSERT(xattn_is_pow2(qsub) && xattn_is_pow2(ksub));
+        GGML_ASSERT(Lq % Bq == 0 && Lk % Bl == 0 && u <= NBk());
+
+        const int64_t gqa = d * Hkv;         // n_embd_k_gqa
+
+        // K exactly as the cache holds it.
+        ggml_tensor * kc = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, gqa, Lk);
+        ggml_set_name(kc, "cache_k");
+        // Q exactly as build_attn receives it.
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, Hq, Lq);
+        ggml_set_name(q, "q");
+
+        // ---- K: [gqa, ksub, NBk] -> [gqa, 1, NBk] -> [d, NBk, Hkv]
+        ggml_tensor * kv3 = ggml_view_3d(ctx, kc, gqa, ksub, NBk(),
+                                         (size_t)(Bl/ksub)*kc->nb[1], (size_t)Bl*kc->nb[1], 0);
+        ggml_tensor * km = halve1(ctx, kv3, ksub);
+        km = ggml_reshape_3d(ctx, km, d, Hkv, NBk());
+        km = ggml_cont(ctx, ggml_permute(ctx, km, 0, 2, 1, 3));            // [d, NBk, Hkv]
+        ggml_set_name(km, "k_pooled");
+
+        // ---- Q: [d*Hq, qsub, NBq] -> [d*Hq, 1, NBq] -> GQA sum -> [d, NBq, Hkv]
+        ggml_tensor * qv3 = ggml_view_3d(ctx, q, d*Hq, qsub, NBq(),
+                                         (size_t)(Bq/qsub)*q->nb[2], (size_t)Bq*q->nb[2], 0);
+        ggml_tensor * qm = halve1(ctx, qv3, qsub);
+        qm = ggml_reshape_4d(ctx, qm, d, G(), Hkv, NBq());                 // h = kv*G + j
+        qm = halve1(ctx, qm, G());                                         // [d,1,Hkv,NBq]
+        qm = ggml_reshape_3d(ctx, qm, d, Hkv, NBq());
+        qm = ggml_cont(ctx, ggml_permute(ctx, qm, 0, 2, 1, 3));            // [d, NBq, Hkv]
+        qm = ggml_scale(ctx, qm, 1.0f / ((float) qsub * (float) G() * (float) ksub * sqrtf((float) d)));
+        ggml_set_name(qm, "meanpool_q");
+
+        ggml_tensor * sc = ggml_mul_mat(ctx, km, qm);                      // [NBk, NBq, Hkv]
+        ggml_mul_mat_set_prec(sc, GGML_PREC_F32);
+        ggml_set_name(sc, "meanpool_scores");
+
+        ggml_tensor * bias = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, NBk(), NBq(), 1, 1);
+        ggml_set_name(bias, "sparse_bias");
+        ggml_tensor * ranked = ggml_argsort(ctx, ggml_add(ctx, sc, bias), GGML_SORT_ORDER_DESC);
+        ggml_set_name(ranked, "ranked");
+        return ranked;
+    }
+};
+
 struct test_flash_attn_ext_gather : public test_case {
     const int64_t hs;      // head size (DK == DV)
     const int64_t nh;      // number of KV heads
@@ -12958,6 +13052,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_xattn_select(128, 2, 2, 256, 1024, 8, 64, /*R=*/2, 8, /*stage=*/2, plant));
     }
 
+    // The deployment layout: K from a [n_embd_k_gqa, kv_size] cache, Q as [d, n_head, n_tokens].
+    //                                                 d   Hq Hkv   Lq    Lk  Bl   Bq   u qsub ksub
+    test_cases.emplace_back(new test_meanpool_deploy(128, 16,  8, 1024, 4096, 64, 256, 16,   4,   8));
+    test_cases.emplace_back(new test_meanpool_deploy(128, 16,  8, 1024, 4096, 64, 256, 16,   4,  16));
+    test_cases.emplace_back(new test_meanpool_deploy(128, 16,  8, 1024, 4096, 64, 256, 16,  64,  64));  // no subsample
+    test_cases.emplace_back(new test_meanpool_deploy(128, 32,  8,  512, 2048, 64, 256,  8,   4,   8));  // G=4
     test_cases.emplace_back(new test_meanpool_block(128, 4, 2, 128,  512, 64, 4, /*stage=*/0, /*kmean=*/false));
     test_cases.emplace_back(new test_meanpool_block(128, 8, 2, 256, 1024, 64, 8, /*stage=*/0, /*kmean=*/true));
     test_cases.emplace_back(new test_meanpool_block(128, 4, 2, 256,  512, 64, 4, /*stage=*/0, /*kmean=*/false, /*qsub=*/8));
@@ -14260,6 +14360,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int lq : { 512, 2048 }) {
         const int kv = 4096, u = 16;
         test_cases.emplace_back(new test_xattn_select (128, 16, 8, lq, kv, 16, 64, lq/64, u, /*stage=*/2));
+        // The deployment layout, K pooled INLINE from a cache-shaped tensor. This is the
+        // graph llama.cpp actually builds, so its cost is the real scorer cost -- unlike the
+        // rows below, which take K pre-pooled and so exclude the K side entirely.
+        //                                                d   Hq Hkv  Lq  Lk  Bl   Bq  u qsub ksub
+        test_cases.emplace_back(new test_meanpool_deploy(128, 16,  8, lq, kv, 64, 256, u,   4,   4));
+        test_cases.emplace_back(new test_meanpool_deploy(128, 16,  8, lq, kv, 64, 256, u,   4,   8));
+        test_cases.emplace_back(new test_meanpool_deploy(128, 16,  8, lq, kv, 64, 256, u,   4,  16));
+        test_cases.emplace_back(new test_meanpool_deploy(128, 16,  8, lq, kv, 64, 256, u,   4,  64));
         test_cases.emplace_back(new test_meanpool_block(128, 16, 8, lq, kv, 64, u, /*stage=*/1, /*kmean=*/false, /*qsub=*/64));
         test_cases.emplace_back(new test_meanpool_block(128, 16, 8, lq, kv, 64, u, /*stage=*/1, /*kmean=*/false, /*qsub=*/8));
         test_cases.emplace_back(new test_meanpool_block(128, 16, 8, lq, kv, 64, u, /*stage=*/1, /*kmean=*/false, /*qsub=*/4));
