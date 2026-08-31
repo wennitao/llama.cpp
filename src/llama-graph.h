@@ -1168,6 +1168,14 @@ struct llm_graph_context {
     // attention
     //
 
+    // Block-sparse FA: score KV blocks with meanpool and return an I32 selection view.
+    // Null when the shapes do not admit it. See llama-sparse-attn.h.
+    ggml_tensor * build_sparse_sel(
+            ggml_tensor * q_cur,
+            ggml_tensor * bias,
+            const llama_kv_cache_context * mctx_cur,
+            int il) const;
+
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_tokens]

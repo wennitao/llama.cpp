@@ -139,6 +139,26 @@ times; every rep favours sparse at every length.
 | pp4096 | 1761.2 | 2129.6 | **1.21x** |
 | pp8192 | 1325.9 | 1914.9 | **1.44x** |
 
+And with the real **meanpool scorer** (Q4/K8) replacing the static selection, same protocol
+on a later device (serial 87b3a4aa; the dense baselines agree to ~1.5%, so the two tables are
+comparable):
+
+| | dense t/s | meanpool Q4/K8 | | per-rep ratios |
+|:--|--:|--:|--:|:--|
+| pp2048 | 2081.4 | 2333.5 | **1.12x** | 1.114 1.140 1.110 |
+| pp4096 | 1794.2 | 2213.2 | **1.23x** | 1.208 1.253 1.240 |
+| pp8192 | 1319.7 | 1990.5 | **1.51x** | 1.394 1.610 1.526 |
+
+**The scorer is not slower than the static selection, it is slightly faster** -- which is not
+because scoring is free but because the bias leaf pushes causally unreachable blocks to
+-inf, so the selection never spends a slot on a block the mask will kill. The static
+selection padded with out-of-reach blocks, and the kernel staged and computed every one of
+them. The scorer's own cost (742 us per call at Lq=2048, Lk=4096, K pooled inline) is paid
+back by that.
+
+> The pp8192 spread is wide (1.39-1.61) and driven by one low dense sample; read it as
+> "about 1.5x", not 1.508.
+
 The gain grows with context because attention is the only `O(N^2)` term: at 2048 it is a
 small share of prefill, by 8192 it dominates. Extrapolating past 8192 from three points is
 not supported by this data.

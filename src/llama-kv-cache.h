@@ -174,6 +174,13 @@ public:
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+
+    // The K cache in its STORED layout -- [n_embd_k_gqa, bs, n_blocks] over layers[].k --
+    // for block pooling. Deliberately not get_k(): that view puts the head axis at ne[1]
+    // with the position stride above it, so a block view over it is permuted and every
+    // reduction op falls off the NPU. Here the head index stays inside the row, the strides
+    // are strictly increasing, and all heads pool together.
+    ggml_tensor * get_k_pool_src(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t bs, uint32_t ksub) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
@@ -216,6 +223,7 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     // Block-sparse FA: fill an I32 [u, NBq, 1, 1] selection. See llama-sparse-attn.h.
     void set_input_sparse_sel(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t bs, uint32_t bq) const;
+    void set_input_sparse_bias(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t bs, uint32_t bq) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -375,6 +383,9 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
 
+    // See llama_kv_cache::get_k_pool_src.
+    ggml_tensor * get_k_pool_src(ggml_context * ctx, int32_t il, uint32_t bs, uint32_t ksub) const;
+
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
     //   - k_cur  [n_embd_head_k, n_head_k, n_tokens]
@@ -400,6 +411,7 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     // Block-sparse FA: fill an I32 [u, NBq, 1, 1] selection. See llama-sparse-attn.h.
     void set_input_sparse_sel(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t bs, uint32_t bq) const;
+    void set_input_sparse_bias(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t bs, uint32_t bq) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;

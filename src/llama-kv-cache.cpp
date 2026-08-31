@@ -1267,6 +1267,27 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
 }
 
+ggml_tensor * llama_kv_cache::get_k_pool_src(ggml_context * ctx, int32_t il, uint32_t n_kv,
+                                             uint32_t bs, uint32_t ksub) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    auto * k = layers[ikv].k;   // [n_embd_k_gqa, kv_size, n_stream], contiguous
+
+    GGML_ASSERT(n_stream == 1 && "sparse FA: multi-stream pooling not implemented");
+    GGML_ASSERT(bs % ksub == 0);
+
+    const uint32_t n_blocks = n_kv / bs;
+    const uint32_t step     = bs / ksub;      // rows skipped between samples
+
+    // ne = [n_embd_k_gqa, ksub, n_blocks]; nb strictly increasing, so ggml_is_permuted is
+    // false and the halving adds stay on an accelerator that rejects permuted operands.
+    return ggml_view_3d(ctx, k,
+            k->ne[0], ksub, n_blocks,
+            k->nb[1]*step,
+            k->nb[1]*bs,
+            0);
+}
+
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
@@ -1759,6 +1780,59 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //const int64_t t_end = ggml_time_us();
 
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+}
+
+// The bias leaf the block scorer adds to its raw scores, before the argsort.
+//
+// Three jobs, all of which a raw dot product gets wrong:
+//   - block 0 (the attention sink) is forced in. Removing it collapses every scorer from
+//     ~99% of oracle to ~78-81% (docs/backend/snapdragon/oracle-block-scoring.md).
+//   - the group's last reachable block is forced in, so the newest queries always have
+//     causally valid keys. That is what the deployed XAttention bias leaf does too.
+//   - blocks the group cannot reach are pushed to -inf so they never consume a slot. The
+//     kernel would otherwise stage and compute them and let the per-row mask kill them,
+//     which is the wasted-slot effect that makes a shared list cost recall.
+void llama_kv_cache::set_input_sparse_bias(ggml_tensor * dst, const llama_ubatch * ubatch,
+                                           uint32_t bs, uint32_t bq) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(n_stream == 1 && "sparse FA: multi-stream selection not implemented");
+
+    const auto & cells = v_cells[0];
+
+    const uint32_t n_bk = (uint32_t) dst->ne[0];
+    const uint32_t n_qb = (uint32_t) dst->ne[1];
+    const uint32_t n_kv = (uint32_t) cells.size();
+
+    float * data = (float *) dst->data;
+
+    const float BIG = 1e9f;
+
+    for (uint32_t qb = 0; qb < n_qb; ++qb) {
+        llama_pos pmax = -1;
+        for (uint32_t i = qb * bq; i < (qb + 1) * bq && i < ubatch->n_tokens; ++i) {
+            if (ubatch->pos[i] > pmax) {
+                pmax = ubatch->pos[i];
+            }
+        }
+
+        uint32_t n_avail = 0;
+        for (uint32_t j = 0; j < n_kv; ++j) {
+            if (!cells.is_empty(j) && cells.pos_get(j) <= pmax) {
+                n_avail = j / bs + 1;
+            }
+        }
+        if (n_avail == 0) {
+            n_avail = 1;
+        }
+
+        float * row = data + (size_t) qb * n_bk;
+        for (uint32_t b = 0; b < n_bk; ++b) {
+            row[b] = b < n_avail ? 0.0f : -BIG;
+        }
+        row[0]           = BIG;
+        row[n_avail - 1] = BIG + 1.0f;      // outranks the sink; they coincide at n_avail==1
+    }
 }
 
 void llama_kv_cache::set_input_sparse_sel(ggml_tensor * dst, const llama_ubatch * ubatch,
@@ -2702,6 +2776,16 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
 void llama_kv_cache_context::set_input_sparse_sel(ggml_tensor * dst, const llama_ubatch * ubatch,
                                                   uint32_t bs, uint32_t bq) const {
     kv->set_input_sparse_sel(dst, ubatch, bs, bq);
+}
+
+void llama_kv_cache_context::set_input_sparse_bias(ggml_tensor * dst, const llama_ubatch * ubatch,
+                                                   uint32_t bs, uint32_t bq) const {
+    kv->set_input_sparse_bias(dst, ubatch, bs, bq);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_pool_src(ggml_context * ctx, int32_t il,
+                                                     uint32_t bs, uint32_t ksub) const {
+    return kv->get_k_pool_src(ctx, il, n_kv, bs, ksub);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

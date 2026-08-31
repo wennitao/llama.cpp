@@ -17,6 +17,17 @@
 #define LLAMA_SPARSE_ATTN_BS 64   // KV block the selection names
 #define LLAMA_SPARSE_ATTN_BQ 256  // query block one list serves (k = 4 blocks of 64)
 
+// Rows actually averaged per block, out of BS/BQ. Both sides subsample; neither is free
+// but they are not equally cheap. A query block's rows are a redundant view of the same
+// ranking question, so Q64 -> Q4 costs 0.001 of recall. A key block's CENTROID is the
+// object being ranked, so a sample estimates it rather than repeating it -- K is 5-9x more
+// sensitive. Measured over 11 RULER/LongBench datasets x 2 models at k=4, 25%:
+// K16 costs 0.2 points, K8 costs 0.5, K4 costs 0.9, K1 costs 3.6 and falls below having no
+// scorer at all. K8 is the knee: 2.6x cheaper than a full K mean on device (742 vs 1917 us
+// whole-graph at Lq=2048, Lk=4096) for half a point.
+#define LLAMA_SPARSE_ATTN_QSUB 4
+#define LLAMA_SPARSE_ATTN_KSUB 8
+
 // Density percent from the environment; 0 = off.
 static inline uint32_t llama_sparse_attn_density() {
     const char * s = getenv("LLAMA_SPARSE_ATTN");

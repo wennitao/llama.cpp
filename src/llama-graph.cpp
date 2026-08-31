@@ -109,9 +109,12 @@ static ggml_tensor * build_attn_inp_sparse_sel(
     }
     #undef SPARSE_BAIL
 
-    ggml_tensor * res = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, u, (n_tokens + bq - 1) / bq, 1, 1);
+    // The leaf is the reachability/sink BIAS, not the selection: the selection is now
+    // computed on device by the scorer. u rides along in ne[2] so build_attn can recover it
+    // without recomputing the policy.
+    ggml_tensor * res = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_bk, (n_tokens + bq - 1) / bq, u, 1);
     ggml_set_input(res);
-    ggml_set_name(res, "attn_inp_sparse_sel");
+    ggml_set_name(res, "attn_inp_sparse_bias");
 
     {
         static uint32_t last_n_kv = 0, last_nq = 0;
@@ -559,7 +562,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     }
 
     if (self_sparse_sel && self_sparse_sel->buffer) {
-        mctx->set_input_sparse_sel(self_sparse_sel, ubatch, LLAMA_SPARSE_ATTN_BS, LLAMA_SPARSE_ATTN_BQ);
+        mctx->set_input_sparse_bias(self_sparse_sel, ubatch, LLAMA_SPARSE_ATTN_BS, LLAMA_SPARSE_ATTN_BQ);
     }
 
     if (self_k_rot && self_k_rot->buffer) {
@@ -2631,6 +2634,86 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+// Sum over ne[1] by halving. Every operand is a contiguous block at the natural stride, so
+// no step is permuted -- which is what keeps the whole reduction off the CPU.
+static ggml_tensor * llama_sparse_halve1(ggml_context * ctx, ggml_tensor * a, int64_t n) {
+    for (; n > 1; n /= 2) {
+        ggml_tensor * lo = ggml_view_4d(ctx, a, a->ne[0], n/2, a->ne[2], a->ne[3],
+                                        a->nb[1], a->nb[2], a->nb[3], 0);
+        ggml_tensor * hi = ggml_view_4d(ctx, a, a->ne[0], n/2, a->ne[2], a->ne[3],
+                                        a->nb[1], a->nb[2], a->nb[3], (size_t)(n/2)*a->nb[1]);
+        a = ggml_cont(ctx, ggml_add(ctx, lo, hi));
+    }
+    return a;
+}
+
+// meanpool block scoring: mean(Q rows of a query block) . mean(K rows of a KV block).
+//
+// Both reductions use the WHOLE ROW as the unit -- [n_embd_gqa, rows, blocks] -- because in
+// both the KV cache and q_cur the head index lives inside the row, so the natural
+// [d, rows, blocks, heads] view is permuted and a backend that rejects permuted operands
+// would run every add on the CPU. All heads pool inside one row instead; the head axis comes
+// back with a reshape, and only the small final [d, N, H] transpose costs a copy.
+//
+// Returns an I32 [u, NBq, Hkv] selection view, or null if the shapes do not admit it.
+ggml_tensor * llm_graph_context::build_sparse_sel(
+        ggml_tensor * q_cur,
+        ggml_tensor * bias,
+        const llama_kv_cache_context * mctx_cur,
+        int il) const {
+    const int64_t bs   = LLAMA_SPARSE_ATTN_BS;
+    const int64_t bq   = LLAMA_SPARSE_ATTN_BQ;
+    const int64_t qsub = LLAMA_SPARSE_ATTN_QSUB;
+    const int64_t ksub = LLAMA_SPARSE_ATTN_KSUB;
+
+    const int64_t d   = q_cur->ne[0];
+    const int64_t Hq  = q_cur->ne[1];
+    const int64_t Lq  = q_cur->ne[2];
+    const int64_t Hkv = mctx_cur->get_k(ctx0, il)->ne[1];
+    const int64_t G   = Hq / Hkv;
+
+    const int64_t NBq = bias->ne[1];
+    const int64_t NBk = bias->ne[0];
+    const int64_t u   = bias->ne[2];
+
+    // halve1 needs powers of two, and a query block must not straddle the ubatch.
+    if (Lq % bq != 0 || (G & (G - 1)) != 0 || Hq % Hkv != 0) {
+        return nullptr;
+    }
+
+    // K: [n_embd_k_gqa, ksub, NBk] -> [n_embd_k_gqa, 1, NBk] -> [d, NBk, Hkv]
+    ggml_tensor * km = llama_sparse_halve1(ctx0, mctx_cur->get_k_pool_src(ctx0, il, bs, ksub), ksub);
+    km = ggml_reshape_3d(ctx0, km, d, Hkv, NBk);
+    km = ggml_cont(ctx0, ggml_permute(ctx0, km, 0, 2, 1, 3));
+    cb(km, "sparse_k_pool", il);
+
+    // Q: [d*Hq, qsub, NBq] -> [d*Hq, 1, NBq] -> sum over G -> [d, NBq, Hkv]
+    ggml_tensor * qv = ggml_view_3d(ctx0, q_cur, d*Hq, qsub, NBq,
+                                    (size_t)(bq/qsub)*q_cur->nb[2], (size_t)bq*q_cur->nb[2], 0);
+    ggml_tensor * qm = llama_sparse_halve1(ctx0, qv, qsub);
+    qm = ggml_reshape_4d(ctx0, qm, d, G, Hkv, NBq);          // query head h = kv_head*G + j
+    qm = llama_sparse_halve1(ctx0, qm, G);
+    qm = ggml_reshape_3d(ctx0, qm, d, Hkv, NBq);
+    qm = ggml_cont(ctx0, ggml_permute(ctx0, qm, 0, 2, 1, 3));
+    // Every mean's divisor folds here, with 1/sqrt(d). Only the RANKING matters, so the
+    // scale is cosmetic -- but it keeps the scores on the same footing as real logits, which
+    // is what makes the bias leaf's magnitudes meaningful.
+    qm = ggml_scale(ctx0, qm, 1.0f / ((float) qsub * (float) G * (float) ksub * sqrtf((float) d)));
+    cb(qm, "sparse_q_pool", il);
+
+    ggml_tensor * sc = ggml_mul_mat(ctx0, km, qm);           // [NBk, NBq, Hkv]
+    ggml_mul_mat_set_prec(sc, GGML_PREC_F32);
+
+    ggml_tensor * b3 = ggml_view_3d(ctx0, bias, NBk, NBq, 1, bias->nb[1], bias->nb[2], 0);
+    ggml_tensor * ranked = ggml_argsort(ctx0, ggml_add(ctx0, sc, b3), GGML_SORT_ORDER_DESC);
+    cb(ranked, "sparse_ranked", il);
+
+    // Strided view of the first u -- the argsort_top_k layout the backend is documented to
+    // accept (nb[0] == 4, nb[1] read rather than assumed contiguous).
+    return ggml_view_4d(ctx0, ranked, u, NBq, Hkv, 1,
+                        ranked->nb[1], ranked->nb[2], ranked->nb[3], 0);
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -2932,8 +3015,13 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    ggml_tensor * sparse_sel = nullptr;
+    if (inp->get_sparse_sel()) {
+        sparse_sel = build_sparse_sel(q_cur, inp->get_sparse_sel(), mctx_cur, il);
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il,
-                                       inp->get_sparse_sel(), LLAMA_SPARSE_ATTN_BQ);
+                                       sparse_sel, LLAMA_SPARSE_ATTN_BQ);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
