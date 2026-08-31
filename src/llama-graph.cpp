@@ -3018,6 +3018,18 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * sparse_sel = nullptr;
     if (inp->get_sparse_sel()) {
         sparse_sel = build_sparse_sel(q_cur, inp->get_sparse_sel(), mctx_cur, il);
+
+        // The bias leaf existing does NOT mean the selection reached the op: build_sparse_sel
+        // can decline on shape, and the backend can still reject src[5] and run dense. Both
+        // are silent and both look exactly like "sparsity had no effect on the output" --
+        // which is what an identical perplexity across densities looks like too. Say which.
+        static bool once = false;
+        if (!once) {
+            once = true;
+            LLAMA_LOG_WARN("sparse-attn: selection %s for layer %d (q_cur %lld x %lld x %lld)\n",
+                           sparse_sel ? "ATTACHED" : "DECLINED (shape)", il,
+                           (long long) q_cur->ne[0], (long long) q_cur->ne[1], (long long) q_cur->ne[2]);
+        }
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il,
