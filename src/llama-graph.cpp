@@ -561,8 +561,16 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
     }
 
+    // ggml_gallocr only reserves storage for tensors some node reads. An input leaf that
+    // no node consumed still has a buffer, but its data pointer aliases memory the
+    // allocator handed to something else -- so writing the bias into it silently corrupts
+    // live activations. Refuse rather than trust the caller to have wired it up.
     if (self_sparse_sel && self_sparse_sel->buffer) {
-        mctx->set_input_sparse_bias(self_sparse_sel, ubatch, LLAMA_SPARSE_ATTN_BS, LLAMA_SPARSE_ATTN_BQ);
+        if (self_sparse_sel->data == nullptr) {
+            LLAMA_LOG_WARN("sparse-attn: selection leaf unallocated, skipping bias\n");
+        } else {
+            mctx->set_input_sparse_bias(self_sparse_sel, ubatch, LLAMA_SPARSE_ATTN_BS, LLAMA_SPARSE_ATTN_BQ);
+        }
     }
 
     if (self_k_rot && self_k_rot->buffer) {
@@ -586,12 +594,24 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
 
-    // u is a pure function of n_kv, which can_reuse_kq_mask already pins. NBq is not --
-    // it follows n_tokens. A stale selection is not a wrong shape that fails loudly, it
-    // is a wrong ANSWER that still runs, so check it explicitly.
-    if (self_sparse_sel) {
-        res &= self_sparse_sel->ne[1] ==
-               (params.ubatch.n_tokens + LLAMA_SPARSE_ATTN_BQ - 1) / LLAMA_SPARSE_ATTN_BQ;
+    // Whether sparsity applies AT ALL has to be part of reuse, not just its shape.
+    // The graph reserved at context init uses a small ubatch, so it is built with no
+    // selection; every later ubatch is big enough to want one. Comparing only the shape
+    // of an EXISTING leaf let that sparsity-free graph be reused forever -- build_attn was
+    // never called again, so the scorer never entered the graph, while set_input kept
+    // filling a leaf no node consumed. That leaf is not allocated, so the writes landed on
+    // whatever shared that memory: perplexity moved by hundreds of points and looked
+    // exactly like a quality result.
+    {
+        const bool want = llama_sparse_attn_density() != 0 &&
+                          params.cparams.flash_attn && params.cparams.causal_attn &&
+                          params.ubatch.n_seqs_unq == 1 &&
+                          params.ubatch.n_tokens > LLAMA_SPARSE_ATTN_BQ;
+        res &= (want == (self_sparse_sel != nullptr));
+        if (self_sparse_sel) {
+            res &= self_sparse_sel->ne[1] ==
+                   (params.ubatch.n_tokens + LLAMA_SPARSE_ATTN_BQ - 1) / LLAMA_SPARSE_ATTN_BQ;
+        }
     }
 
     return res;
@@ -3020,13 +3040,16 @@ ggml_tensor * llm_graph_context::build_attn(
         sparse_sel = build_sparse_sel(q_cur, inp->get_sparse_sel(), mctx_cur, il);
 
         // The bias leaf existing does NOT mean the selection reached the op: build_sparse_sel
-        // can decline on shape, and the backend can still reject src[5] and run dense. Both
-        // are silent and both look exactly like "sparsity had no effect on the output" --
-        // which is what an identical perplexity across densities looks like too. Say which.
+        // can decline on shape, and the backend can still reject src[5] and run dense.
+        //
+        // ERROR, not WARN, and that is not severity inflation: this fires during the
+        // context's graph-reserve pass, before the logger is configured, and a WARN there
+        // is discarded. It looked for hours like the selection was never attaching in
+        // llama-perplexity -- the code was correct and the evidence was missing.
         static bool once = false;
         if (!once) {
             once = true;
-            LLAMA_LOG_WARN("sparse-attn: selection %s for layer %d (q_cur %lld x %lld x %lld)\n",
+            LLAMA_LOG_ERROR("sparse-attn: selection %s for layer %d (q_cur %lld x %lld x %lld)\n",
                            sparse_sel ? "ATTACHED" : "DECLINED (shape)", il,
                            (long long) q_cur->ne[0], (long long) q_cur->ne[1], (long long) q_cur->ne[2]);
         }

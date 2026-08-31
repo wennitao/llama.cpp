@@ -1832,6 +1832,7 @@ void llama_kv_cache::set_input_sparse_bias(ggml_tensor * dst, const llama_ubatch
         }
         row[0]           = BIG;
         row[n_avail - 1] = BIG + 1.0f;      // outranks the sink; they coincide at n_avail==1
+
     }
 }
 
