@@ -301,6 +301,51 @@ against 1.2 before. On Llama the spread is 1.7 points and the old reading broadl
 coarsening still dominates, but on at least one architecture a bad scorer compounds it rather
 than being masked by it.
 
+## Subsampling K, and why it decides the deployment
+
+Every `meanpool_sN` above subsamples **Q only** and takes a full 64-row K mean. That
+asymmetry was never deliberate, and it matters: Q pooling costs `O(n_tokens)` per layer per
+ubatch while K pooling costs `O(n_kv)`, so on a long prefill the K side is the whole cost.
+Measured inline on the HTP it is **+1366 to +1991 us** per call at `Lk` = 2048-4096, which is
+more than the entire `meanpool_s4` scorer it feeds (1570 us at `Lq=2048, Lk=4096`).
+
+There is a real reason to expect K to subsample *worse* than Q. On the Q side the 64 rows are
+a redundant view of the same ranking question, which is why 8-of-64 costs 0.1 points. On the
+K side the block **centroid is the object being ranked**, so a sample is a noisy estimate of
+it rather than a redundant view of it. The symmetry argument is not valid a priori.
+
+Absolute recall, `k=4`, 25% density, faithful metric, Q pooled at `bq`, 11 datasets x all
+layers x 2 instances:
+
+| Q / K rows | Qwen3-1.7B | vs K64 | Llama-3.2-1B | vs K64 |
+|:--|--:|--:|--:|--:|
+| Q64 / K64 | .902 | | .904 | |
+| **Q4 / K64** | **.901** | — | **.903** | — |
+| **Q4 / K16** | **.899** | −0.002 | **.901** | −0.002 |
+| Q4 / K8 | .896 | −0.005 | .899 | −0.004 |
+| Q4 / K4 | .892 | −0.009 | .896 | −0.007 |
+| Q4 / K2 | .882 | −0.019 | .889 | −0.014 |
+| Q4 / K1 | .866 | −0.036 | .876 | −0.027 |
+| `recent`, no scorer | .882 | −0.019 | .887 | −0.016 |
+
+**The asymmetry is real but mild.** Q is free to subsample (Q64 → Q4 costs 0.001); K is
+roughly 5-9x more sensitive per unit of subsample. But the absolute cost stays small down to
+K8: **K16 costs 0.2 points and K8 costs 0.5**, against a 4x and 8x cut in the only term that
+grows with context.
+
+Two consequences for the deployment:
+
+- **K8 or K16 is the operating point**, and it makes inline pooling affordable: the +1839 us
+  measured at K64 scales with rows read, so K8 is roughly +230 us — below the scorer itself.
+- **No pooled-K cache is needed.** Its whole justification was that K pooling is O(n_kv) per
+  layer per ubatch. Subsampling removes most of that, and a strided
+  `[n_embd_k_gqa, KSUB, NBk]` view over the cache tensor has strictly increasing strides, so
+  it stays on the NPU like the full-row version.
+
+> `Q4/K4` (.892) still beats `recent` (.882) on Qwen by a point of mean recall, and by more
+> in the tail — but it is the *first* configuration where the margin over having no scorer at
+> all gets thin. K8 keeps a 1.4-point margin; K1 falls below `recent` entirely.
+
 ## The table: quality against cost
 
 Quality is the ratio to the merged oracle at `k=4`, 25% density, 11 RULER/LongBench

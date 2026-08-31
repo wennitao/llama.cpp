@@ -260,6 +260,31 @@ def sc_meanpool_s4(q, k, bs, **kw):
 def sc_meanpool_s2(q, k, bs, **kw):
     return sc_meanpool_sub(q, k, bs, QSUB=2)
 
+def sc_meanpool_ksub(q, k, bs, QSUB=4, KSUB=8, **kw):
+    """meanpool subsampling BOTH sides: QSUB rows per query block, KSUB per key block.
+
+    Q subsampling is nearly free (0.1-0.2 pts at 8x) because a query block's 64 rows are a
+    redundant view of the same ranking question. K is not obviously symmetric: the block
+    CENTROID is the object being ranked, so a KSUB-row sample is a noisy estimate of it
+    rather than a redundant view of it. That is why this needs measuring rather than
+    assuming -- and it decides whether the deployed scorer needs a pooled-K cache at all,
+    since K pooling is O(n_kv) per layer per ubatch and Q pooling is O(n_tokens).
+    """
+    Hq, T, d = q.shape; Hkv = k.shape[0]; G = Hq // Hkv; NB = _blocks(T, bs)
+    pad = NB * bs - T
+    qz = torch.nn.functional.pad(q.float(), (0, 0, 0, pad))
+    kz = torch.nn.functional.pad(k.float(), (0, 0, 0, pad))
+    qs = max(1, bs // QSUB); ks = max(1, bs // KSUB)
+    qb = qz.view(Hkv, G, NB, bs, d)[:, :, :, ::qs, :].mean(3).mean(1)
+    kb = kz.view(Hkv, NB, bs, d)[:, :, ::ks, :].mean(2)
+    return torch.einsum('hnd,hmd->hnm', qb, kb).permute(1, 0, 2).contiguous() / math.sqrt(d)
+
+def sc_mp_q4k16(q, k, bs, **kw): return sc_meanpool_ksub(q, k, bs, 4, 16)
+def sc_mp_q4k8 (q, k, bs, **kw): return sc_meanpool_ksub(q, k, bs, 4, 8)
+def sc_mp_q4k4 (q, k, bs, **kw): return sc_meanpool_ksub(q, k, bs, 4, 4)
+def sc_mp_q4k2 (q, k, bs, **kw): return sc_meanpool_ksub(q, k, bs, 4, 2)
+def sc_mp_q4k1 (q, k, bs, **kw): return sc_meanpool_ksub(q, k, bs, 4, 1)
+
 def sc_meanpool_sub(q, k, bs, QSUB=8, **kw):
     """meanpool over a subsample: mean of QSUB evenly spaced rows per block, not all bs.
 
@@ -275,8 +300,9 @@ def sc_meanpool_sub(q, k, bs, QSUB=8, **kw):
     kb = kz.view(Hkv, NB, bs, d).mean(2)
     return torch.einsum('hnd,hmd->hnm', qb, kb).permute(1, 0, 2).contiguous() / math.sqrt(d)
 
-SCORERS = {'xattn': sc_xattn, 'quoka_str': sc_quoka_strided, 'meanpool_s8': sc_meanpool_sub, 'meanpool_s4': sc_meanpool_s4, 'meanpool_s2': sc_meanpool_s2, 'quoka': sc_quoka, 'meanpool': sc_meanpool,
-           'maxpool': sc_maxpool, 'recent': sc_recent, 'random': sc_random}
+SCORERS = {'meanpool': sc_meanpool, 'meanpool_s4': sc_meanpool_s4,
+           'q4k16': sc_mp_q4k16, 'q4k8': sc_mp_q4k8, 'q4k4': sc_mp_q4k4, 'q4k2': sc_mp_q4k2, 'q4k1': sc_mp_q4k1,
+           'recent': sc_recent}
 
 
 def force_sink_diag(scores):
