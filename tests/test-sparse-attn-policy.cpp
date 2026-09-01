@@ -69,6 +69,32 @@ int main() {
     // anomalous shapes or carrying the previous u across ubatches, which would stop u
     // being a pure function of n_kv and break the can_reuse shape check.
 
+    // Against the measured (kv=4096, nb=1024) surface: the policy must never choose a u
+    // that costs more than the naive one. Costs are microseconds read off the device.
+    static const struct { int u; int us; } surf[] = {
+        { 3,1764},{ 4,2194},{ 5,2632},{ 6,1832},{ 7,3526},{ 8,2285},{ 9,2387},{10,2728},
+        {11,5323},{12,2468},{13,6166},{14,3663},{15,3046},{16,3110},{17,7969},{18,3195},
+        {19,8903},{20,3864},{21,3661},{22,5496},{23,10619},{24,3771},{25,4701},{26,6408},
+        {27,6155},{28,4658},{29,13314},{30,4914},{31,14189},{32,4789},
+    };
+    const int NS = (int) (sizeof(surf)/sizeof(surf[0]));
+    auto cost = [&](uint32_t u) -> int {
+        for (int i = 0; i < NS; ++i) { if ((uint32_t) surf[i].u == u) { return surf[i].us; } }
+        return -1;
+    };
+    for (int i = 0; i < NS; ++i) {
+        const uint32_t u0 = (uint32_t) surf[i].u;
+        // round_u directly, not pick_u: a density round-trip does not recover u0 exactly
+        // and would compare the cost of one u against the choice made for another.
+        const uint32_t u = llama_sparse_attn_round_u(u0, 64, LLAMA_SPARSE_ATTN_BS);
+        const int c0 = cost(u0), c1 = cost(u);
+        if (c0 > 0 && c1 > 0 && c1 > c0 * 1.05) {
+            printf("FAIL surface: u0=%u (%d us) -> u=%u (%d us), %.2fx WORSE\n",
+                   u0, c0, u, c1, (double) c1 / c0);
+            bad++;
+        }
+    }
+
     printf("%s\n", bad ? "FAILED" : "OK");
     return bad != 0;
 }

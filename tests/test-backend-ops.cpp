@@ -14258,6 +14258,45 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // ---------------------------------------------------------------------------------
+    // THE FULL (kv, u) SURFACE. Every u from 1 to NBk at each context, so the sawtooth,
+    // the FA_MIN_KV_BLOCKS floor and the crossover against dense are all visible at once
+    // rather than inferred from a fitted model. bq = 256 (k=4), nb = the deployed ubatch.
+    for (int kv : { 512, 1024, 2048, 4096 }) {
+        const int nb  = kv < 1024 ? kv : 1024;
+        const int NBk = kv / 64;
+        for (int u = 1; u <= NBk; ++u) {
+            // Above 32 blocks, step by 2 but keep every prime -- the primes are where the
+            // divisor structure collapses to m=1 and the cost triples.
+            bool prime = u > 1;
+            for (int f = 2; f * f <= u; ++f) { if (u % f == 0) { prime = false; break; } }
+            if (u > 32 && (u % 2) && !prime) {
+                continue;
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, nb, 64, u, /*mask=*/false,
+                                                                   /*per_head_sel=*/true, 256, /*per_qblock=*/true));
+        }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // THE KERNEL ALONE, ACROSS CONTEXT, AT THE DENSITY QUALITY ACTUALLY ALLOWS.
+    //
+    // 62.5% with k=4 (bq=256) is the point that costs +2.4% perplexity; 25% costs +26%.
+    // nb tracks the deployed ubatch (min(kv, 1024)), and each sparse row is paired with
+    // the dense op at the same shape, so the ratio is the kernel's own speedup with no
+    // scorer, no per-graph constant and no FFN in the way.
+    for (int kv : { 512, 1024, 2048, 4096 }) {
+        const int nb = kv < 1024 ? kv : 1024;
+        const int u  = kv / 64 * 5 / 8;                  // 62.5% of NBk
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, kv, nb, /*mask=*/false, false, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, nb, 64, u, /*mask=*/false,
+                                                               /*per_head_sel=*/true, 256, /*per_qblock=*/true));
+        // and at 25%, for the contrast the quality number rules out
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, kv, nb, 64, kv/64/4, /*mask=*/false,
+                                                               /*per_head_sel=*/true, 256, /*per_qblock=*/true));
+    }
+
+    // ---------------------------------------------------------------------------------
     // THE THREADING CLIFF AT THE PIPELINE'S OWN OPERATING POINT.
     //
     // The planned pipeline is meanpool_s8 + k=4 (bq=256) + top-u, at kv=4096, nb=2048.

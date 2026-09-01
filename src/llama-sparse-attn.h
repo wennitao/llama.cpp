@@ -61,41 +61,44 @@ static inline uint32_t llama_sparse_attn_nkvb(uint32_t u, uint32_t bs) {
 
 // Pick u for a target density.
 //
-// Deliberately NOT "minimise the cost model": that fit is good to 3% but its 16% worst
-// case is the size of the gap between adjacent good u, and it ranks u=16 against u=18
-// backwards (it predicts 18 is cheaper; measured, 16 is -- 6339 vs 6451 us). The model
-// is only trusted for what it gets right by an order of magnitude: a u whose chunk count
-// is several times the neighbourhood minimum costs 2-3x, because every chunk is a fixed
-// ~161 us regardless of how much KV it holds.
+// The measured (kv, u) surface says two things that decide this.
 //
-// So: keep the naive u unless its chunk count is anomalous. Against the 20 measured
-// points this fires 8 times, gains 1.32x-3.00x every time, and never fires on a u that
-// was already good -- it cannot lose.
+// First, the kernel's cost does not depend on kv at all -- only on u and the query count.
+// u=16 costs 3112 / 3105 / 3110 us at kv = 1024 / 2048 / 4096 (0.2% spread). It touches u
+// blocks and nothing else. So the speedup against dense grows linearly with context, and
+// the right question is never "what fraction" but "how many blocks can I afford".
 //
-// This is load-bearing rather than insurance. n_kv is padded to a multiple of 256, so
-// NBk is a multiple of 4 and u0 = NBk/4 walks every integer, primes included: 28 of the
-// 64 padded n_kv values up to 16384 have an anomalous u0. n_kv=4352 gives u0=17, which
-// measured 2.49x the cost of u=18.
+// Second, cost is dominated by the CHUNK COUNT, not by u. At kv=4096, nb=1024: every u
+// with three chunks lands between 1764 and 3771 us, while u=17 (seventeen chunks, m=1)
+// costs 7969 and u=59 costs 26965 -- three times DENSE. A chunk is worth roughly five
+// blocks.
+//
+// So: minimise n_kv_blocks over a small window above the naive u, tie-breaking to the
+// smallest u. This never selects fewer blocks than the target, and when it moves it
+// usually moves to something both cheaper and larger. The one case in the measured
+// surface where it moves without needing to (u0=16 -> 18) costs 2.7% and buys two extra
+// blocks of recall, which is a trade worth making.
+//
+// The previous rule -- keep u0 unless its chunk count exceeded twice the window minimum --
+// was too lax and left up to 1.44x on the table (u0=5 kept 5 chunks at 2632 us when u=6
+// runs in three at 1832).
+static inline uint32_t llama_sparse_attn_round_u(uint32_t u0, uint32_t n_blocks, uint32_t bs) {
+    const uint32_t hi = u0 + 8 < n_blocks ? u0 + 8 : n_blocks - 1;
+    uint32_t best = u0, best_c = llama_sparse_attn_nkvb(u0, bs);
+    for (uint32_t u = u0 + 1; u <= hi; ++u) {
+        const uint32_t c = llama_sparse_attn_nkvb(u, bs);
+        if (c < best_c) {          // strict: a tie keeps the smaller u, which is cheaper
+            best_c = c;
+            best   = u;
+        }
+    }
+    return best;
+}
+
 static inline uint32_t llama_sparse_attn_pick_u(uint32_t n_blocks, uint32_t density_pct, uint32_t bs) {
     const uint32_t u0 = (n_blocks * density_pct + 99) / 100;
     if (u0 < 3 || u0 >= n_blocks) {
         return 0;                                  // nothing to gain; caller runs dense
     }
-    const uint32_t hi = u0 + 8 < n_blocks ? u0 + 8 : n_blocks - 1;
-    uint32_t lo_nkvb = llama_sparse_attn_nkvb(u0, bs);
-    for (uint32_t u = u0; u <= hi; ++u) {
-        const uint32_t c = llama_sparse_attn_nkvb(u, bs);
-        if (c < lo_nkvb) {
-            lo_nkvb = c;
-        }
-    }
-    if (llama_sparse_attn_nkvb(u0, bs) <= 2 * lo_nkvb) {
-        return u0;
-    }
-    for (uint32_t u = u0; u <= hi; ++u) {
-        if (llama_sparse_attn_nkvb(u, bs) == lo_nkvb) {
-            return u;
-        }
-    }
-    return u0;
+    return llama_sparse_attn_round_u(u0, n_blocks, bs);
 }
