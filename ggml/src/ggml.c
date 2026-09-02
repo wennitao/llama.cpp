@@ -5508,6 +5508,25 @@ void ggml_flash_attn_ext_set_sparse(
     ggml_set_op_params_i32(a, 5, bq);
 }
 
+void ggml_flash_attn_ext_set_sparse_cnt(
+        struct ggml_tensor * a,
+        struct ggml_tensor * cnt) {
+    if (!cnt) {
+        a->src[6] = NULL;
+        return;
+    }
+
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] != NULL);   // counts qualify a selection; they mean nothing alone
+    GGML_ASSERT(a->src[6] == NULL);
+    GGML_ASSERT(cnt->type == GGML_TYPE_F32);
+    GGML_ASSERT(cnt->nb[0] == sizeof(float));
+
+    // The ne[0..2] == sel->ne[1..3] shape rules stay soft rejects in the backend's
+    // supports_op, for the same reason as ggml_flash_attn_ext_set_sparse above.
+    a->src[6] = cnt;
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {

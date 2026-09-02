@@ -1174,7 +1174,10 @@ struct llm_graph_context {
             ggml_tensor * q_cur,
             ggml_tensor * bias,
             const llama_kv_cache_context * mctx_cur,
-            int il) const;
+            int il,
+            // Threshold mode only: receives the per-row length tensor for
+            // FLASH_ATTN_EXT src[6]; set to null in fixed-u mode.
+            ggml_tensor ** cnt_out = nullptr) const;
 
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
@@ -1191,7 +1194,8 @@ struct llm_graph_context {
             // plain-KV one. A backend that does not implement the indirection rejects
             // the op and it runs dense, so this can only cost speed. llama-sparse-attn.h.
             ggml_tensor * sparse_sel = nullptr,
-                    int   sparse_bq  = 0) const;
+                    int   sparse_bq  = 0,
+            ggml_tensor * sparse_cnt = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

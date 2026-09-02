@@ -92,6 +92,12 @@ struct htp_fa_kernel_params {
             // q_start/sel_bq. 0 = shared selection (sel->ne[1] == 1), the legacy layout.
             uint16_t sel_bq;
             uint16_t res_mode;           // enum htp_fa_res_mode (KV block residency)
+            // Per-row selection length (src[6] present): n_sel becomes the upper bound
+            // u_max and each query-block row reads its own length from the count
+            // tensor. Chunk decomposition, the KV loop bound and the DMA FIFO all
+            // become per-row; VTCM does not change -- it holds one Bc-wide chunk.
+            uint16_t dyn_sel;
+            uint16_t reserved0;
             int32_t  mask_broadcast;
             int32_t  pipeline;
             struct fastdiv_values div_G;

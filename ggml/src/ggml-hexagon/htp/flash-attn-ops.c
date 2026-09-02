@@ -119,6 +119,12 @@ struct hmx_fa_context {
     uint32_t     sel_nb1;     // byte stride between per-query-block lists; 0 = shared
     uint32_t     sel_nb2;     // byte stride between per-KV-head lists
     uint32_t     sel_nb3;     // byte stride between per-sequence lists
+    // Per-row selection length (src[6]; NULL = every row uses n_sel). F32 because it
+    // is the natural output of an in-graph reduction; read scalar, truncated, clamped.
+    const float * cnt;
+    uint32_t     cnt_nb_qb;   // byte stride between per-query-block counts; 0 = shared
+    uint32_t     cnt_nb_head; // byte stride between per-KV-head counts
+    uint32_t     cnt_nb_seq;  // byte stride between per-sequence counts
     uint32_t     sel_nq;      // query-block rows in sel[] (sel->ne[1])
     struct fastdiv_values div_sel_bq;  // q_start -> query-block row, divides by sel_bq
     uint32_t     sparse_bs;   // selection block size (== Bc when dense)
@@ -214,19 +220,47 @@ static inline uint32_t fa_sel_row(const struct hmx_fa_context * factx, uint32_t 
     return (uint32_t) hex_smin(fastdiv(q_start, &factx->div_sel_bq), factx->sel_nq - 1);
 }
 
-// Number of selected blocks in chunk c. Dense: the chunk is itself one block.
+// Selection length of one (query block, KV head, sequence) row. Without a count
+// tensor every row uses n_sel; with one, n_sel is the upper bound (u_max) and the row
+// reads its own length. The count is device memory the host validates only by SHAPE,
+// so it is truncated and clamped here -- an out-of-range value must degrade to a legal
+// length, never to a chunk count the DMA FIFO and the loop bound disagree about.
+static inline uint32_t fa_row_nsel(const struct hmx_fa_context * factx,
+                                   uint32_t qb, uint32_t kv_head, uint32_t ib3) {
+    if (__builtin_expect(factx->cnt == NULL, true)) {
+        return factx->n_sel;
+    }
+    const float c = *(const float *) ((const uint8_t *) factx->cnt +
+                                      qb      * factx->cnt_nb_qb +
+                                      kv_head * factx->cnt_nb_head +
+                                      ib3     * factx->cnt_nb_seq);
+    int32_t n = (int32_t) c;
+    if (n < 1) {
+        n = 1;
+    }
+    if (n > (int32_t) factx->n_sel) {
+        n = (int32_t) factx->n_sel;
+    }
+    return (uint32_t) n;
+}
+
+// Number of selected blocks in chunk c of one row. Dense: the chunk is itself one block.
 //
-// Deliberately NOT a function of the query block: n_sel is fixed across query blocks,
-// so every query block decomposes into the same chunk count with the same per-chunk
-// block count. That is what keeps the untagged DMA FIFO in sync -- the push count in
-// fa_push_chunk must equal the pop counts one loop iteration later, and those two
-// sites do not necessarily see the same query block. Do not let qb leak in here.
-static inline uint32_t fa_chunk_nblk(const struct hmx_fa_context * factx, uint32_t c) {
+// This IS a function of the query-block row (via row_nsel), which is safe for the
+// untagged DMA FIFO for the same reason fa_push_chunk derives its own sel row: every
+// push and pop site computes the length from the q_start of the TILE THE CHUNK SERVES,
+// so producer and consumer agree by construction. What must never happen is one site
+// using a cached "current" length while staging another tile's chunk -- the tail
+// prefetch stages the next tile's chunk 0 while the consumer still pops the current
+// tile's -- which is why the length is always re-derived from (qb, kv_head, ib3) and
+// never carried across the loop seam.
+static inline uint32_t fa_chunk_nblk(const struct hmx_fa_context * factx, uint32_t c,
+                                     uint32_t row_nsel) {
     if (__builtin_expect(factx->sel == NULL, true)) {
         return 1;
     }
     const uint32_t base = c * factx->m;
-    return base < factx->n_sel ? (uint32_t) hex_smin(factx->m, factx->n_sel - base) : 0;
+    return base < row_nsel ? (uint32_t) hex_smin(factx->m, row_nsel - base) : 0;
 }
 
 // Index of the j'th selected block of chunk c, for query block qb.
@@ -327,7 +361,7 @@ static inline void fa_res_begin_epoch(struct hmx_fa_context * factx, uint32_t ib
 static inline uint32_t fa_chunk_rows(const struct hmx_fa_context * factx,
                                      uint32_t c, uint32_t qb, uint32_t kv_head,
                                      uint32_t ib3, uint32_t n_kv) {
-    const uint32_t nblk = fa_chunk_nblk(factx, c);
+    const uint32_t nblk = fa_chunk_nblk(factx, c, fa_row_nsel(factx, qb, kv_head, ib3));
     uint32_t rows = 0;
     for (uint32_t j = 0; j < nblk; ++j) {
         rows += fa_block_rows(factx, c, j, qb, kv_head, ib3, n_kv);
@@ -2010,9 +2044,9 @@ static inline uint32_t fa_push_chunk(dma_queue * dma, const struct htp_tensor * 
                                      size_t m_line_bytes, size_t n_rows_q, size_t nek1,
                                      size_t buf, uint32_t ib3, bool push_mask,
                                      struct hmx_fa_context * factx) {
-    const uint32_t nblk = fa_chunk_nblk(factx, c);
     const uint32_t bs   = factx->sel ? factx->sparse_bs : (uint32_t) factx->Bc;
     const uint32_t qb   = fa_sel_row(factx, q_start);
+    const uint32_t nblk = fa_chunk_nblk(factx, c, fa_row_nsel(factx, qb, kv_head, ib3));
 
     for (uint32_t j = 0; j < nblk; ++j) {
         uint32_t  start;
@@ -2193,7 +2227,8 @@ static bool fa_sel_repeats_blocks(const struct hmx_fa_context * factx, uint32_t 
     for (uint32_t i = 0; i < n_q_blocks; ++i) {
         const uint32_t  qb   = fa_sel_row(factx, i * factx->Br);
         const int32_t * list = (const int32_t *) ((const uint8_t *) factx->sel + qb * factx->sel_nb1);
-        for (uint32_t s = 0; s < factx->n_sel; ++s) {
+        const uint32_t  ns   = fa_row_nsel(factx, qb, 0, 0);
+        for (uint32_t s = 0; s < ns; ++s) {
             uint32_t idx = (uint32_t) list[s];
             if (idx >= factx->n_blk_total) {
                 idx = factx->n_blk_total - 1;
@@ -2308,6 +2343,20 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
             // XAttention scorer emits (one Bl for both the query and the key axis).
             const uint32_t sel_bq = kparams->u.hmx.sel_bq ? kparams->u.hmx.sel_bq : factx.sparse_bs;
             factx.div_sel_bq = init_fastdiv_values(sel_bq ? sel_bq : 1);
+
+            // Per-row selection length. The host promises the shape mirrors sel's row
+            // axes (ne[0] == sel->ne[1] and so on); broadcast dims zero their stride so
+            // one count can serve every head or sequence, exactly like sel itself.
+            if (kparams->u.hmx.dyn_sel) {
+                const struct htp_tensor * cnt = octx->src[6];
+                if (!cnt || !cnt->data) {
+                    return HTP_STATUS_NO_SUPPORT;
+                }
+                factx.cnt         = (const float *) cnt->data;
+                factx.cnt_nb_qb   = (cnt->ne[0] > 1) ? cnt->nb[0] : 0;
+                factx.cnt_nb_head = (cnt->ne[1] > 1) ? cnt->nb[1] : 0;
+                factx.cnt_nb_seq  = (cnt->ne[2] > 1) ? cnt->nb[2] : 0;
+            }
         }
     }
 
@@ -2502,6 +2551,15 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
             // dense and for a shared (ne[1] == 1) selection.
             const uint32_t qb = fa_sel_row(&factx, q_start);
 
+            // This tile's own KV work: its row's selection length and the chunk count it
+            // decomposes into. Without a count tensor row_nsel == n_sel and row_chunks ==
+            // n_kv_blocks, so the fixed-length path is bit-identical. Everything inside
+            // this iteration -- loop bound, prefetch horizons, epilogue -- runs on
+            // row_chunks; factx.n_kv_blocks is only the across-tiles upper bound.
+            const uint32_t row_nsel   = factx.sel ? fa_row_nsel(&factx, qb, kv_head, ib3) : 0;
+            const uint32_t row_chunks = factx.sel ? (row_nsel + factx.m - 1) / factx.m
+                                                  : factx.n_kv_blocks;
+
             // Trace tag. Both inner axes are in it, because with the KV head outside the
             // query block loop a bare q_start recurs once per head and the phases become
             // impossible to attribute in a trace.
@@ -2562,7 +2620,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                     hmx_fa_o_update_job_t ou_job[2];
 
                     // Prefetch block 1 early if there are multiple blocks
-                    if (factx.n_kv_blocks > 1) {
+                    if (row_chunks > 1) {
                         fa_prefetch_block(dma, k, v, mask, 1, Bc, size_k_row_padded, size_k_row, size_v_row_padded, size_v_row,
                                           ik2, ik3, iv2, iv3, q_start, im3, kv_head, G, m_line_bytes, n_rows_q, nek1, 1, ib3, &factx);
                     }
@@ -2574,7 +2632,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                     // scattered slots, and without it they are exactly
                     // vtcm_k_fp16[buf] + j*bs*stride, so bases[0] is the old base.
                     void * k_bases[FA_SPARSE_MAX_M];
-                    const uint32_t nblk0 = fa_chunk_nblk(&factx, 0);
+                    const uint32_t nblk0 = fa_chunk_nblk(&factx, 0, row_nsel);
                     fa_pop_bases(dma, nblk0, k_bases);
                     fa_phase_k_interleave(&factx, blk0_rows, k_src_stride, k_bases,
                                           factx.k_res ? nblk0 : 1,
@@ -2591,14 +2649,14 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                     qk_job[0].hmx_scales     = factx.vtcm_hmx_scales_qk;
                     hmx_queue_push(hmx_q, hmx_queue_make_desc(hmx_fa_qk_dot_worker, &qk_job[0]));
 
-                    for (uint32_t kv_blk = 0; kv_blk < factx.n_kv_blocks; ++kv_blk) {
+                    for (uint32_t kv_blk = 0; kv_blk < row_chunks; ++kv_blk) {
                         const uint32_t kv_start    = fa_kv_block_start(&factx, kv_blk, qb, kv_head, ib3);
                         const uint32_t kv_rows     = fa_chunk_rows(&factx, kv_blk, qb, kv_head, ib3, nek1);
                         const size_t   n_col_tiles = hmx_ceil_div(kv_rows, HMX_FP16_TILE_N_COLS);
 
                         // ---- 1. Pop and run V-prep for current block ----
                         void * v_bases[FA_SPARSE_MAX_M];
-                        const uint32_t cur_nblk = fa_chunk_nblk(&factx, kv_blk);
+                        const uint32_t cur_nblk = fa_chunk_nblk(&factx, kv_blk, row_nsel);
                         fa_pop_bases(dma, cur_nblk, v_bases);
                         fa_phase_v_interleave(&factx, kv_rows, v_src_stride, v_bases,
                                               factx.v_res ? cur_nblk : 1,
@@ -2611,7 +2669,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                             if (__builtin_expect(factx.mask_use_cache, true)) {
                                 current_mask_vtcm = (__fp16 *) dma_queue_pop(dma).dst;
                             } else if (__builtin_expect(factx.mask_broadcast, true)) {
-                                fa_pop_n(dma, fa_chunk_nblk(&factx, kv_blk));
+                                fa_pop_n(dma, fa_chunk_nblk(&factx, kv_blk, row_nsel));
                                 current_mask_vtcm = factx.vtcm_mask_buf + buf_idx * factx.mask_slot_stride;
                             } else {
                                 fa_pop_mask_dma_gqa(dma, G);
@@ -2643,13 +2701,13 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         }
 
                         // ---- 4. Pop and run K-prep for next block & push next QK-dot ----
-                        if (kv_blk + 1 < factx.n_kv_blocks) {
+                        if (kv_blk + 1 < row_chunks) {
                             const uint32_t next_start = fa_kv_block_start(&factx, kv_blk + 1, qb, kv_head, ib3);
                             const uint32_t next_rows  = fa_chunk_rows(&factx, kv_blk + 1, qb, kv_head, ib3, nek1);
                             const size_t   next_buf   = 1 - buf_idx;
 
                             void * next_k_bases[FA_SPARSE_MAX_M];
-                            const uint32_t next_nblk = fa_chunk_nblk(&factx, kv_blk + 1);
+                            const uint32_t next_nblk = fa_chunk_nblk(&factx, kv_blk + 1, row_nsel);
                             fa_pop_bases(dma, next_nblk, next_k_bases);
                             fa_phase_k_interleave(&factx, next_rows, k_src_stride, next_k_bases,
                                                   factx.k_res ? next_nblk : 1,
@@ -2704,7 +2762,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         }
 
                         // Prefetch block kv_blk + 2
-                        if (kv_blk + 2 < factx.n_kv_blocks) {
+                        if (kv_blk + 2 < row_chunks) {
                             fa_prefetch_block(dma, k, v, mask, kv_blk + 2, Bc, size_k_row_padded, size_k_row, size_v_row_padded, size_v_row,
                                               ik2, ik3, iv2, iv3, q_start, im3, kv_head, G, m_line_bytes, n_rows_q, nek1, buf_idx, ib3, &factx);
                         }
@@ -2713,8 +2771,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                     }
 
                     // Epilogue
-                    if (factx.n_kv_blocks > 0) {
-                        const uint32_t last_blk = factx.n_kv_blocks - 1;
+                    if (row_chunks > 0) {
+                        const uint32_t last_blk = row_chunks - 1;
                         const size_t last_cols  = hmx_ceil_div(fa_kv_block_rows(&factx, last_blk, qb, kv_head, ib3, nek1), HMX_FP16_TILE_N_COLS);
                         ou_job[0].o_curr           = o_tile_curr;
                         ou_job[0].o_prev           = o_tile_prev;
@@ -2740,10 +2798,10 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                 } else {
                     // Fallback path
-                    for (uint32_t kv_blk = 0; kv_blk < factx.n_kv_blocks; ++kv_blk) {
+                    for (uint32_t kv_blk = 0; kv_blk < row_chunks; ++kv_blk) {
                         const uint32_t kv_start    = fa_kv_block_start(&factx, kv_blk, qb, kv_head, ib3);
                         const uint32_t kv_rows     = fa_chunk_rows(&factx, kv_blk, qb, kv_head, ib3, nek1);
-                        const uint32_t cur_nblk    = fa_chunk_nblk(&factx, kv_blk);
+                        const uint32_t cur_nblk    = fa_chunk_nblk(&factx, kv_blk, row_nsel);
                         const size_t   n_col_tiles = hmx_ceil_div(kv_rows, HMX_FP16_TILE_N_COLS);
                         const uint32_t chunk_bs    = factx.sel ? factx.sparse_bs : (uint32_t) Bc;
 
@@ -2764,9 +2822,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                             }
                         }
 
-                        if (kv_blk + 1 < factx.n_kv_blocks) {
+                        if (kv_blk + 1 < row_chunks) {
                             const size_t    prefetch_buf   = 1 - buf_idx;
-                            const uint32_t  nxt_nblk       = fa_chunk_nblk(&factx, kv_blk + 1);
+                            const uint32_t  nxt_nblk       = fa_chunk_nblk(&factx, kv_blk + 1, row_nsel);
                             for (uint32_t j = 0; j < nxt_nblk; ++j) {
                                 const uint32_t bstart = fa_chunk_block_start(&factx, kv_blk + 1, j, qb, kv_head, ib3);
                                 const uint32_t brows  = fa_block_rows(&factx, kv_blk + 1, j, qb, kv_head, ib3, nek1);
@@ -2858,7 +2916,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                             ou_job.DV               = DV;
 
                             hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_fa_o_update_worker, &ou_job));
-                            if (kv_blk + 1 == factx.n_kv_blocks) {
+                            if (kv_blk + 1 == row_chunks) {
                                 // Overlapped: run HVX build diag inv L while HMX is busy executing the update
                                 htp_trace_event_start(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, iter_tag);
                                 fa_build_d_diag_inv_l(&factx, n_row_tiles, n_row_tiles_g_br);

@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 
 #define LLAMA_SPARSE_ATTN_BS 64   // KV block the selection names
 #define LLAMA_SPARSE_ATTN_BQ 256  // query block one list serves (k = 4 blocks of 64)
@@ -28,7 +29,7 @@
 #define LLAMA_SPARSE_ATTN_QSUB 4
 #define LLAMA_SPARSE_ATTN_KSUB 8
 
-// Density percent from the environment; 0 = off.
+// Density percent from the environment; 0 = off. "thr:<c>" parses as 0 here.
 static inline uint32_t llama_sparse_attn_density() {
     const char * s = getenv("LLAMA_SPARSE_ATTN");
     if (!s) {
@@ -36,6 +37,25 @@ static inline uint32_t llama_sparse_attn_density() {
     }
     const int v = atoi(s);
     return (v > 0 && v < 100) ? (uint32_t) v : 0;
+}
+
+// Threshold mode: LLAMA_SPARSE_ATTN=thr:<c> replaces fixed top-u with a per-row adaptive
+// rule computed on device. Each 64-query block keeps KV block j iff softmax(scores)_j *
+// avail > c, the four blocks of one 256-query tile union their memberships, and the tile
+// serves that union with its own per-row length (FLASH_ATTN_EXT src[6]).
+//
+// Measured against fixed-u on wikitext-2 at ctx=4096 (bf16 reference, per-head scores):
+// c=1.0 gives the deployed fixed-u pipeline's quality at ~0.68x its kernel cost, and
+// c=0.3 gives DENSE quality at the deployed cost. The rule is per-element rather than
+// XAttention's cumulative-mass cut because it needs no sort/scatter in the graph, and
+// the two sit on the same measured quality/cost curve.
+static inline float llama_sparse_attn_thr() {
+    const char * s = getenv("LLAMA_SPARSE_ATTN");
+    if (!s || strncmp(s, "thr:", 4) != 0) {
+        return 0.0f;
+    }
+    const float c = (float) atof(s + 4);
+    return (c > 0.0f && c < 100.0f) ? c : 0.0f;
 }
 
 // n_kv_blocks the HMX kernel will choose for a given u. Transcribed from

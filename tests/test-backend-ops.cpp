@@ -7306,6 +7306,11 @@ struct test_flash_attn_ext_sparse : public test_case {
     // ggml_argsort_top_k produces, and the only case that proves sel_nb1 is read
     // rather than assumed contiguous.
     const bool    sel_strided;
+    // Per-row selection length (src[6]): n_sel becomes the upper bound and each
+    // (query block, head) row attends to its own first row_n() entries. The mask is
+    // cut to the same lengths, so the CPU reference IS the per-row-truncated
+    // attention -- a kernel that reads any fixed length fails by orders of magnitude.
+    const bool    dyn;
     // The SCORER's query-block size Bl. Real XAttention scores every (query block,
     // key block) pair at Bl granularity, so honouring its selection exactly forces
     // the attention query block Bq == Bl. Decoupling them means one attention block
@@ -7337,6 +7342,10 @@ struct test_flash_attn_ext_sparse : public test_case {
             return VARS_TO_STR14(hs, nh, nr, kv, nb, bs, n_sel, mask, per_head_sel, bq, per_qblock, sel_strided,
                                  bl, n_share);
         }
+        if (dyn) {
+            return VARS_TO_STR13(hs, nh, nr, kv, nb, bs, n_sel, mask, per_head_sel, bq, per_qblock, sel_strided,
+                                 dyn);
+        }
         if (!per_qblock) {
             return VARS_TO_STR9(hs, nh, nr, kv, nb, bs, n_sel, mask, per_head_sel);
         }
@@ -7357,10 +7366,11 @@ struct test_flash_attn_ext_sparse : public test_case {
     test_flash_attn_ext_sparse(int64_t hs = 128, int64_t nh = 4, int64_t nr = 4, int64_t kv = 1024,
                                int64_t nb = 64, int64_t bs = 64, int64_t n_sel = 4, bool mask = true, bool per_head_sel = true,
                                int64_t bq = 0, bool per_qblock = false, bool sel_strided = false,
-                               int64_t bl = 0, int64_t n_share = 0)
+                               int64_t bl = 0, int64_t n_share = 0, bool dyn = false)
         : hs(hs), nh(nh), nr(nr), kv(kv), nb(nb), bs(bs), n_sel(n_sel), mask(mask),
           per_head_sel(per_head_sel), bq(bq), per_qblock(per_qblock), sel_strided(sel_strided),
-          bl(bl), n_share(n_share) {
+          bl(bl), n_share(n_share), dyn(dyn) {
+        GGML_ASSERT(!dyn || R() == 1);  // per-row lengths and the union knobs are orthogonal features
         // A scorer block must tile the attention block exactly, or "the R scorer blocks
         // this attention block spans" is not well defined.
         GGML_ASSERT(bq_eff() % bl_eff() == 0);
@@ -7391,6 +7401,18 @@ struct test_flash_attn_ext_sparse : public test_case {
     // get identical finite values -- the net effect is that block's logits shifted by
     // +ln 2), and an out-of-range sentinel is clamped to the last block, i.e. the same bug.
     int64_t n_sel_row()  const { return R()*n_sel - (R() - 1)*n_share; }
+
+    // The row's own length under dyn: a deterministic spread over [1, n_sel_row()]
+    // that hits both extremes, varying with the query block and (when per-head) the
+    // head, so no two axes can be conflated.
+    int64_t row_n(int64_t iqb, int64_t ih_in) const {
+        if (!dyn) {
+            return n_sel_row();
+        }
+        const int64_t ih = per_head_sel ? ih_in : 0;
+        const int64_t iq = per_qblock ? iqb : 0;
+        return 1 + (iq * 5 + ih * 3) % n_sel_row();
+    }
 
     // Per-head selection needs a per-head mask, and a per-KV-head mask is only
     // expressible without GQA: the mask head is chosen as (query head %
@@ -7493,6 +7515,14 @@ struct test_flash_attn_ext_sparse : public test_case {
         }
         ggml_flash_attn_ext_set_sparse(out, sel, (int32_t) bs, (int32_t) (per_qblock ? bq_eff() : 0));
 
+        if (dyn) {
+            // F32 because that is what an in-graph reduction (sum_rows over a 0/1
+            // membership row) produces; the kernel truncates and clamps.
+            ggml_tensor * cnt = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_qblocks(), n_sel_heads(), 1);
+            ggml_set_name(cnt, "cnt");
+            ggml_flash_attn_ext_set_sparse_cnt(out, cnt);
+        }
+
         ggml_set_name(out, "out");
 
         return out;
@@ -7550,6 +7580,14 @@ struct test_flash_attn_ext_sparse : public test_case {
                     }
                 }
                 ggml_backend_tensor_set(t, idx.data(), 0, idx.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "cnt") == 0) {
+                std::vector<float> cn(n_qblocks() * n_sel_heads());
+                for (int64_t ih = 0; ih < n_sel_heads(); ih++) {
+                    for (int64_t iqb = 0; iqb < n_qblocks(); iqb++) {
+                        cn[ih*n_qblocks() + iqb] = (float) row_n(iqb, ih);
+                    }
+                }
+                ggml_backend_tensor_set(t, cn.data(), 0, cn.size()*sizeof(float));
             } else if (strcmp(t->name, "sel_view") == 0) {
                 // Shares "sel"'s storage; the default uniform fill would clobber it.
             } else if (strcmp(t->name, "m") == 0) {
@@ -7579,7 +7617,10 @@ struct test_flash_attn_ext_sparse : public test_case {
                             // strictly stronger attention than exact per-scorer-block
                             // attention. That is a modelling decision; what the test
                             // asserts is that kernel and CPU agree on the union.
-                            for (int64_t is = 0; is < n_sel_row(); is++) {
+                            // row_n(), not n_sel_row(): with per-row lengths the -INF
+                            // pattern is the TRUNCATED row, so the CPU reference equals
+                            // the kernel's per-row attention exactly.
+                            for (int64_t is = 0; is < row_n(iqb, ih); is++) {
                                 const int64_t blk = sel_block(iqb, ih, is);
                                 for (int64_t j = blk*bs; j < std::min(blk*bs + bs, kv); j++) {
                                     keep[j] = true;
@@ -12876,6 +12917,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // (nek1 % bs != 0), so this is the only overlapping row that runs m == 1, i.e. one
     // block per chunk, with the broadcast-mask dma_cache live alongside the map.
     test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1000, 512, 64, 8, true, true,  64, true));
+
+    // PER-ROW selection lengths (src[6], dyn=true). n_sel becomes the upper bound
+    // u_max: each (query block, head) row attends to its own first row_n() entries,
+    // spread deterministically over [1, u_max] so both extremes occur, and the mask is
+    // truncated to the same lengths -- the CPU reference IS the per-row attention. A
+    // kernel that reads any single fixed length for every row fails by orders of
+    // magnitude, not by rounding.
+    //                                                     hs   nh nr  kv    nb   bs   u  mask perhd   bq  perqb  strided bl ns  dyn
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1024,  256, 64,  8, true, true,  64, true,  false,  0, 0, true));
+    // nr == 1: per-head selection AND per-head counts -- the only rows where
+    // cnt->ne[1] > 1, i.e. where the kernel's cnt_nb_head stride is nonzero.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 1, 1024,  256, 64,  8, true, true,  64, true,  false,  0, 0, true));
+    // Shared selection with shared counts under a per-head mask.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 1, 1024,  256, 64,  8, true, false, 64, true,  false,  0, 0, true));
+    // The deployment geometry (bq=256, G=2): m = 8, so short rows end in a chunk of
+    // fewer than m blocks -- the partial-chunk path on every tile whose length is not
+    // a multiple of 8.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, 2048, 1024, 64, 16, true, true, 256, true,  false,  0, 0, true));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 8, 2, 4096, 1024, 64, 32, true, true, 256, true,  false,  0, 0, true));
+    // Ragged final query tile and ragged final KV block, each under per-row lengths.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1024,  192, 64,  8, true, true,  64, true,  false,  0, 0, true));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1000,  256, 64,  8, true, true,  64, true,  false,  0, 0, true));
+    // Strided sel view: the argsort-top-k layout with a count channel.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1024,  256, 64,  8, true, true,  64, true,  true,   0, 0, true));
+    // Block reuse (the residency-map rows above) with per-row lengths: the repeats
+    // probe now reads each row's own length.
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 4, 1024,  512, 64,  8, true, true,  64, true,  false,  0, 0, true));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(128, 4, 1, 1024,  512, 64,  8, true, true,  64, true,  false,  0, 0, true));
 
     // UNION selections: attention query block Bq decoupled from scorer query block Bl.
     //

@@ -105,7 +105,7 @@ enum htp_op_code {
 };
 
 #define HTP_OP_MAX_DIMS    4    // aka GGML_MAX_DIMS
-#define HTP_OP_MAX_INPUTS  6    // aka GGML_MAX_SRCS
+#define HTP_OP_MAX_INPUTS  7    // sparse flash-attention carries sel (src 5) and its per-row count (src 6)
 #define HTP_OP_MAX_OUTPUTS 4
 #define HTP_OP_MAX_PARAMS  16   // aka GGML_MAX_OP_PARAMS
 #define HTP_OP_MAX_KERN_PARAMS 32
@@ -155,7 +155,7 @@ struct htp_op_desc {
     int32_t  kernel_params[HTP_OP_MAX_KERN_PARAMS]; // generic blob for host-precomputed parameters
     uint16_t src[HTP_OP_MAX_INPUTS];    // Input tensors indices
     uint16_t dst[HTP_OP_MAX_OUTPUTS];   // Output tensor indices
-    uint16_t pad[2];                    // padding to align to 64 bits
+    uint16_t pad[1];                    // padding to align to 64 bits
 };
 
 #ifndef HTP_MAX_NTHREADS

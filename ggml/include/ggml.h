@@ -2456,13 +2456,28 @@ extern "C" {
     //   bq:  query-block size the sel rows are expressed in; 0 means "same as bs".
     //        NBq = ceil(q->ne[1] / bq). ne[1] == 1 broadcasts one list to every query.
     //
-    // n_sel must be FIXED across query blocks -- top-k, not a threshold. Backends
-    // derive chunk count, pipelining and scratch sizing from sel->ne[0] alone.
+    // Without a count tensor (below), n_sel is FIXED across query blocks -- top-k,
+    // not a threshold. Backends derive chunk count, pipelining and scratch sizing
+    // from sel->ne[0] alone.
     GGML_API void ggml_flash_attn_ext_set_sparse(
             struct ggml_tensor * a,
             struct ggml_tensor * sel,
             int32_t              bs,
             int32_t              bq);
+
+    // Optional per-row selection length for a sparse flash-attention op (src[6]).
+    // Makes sel->ne[0] an upper bound (u_max) instead of the exact length: row
+    // (qb, kv_head, seq) attends to its FIRST cnt[qb, kv_head, seq] entries of the
+    // matching sel row. cnt is F32 -- it is the natural output of reductions like
+    // ggml_sum_rows -- and backends truncate toward zero and clamp to [1, u_max].
+    //
+    //   cnt: F32, ne = [sel->ne[1], sel->ne[2], sel->ne[3], 1]
+    //
+    // Call AFTER ggml_flash_attn_ext_set_sparse. A backend that cannot honour a
+    // per-row length rejects the op in supports_op, exactly like the shape rules.
+    GGML_API void ggml_flash_attn_ext_set_sparse_cnt(
+            struct ggml_tensor * a,
+            struct ggml_tensor * cnt);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "llama-sparse-attn.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -2312,6 +2313,15 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         for (const auto & lora : model.loras) {
             res += lora->get_n_nodes();
         }
+    }
+
+    // The block-sparse threshold scorer (llama-sparse-attn.h) adds ~25 nodes per
+    // attention layer: pooling views, softmax, the membership comparison, four union
+    // views with their adds, sum_rows and argsort. The fixed-u scorer fits in the
+    // slack; the threshold one measurably does not (graph_reserve aborts in
+    // ggml_view_4d with the metadata pool exhausted).
+    if (llama_sparse_attn_thr() != 0.0f || llama_sparse_attn_density() != 0) {
+        res += 32u * model.hparams.n_layer();
     }
 
     uint32_t n_sampling_nodes = 0;

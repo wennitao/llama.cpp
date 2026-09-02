@@ -1800,7 +1800,11 @@ void llama_kv_cache::set_input_sparse_bias(ggml_tensor * dst, const llama_ubatch
 
     const auto & cells = v_cells[0];
 
-    const uint32_t n_bk = (uint32_t) dst->ne[0];
+    // Threshold leaves (ne[3] == 2, see build_attn_inp_sparse_sel) carry an extra
+    // avail row and split the bias into a pre-softmax slice and a post-threshold
+    // force slice; the caller passes bq == bs for them (one row per fine block).
+    const bool     thr  = dst->ne[3] == 2;
+    const uint32_t n_bk = (uint32_t) dst->ne[0] - (thr ? 1 : 0);
     const uint32_t n_qb = (uint32_t) dst->ne[1];
     const uint32_t n_kv = (uint32_t) cells.size();
 
@@ -1824,6 +1828,30 @@ void llama_kv_cache::set_input_sparse_bias(ggml_tensor * dst, const llama_ubatch
         }
         if (n_avail == 0) {
             n_avail = 1;
+        }
+
+        if (thr) {
+            // Slice 0: the pre-softmax reach bias, plus the row's avail in the extra
+            // slot -- it rescales the softmax so the c threshold is length-independent.
+            float * row = data + (size_t) qb * dst->nb[1] / sizeof(float);
+            for (uint32_t b = 0; b < n_bk; ++b) {
+                row[b] = b < n_avail ? 0.0f : -BIG;
+            }
+            row[n_bk] = (float) n_avail;
+
+            // Slice 1: the post-threshold force. +BIG makes the sink and the row's own
+            // block members regardless of score; -BIG keeps unreachable blocks out even
+            // if rounding leaves them a whisker of probability. A +BIG in slice 0 would
+            // instead eat the whole softmax distribution -- that is why force is its own
+            // channel applied after the comparison.
+            float * frc = row + dst->nb[3] / sizeof(float);
+            for (uint32_t b = 0; b < n_bk; ++b) {
+                frc[b] = b < n_avail ? 0.0f : -BIG;
+            }
+            frc[0]           = BIG;
+            frc[n_avail - 1] = BIG;
+            frc[n_bk]        = 0.0f;
+            continue;
         }
 
         float * row = data + (size_t) qb * n_bk;

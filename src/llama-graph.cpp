@@ -60,7 +60,8 @@ static ggml_tensor * build_attn_inp_sparse_sel(
         const llama_ubatch & ubatch,
         const llama_cparams & cparams) {
     const uint32_t density = llama_sparse_attn_density();
-    if (density == 0) {
+    const float    thr     = llama_sparse_attn_thr();
+    if (density == 0 && thr == 0.0f) {
         return nullptr;
     }
 
@@ -102,6 +103,27 @@ static ggml_tensor * build_attn_inp_sparse_sel(
 
     const uint32_t n_kv = mctx->get_n_kv();
     const uint32_t n_bk = (n_kv + bs - 1) / bs;
+
+    if (thr > 0.0f) {
+        if (n_bk < 3) {
+            SPARSE_BAIL("threshold needs at least 3 KV blocks (NBk %u)", n_bk);
+        }
+        // The THRESHOLD leaf, one 64-query row per fine block (ne[3] == 2 marks it):
+        //   slice 0, rows 0..NBk-1:  0 within the row's causal reach, -BIG beyond it --
+        //                            the pre-softmax bias, so unreachable blocks carry
+        //                            no probability mass;
+        //   slice 0, row NBk:        the row's avail (reachable block count), which
+        //                            scales the softmax so the c threshold is
+        //                            length-independent;
+        //   slice 1, rows 0..NBk-1:  +BIG at the sink and the row's own block (forced
+        //                            members), -BIG beyond reach, 0 elsewhere -- added
+        //                            AFTER thresholding, where a +BIG pre-softmax would
+        //                            instead eat the whole distribution.
+        ggml_tensor * res = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_bk + 1, (n_tokens + bs - 1) / bs, 1, 2);
+        ggml_set_input(res);
+        ggml_set_name(res, "attn_inp_sparse_bias");
+        return res;
+    }
 
     const uint32_t u = llama_sparse_attn_pick_u(n_bk, density, bs);
     if (u == 0) {
@@ -569,7 +591,11 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         if (self_sparse_sel->data == nullptr) {
             LLAMA_LOG_WARN("sparse-attn: selection leaf unallocated, skipping bias\n");
         } else {
-            mctx->set_input_sparse_bias(self_sparse_sel, ubatch, LLAMA_SPARSE_ATTN_BS, LLAMA_SPARSE_ATTN_BQ);
+            mctx->set_input_sparse_bias(self_sparse_sel, ubatch, LLAMA_SPARSE_ATTN_BS,
+                                        // threshold leaves (ne[3] == 2) keep one row per
+                                        // FINE block; the union to BQ happens in-graph
+                                        self_sparse_sel->ne[3] == 2 ? LLAMA_SPARSE_ATTN_BS
+                                                                    : LLAMA_SPARSE_ATTN_BQ);
         }
     }
 
@@ -603,14 +629,16 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     // whatever shared that memory: perplexity moved by hundreds of points and looked
     // exactly like a quality result.
     {
-        const bool want = llama_sparse_attn_density() != 0 &&
+        const bool want = (llama_sparse_attn_density() != 0 || llama_sparse_attn_thr() != 0.0f) &&
                           params.cparams.flash_attn && params.cparams.causal_attn &&
                           params.ubatch.n_seqs_unq == 1 &&
                           params.ubatch.n_tokens > LLAMA_SPARSE_ATTN_BQ;
         res &= (want == (self_sparse_sel != nullptr));
         if (self_sparse_sel) {
-            res &= self_sparse_sel->ne[1] ==
-                   (params.ubatch.n_tokens + LLAMA_SPARSE_ATTN_BQ - 1) / LLAMA_SPARSE_ATTN_BQ;
+            // Threshold leaves (ne[3] == 2) keep one row per FINE block.
+            const uint32_t bq_leaf = self_sparse_sel->ne[3] == 2 ? LLAMA_SPARSE_ATTN_BS
+                                                                 : LLAMA_SPARSE_ATTN_BQ;
+            res &= self_sparse_sel->ne[1] == (params.ubatch.n_tokens + bq_leaf - 1) / bq_leaf;
         }
     }
 
@@ -2680,11 +2708,17 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
         ggml_tensor * q_cur,
         ggml_tensor * bias,
         const llama_kv_cache_context * mctx_cur,
-        int il) const {
+        int il,
+        ggml_tensor ** cnt_out) const {
     const int64_t bs   = LLAMA_SPARSE_ATTN_BS;
-    const int64_t bq   = LLAMA_SPARSE_ATTN_BQ;
     const int64_t qsub = LLAMA_SPARSE_ATTN_QSUB;
     const int64_t ksub = LLAMA_SPARSE_ATTN_KSUB;
+
+    // Threshold leaves (ne[3] == 2, see build_attn_inp_sparse_sel) score one row per
+    // FINE block and carry an extra avail row; fixed-u leaves score one row per
+    // attention query block and smuggle u in ne[2].
+    const bool    thr = bias->ne[3] == 2;
+    const int64_t bq  = thr ? bs : LLAMA_SPARSE_ATTN_BQ;
 
     const int64_t d   = q_cur->ne[0];
     const int64_t Hq  = q_cur->ne[1];
@@ -2693,11 +2727,16 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
     const int64_t G   = Hq / Hkv;
 
     const int64_t NBq = bias->ne[1];
-    const int64_t NBk = bias->ne[0];
-    const int64_t u   = bias->ne[2];
+    const int64_t NBk = bias->ne[0] - (thr ? 1 : 0);
+    const int64_t u   = thr ? NBk : bias->ne[2];
 
-    // halve1 needs powers of two, and a query block must not straddle the ubatch.
-    if (Lq % bq != 0 || (G & (G - 1)) != 0 || Hq % Hkv != 0) {
+    if (cnt_out) {
+        *cnt_out = nullptr;
+    }
+
+    // halve1 needs powers of two, a query block must not straddle the ubatch, and the
+    // threshold union needs whole groups of BQ/bs fine rows.
+    if (Lq % LLAMA_SPARSE_ATTN_BQ != 0 || (G & (G - 1)) != 0 || Hq % Hkv != 0) {
         return nullptr;
     }
 
@@ -2725,6 +2764,51 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
     ggml_mul_mat_set_prec(sc, GGML_PREC_F32);
 
     ggml_tensor * b3 = ggml_view_3d(ctx0, bias, NBk, NBq, 1, bias->nb[1], bias->nb[2], 0);
+
+    if (thr) {
+        // The per-row adaptive rule (see llama_sparse_attn_thr): membership per fine
+        // row is softmax(scores + reach_bias) * avail > c, expressed with ops the HTP
+        // implements -- the comparison as clamp((p*avail - c)*BIG + force, 0, 1), the
+        // union over the R fine rows of one attention query block as clamp(sum, 0, 1)
+        // of R strided views, the per-row length as sum_rows of the union, and the
+        // packed list as argsort-descending of a 0/1 row (members first, order among
+        // members irrelevant, every index present exactly once -- the kernel's
+        // disjointness invariant).
+        const float   BIGF = 1e9f;
+        const float   c    = llama_sparse_attn_thr();
+        const int64_t R    = LLAMA_SPARSE_ATTN_BQ / bq;      // fine rows per attention block
+
+        ggml_tensor * pm = ggml_soft_max(ctx0, ggml_add(ctx0, sc, b3));
+        ggml_tensor * av = ggml_view_3d(ctx0, bias, 1, NBq, 1, bias->nb[1], bias->nb[2],
+                                        (size_t) NBk * bias->nb[0]);
+        pm = ggml_mul(ctx0, pm, av);
+        pm = ggml_scale_bias(ctx0, pm, BIGF, -c * BIGF);
+        ggml_tensor * fr = ggml_view_3d(ctx0, bias, NBk, NBq, 1, bias->nb[1], bias->nb[2],
+                                        bias->nb[3]);
+        pm = ggml_clamp(ctx0, ggml_add(ctx0, pm, fr), 0.0f, 1.0f);
+        cb(pm, "sparse_mem", il);
+
+        ggml_tensor * us = nullptr;
+        for (int64_t r = 0; r < R; ++r) {
+            ggml_tensor * vr = ggml_view_3d(ctx0, pm, NBk, NBq / R, Hkv,
+                                            pm->nb[1] * R, pm->nb[2], (size_t) r * pm->nb[1]);
+            us = us ? ggml_add(ctx0, us, vr) : vr;
+        }
+        ggml_tensor * um = ggml_clamp(ctx0, us, 0.0f, 1.0f);  // [NBk, NBq/R, Hkv]
+        cb(um, "sparse_union", il);
+
+        ggml_tensor * cnt = ggml_sum_rows(ctx0, um);          // [1, NBq/R, Hkv]
+        cnt = ggml_reshape_3d(ctx0, cnt, NBq / R, Hkv, 1);
+        cb(cnt, "sparse_cnt", il);
+        if (cnt_out) {
+            *cnt_out = cnt;
+        }
+
+        ggml_tensor * ranked = ggml_argsort(ctx0, um, GGML_SORT_ORDER_DESC);
+        cb(ranked, "sparse_ranked", il);
+        return ranked;                                        // full-length rows; cnt truncates
+    }
+
     ggml_tensor * ranked = ggml_argsort(ctx0, ggml_add(ctx0, sc, b3), GGML_SORT_ORDER_DESC);
     cb(ranked, "sparse_ranked", il);
 
@@ -2745,7 +2829,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                float   kq_scale,
                  int   il,
          ggml_tensor * sparse_sel,
-                 int   sparse_bq) const {
+                 int   sparse_bq,
+         ggml_tensor * sparse_cnt) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2785,6 +2870,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         if (sparse_sel) {
             ggml_flash_attn_ext_set_sparse(cur, sparse_sel, LLAMA_SPARSE_ATTN_BS, sparse_bq);
+            if (sparse_cnt) {
+                ggml_flash_attn_ext_set_sparse_cnt(cur, sparse_cnt);
+            }
         }
 
         if (v_mla) {
@@ -3036,8 +3124,9 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     ggml_tensor * sparse_sel = nullptr;
+    ggml_tensor * sparse_cnt = nullptr;
     if (inp->get_sparse_sel()) {
-        sparse_sel = build_sparse_sel(q_cur, inp->get_sparse_sel(), mctx_cur, il);
+        sparse_sel = build_sparse_sel(q_cur, inp->get_sparse_sel(), mctx_cur, il, &sparse_cnt);
 
         // The bias leaf existing does NOT mean the selection reached the op: build_sparse_sel
         // can decline on shape, and the backend can still reject src[5] and run dense.
@@ -3056,7 +3145,7 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il,
-                                       sparse_sel, LLAMA_SPARSE_ATTN_BQ);
+                                       sparse_sel, LLAMA_SPARSE_ATTN_BQ, sparse_cnt);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

@@ -2125,10 +2125,15 @@ static bool ggml_hexagon_precompute_flash_attn_params(
         // rule would silently disable the backend whenever the search moved.
         const size_t br_align = ggml_hexagon_fa_sparse_per_qblock(op) ? (size_t) ggml_hexagon_fa_sparse_bq(op) : 0;
 
+        // Per-row selection length (src[6]): sel->ne[0] becomes the upper bound and
+        // rows decompose into their own chunk counts, so the "m divides n_sel" search
+        // constraint is meaningless -- the kernel derives every chunk's width per row.
+        const struct ggml_tensor * cnt = sel ? op->src[6] : nullptr;
+
         size_t Br = 0, Bc = 0;
         int ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK, DV, neq1, kv_effective, sess->vtcm_size, sess->n_threads,
                                          kparams->is_q_fp32 != 0, /*bc_step=*/bs, /*bc_cap=*/sel ? m_max * bs : 0,
-                                         /*sel_blocks=*/sel ? (size_t) sel->ne[0] : 0, br_align, mask_per_head);
+                                         /*sel_blocks=*/(sel && !cnt) ? (size_t) sel->ne[0] : 0, br_align, mask_per_head);
         if (ret != 0 && br_align) {
             // br_unit is ceil(32/G), so for G in {3,5,6,7} nothing divides a 64- or
             // 128-wide query block. Fail-closed (the op drops to a dense backend), but
@@ -2162,6 +2167,7 @@ static bool ggml_hexagon_precompute_flash_attn_params(
             // Only meaningful with a query axis; the shared-selection path leaves it 0
             // so the device keeps taking row 0 for every query block, as before.
             kparams->u.hmx.sel_bq    = (uint16_t) br_align;
+            kparams->u.hmx.dyn_sel   = cnt ? 1 : 0;
             // The device still decides: it needs the VTCM the chosen (Br, Bc) left over,
             // and the selection itself, neither of which is known here.
             kparams->u.hmx.res_mode  = (uint16_t) opt_fa_kv_residency;
@@ -2230,10 +2236,13 @@ static bool ggml_hexagon_precompute_flash_attn_params(
 // same list. That is what an attn_sum reduced over the query axis produces, and it
 // stays the cheap path -- the kernel zeroes the row stride and never divides.
 //
-// n_sel is FIXED across query blocks by construction (top-k, not a tau threshold).
-// Everything the host derives from sel->ne[0] -- chunk count, pipelining, VTCM --
-// would otherwise become per-query-block, and the kernel's DMA FIFO would desync
-// because its push and pop sites do not see the same query block.
+// Without src[6], n_sel is FIXED across query blocks (top-k, not a tau threshold).
+// With src[6] -- F32 per-row lengths, ne mirroring sel->ne[1..3] -- sel->ne[0] is the
+// upper bound u_max: each row attends to the first cnt entries of its list, and the
+// kernel derives loop bound, chunk widths and DMA push/pop counts per row from the
+// q_start of the tile a chunk serves, which is what keeps its untagged FIFO in sync.
+// Host-side sizing (pipelining, thread count, VTCM) stays a function of u_max alone;
+// VTCM in particular holds one Bc-wide chunk, not the selection, so it is unaffected.
 //
 // Only the HMX kernel implements the indirection; anything else rejects the op
 // so it falls back to a dense backend rather than silently ignoring src[5].
@@ -2299,6 +2308,25 @@ static bool ggml_hexagon_supported_fa_sparse(const struct ggml_tensor * op) {
                     (long long) sel->ne[0], (long long) ((k->ne[1] + bs - 1) / bs),
                     (long long) k->ne[1], (long long) bs);
         return false;
+    }
+
+    const struct ggml_tensor * cnt = op->src[6];
+    if (cnt) {
+        // Shape must mirror sel's row axes one-for-one: a count row is meaningless
+        // without the list row it measures. Broadcast follows sel's broadcast.
+        if (cnt->type != GGML_TYPE_F32 || cnt->nb[0] != sizeof(float)) {
+            HEX_VERBOSE("ggml-hex: fa-sparse no : cnt type %s nb0 %zu (want F32, 4)\n",
+                        ggml_type_name(cnt->type), (size_t) cnt->nb[0]);
+            return false;
+        }
+        if (cnt->ne[0] != sel->ne[1] || cnt->ne[1] != sel->ne[2] ||
+            cnt->ne[2] != sel->ne[3] || cnt->ne[3] != 1) {
+            HEX_VERBOSE("ggml-hex: fa-sparse no : cnt ne [%lld,%lld,%lld,%lld] (want [%lld,%lld,%lld,1])\n",
+                        (long long) cnt->ne[0], (long long) cnt->ne[1],
+                        (long long) cnt->ne[2], (long long) cnt->ne[3],
+                        (long long) sel->ne[1], (long long) sel->ne[2], (long long) sel->ne[3]);
+            return false;
+        }
     }
 
     return true;
