@@ -302,6 +302,7 @@ and read the chunk-wide rows as trading roughly twice the recall of `k=4` for th
 | doc | what it settles |
 |:--|:--|
 | `dynamic-sparse-attention.md` | **per-row selection lengths, the threshold policy, and the device quality/speed tables** |
+| `heterogeneous-npu-gpu.md` | NPU+GPU split measured: GPU at ~1/5 the HTP, serial-only scheduler, decode bandwidth-bound on both — a negative result |
 | `flash-attn-htp-anatomy.md` | the kernel: tiling, phases, the per-query-block attribution, the barrier work |
 | `xattn-scoring.md` | XAttention scoring, the context-length curves, op-by-op shapes, the CPU/GPU split |
 | `xattn-block-selection.md` | the selection pipeline, the per-call constant, the OpenCL comparison |
