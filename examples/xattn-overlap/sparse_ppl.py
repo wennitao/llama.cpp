@@ -20,30 +20,69 @@ from oracle_scoring import sc_xattn, sc_meanpool, sc_meanpool_sub, _blocks   # n
 CFG = {}          # set per run
 
 
-def _sel_mask(q, k, bs, bq, u_frac, scorer, mode, force=True, cfg_mult=1.0, cfg_sizes=None, rec=None, cfg_head=None):
+def _sel_mask(q, k, bs, bq, u_frac, scorer, mode, force=True, cfg_mult=1.0, cfg_sizes=None, rec=None, cfg_head=None, cfg_shared=False):
     """Return a bool [NBq_fine, Hkv, NBk] mask of KEPT blocks. NBq_fine = ceil(T/bs)."""
     Hq, T, d = q.shape
     Hkv = k.shape[0]
     NB = _blocks(T, bs)
     sc = scorer(q, k, bs).float()                      # [NB, Hkv, NB]
+    if cfg_shared:
+        # One list shared by every KV head -- what the deployed whole-row scorer
+        # produces (sel carries no head axis). Score = head mean.
+        sc = sc.mean(1, keepdim=True).expand(-1, Hkv, -1).contiguous()
 
     # reachability: block b is usable by query block a only if b <= a
     ar = torch.arange(NB, device=q.device)
     reach = ar.view(-1, 1) >= ar.view(1, -1)           # [NB, NB]
-    sc = sc.masked_fill(~reach.unsqueeze(1), -float('inf'))
 
     R = bq // bs                                       # fine blocks per selection group
-    if R > 1 and mode not in ('union', 'union_fixed'):
-        # COARSEN: one score row per group, from the group's mean. This is what the NPU
-        # graph does, and it is NOT a union -- a fine block gets the group's choice, not
-        # its own, so it can lose blocks it would have kept.
+    if R > 1 and mode not in ('union', 'union_fixed', 'union_thr', 'union_elem'):
+        # DEVICE-FAITHFUL COARSEN. The deployed scorer pools the whole 256-query group
+        # with NO per-row causal masking, forces sink + group-last, cuts one list at the
+        # GROUP-LAST row's reach, and leaves per-row causality to the kernel's mask.
+        # Averaging -inf-masked rows instead (the old code here) makes every KV block
+        # recent to the group -inf for the whole group -- blocks a-1..a-(R-1) become
+        # unselectable even for rows that CAN reach them. That artifact is why this
+        # harness said bq256 costs +13.6%% PPL while the device measured +2.4%% at the
+        # same geometry and density.
         pad = (-NB) % R
-        if pad:
-            sc = torch.cat([sc, sc[-1:].expand(pad, -1, -1)], 0)
-        g = sc.view(-1, R, Hkv, sc.shape[-1])
-        sc = g.mean(1).repeat_interleave(R, 0)[:NB]
-        sc = sc.masked_fill(~reach.unsqueeze(1), -float('inf'))
+        scp = torch.cat([sc, sc[-1:].expand(pad, -1, -1)], 0) if pad else sc
+        gsc = scp.view(-1, R, Hkv, NB).mean(1)          # [NG, Hkv, NB], raw mean
+        NG = gsc.shape[0]
+        keep_g = torch.zeros(NG, Hkv, NB, dtype=torch.bool, device=q.device)
+        for gi in range(NG):
+            a_last = min((gi + 1) * R - 1, NB - 1)
+            avail = a_last + 1                          # group-last row's reach
+            row = gsc[gi, :, :avail]
+            if mode == 'thresh':
+                p = torch.softmax(row, dim=-1)
+                srt, idx = p.sort(dim=-1, descending=True)
+                csum = srt.cumsum(-1)
+                n_keep = (csum < u_frac).sum(-1) + 1
+                for h in range(Hkv):
+                    keep_g[gi, h, idx[h, :n_keep[h]]] = True
+            else:
+                uu = max(1, min(avail, int(round(u_frac * avail))))
+                idx = row.topk(uu, dim=-1).indices
+                keep_g[gi].scatter_(1, idx, True)
+            if force:
+                keep_g[gi, :, 0] = True                 # sink (bias-forced on device)
+                keep_g[gi, :, a_last] = True            # group-last (bias-forced)
+        keep = keep_g.repeat_interleave(R, 0)[:NB]
+        keep &= reach.unsqueeze(1)                      # the kernel's per-row mask
+        if rec is not None:
+            fr = torch.zeros(Hkv, device=q.device)
+            n = 0
+            for a in range(NB):
+                avail = a + 1
+                if avail < 4:
+                    continue
+                fr += keep[a, :, :avail].float().sum(-1) / avail
+                n += 1
+            rec.append((fr / max(n, 1)).cpu())
+        return keep
 
+    sc = sc.masked_fill(~reach.unsqueeze(1), -float('inf'))
     keep = torch.zeros(NB, Hkv, NB, dtype=torch.bool, device=q.device)
     for a in range(NB):
         avail = a + 1
@@ -59,7 +98,14 @@ def _sel_mask(q, k, bs, bq, u_frac, scorer, mode, force=True, cfg_mult=1.0, cfg_
                 f = fr if fr is not None else float(cfg_head[h])
                 uu = max(1, min(avail, int(round(f * avail))))
                 keep[a, h, row[h].topk(uu).indices] = True
-        elif mode == 'thresh':
+        elif mode == 'union_elem':
+            # Per-ELEMENT softmax threshold: keep block j iff p_j * avail > c. Monotone
+            # in the row's own score, so it needs no sort/cumsum on device -- membership
+            # is step(p*avail - c), the union is step over the group mean, and the packed
+            # list is the argsort the scorer already runs. u_frac carries c.
+            pp = torch.softmax(row, dim=-1)
+            keep[a, :, :avail] = pp * avail > u_frac
+        elif mode in ('thresh', 'union_thr'):
             # XAttention's rule: softmax the row, keep blocks in descending order until
             # the kept mass reaches `u_frac`. Density adapts per (layer, head, query block).
             p = torch.softmax(row, dim=-1)
@@ -124,14 +170,26 @@ def _sel_mask(q, k, bs, bq, u_frac, scorer, mode, force=True, cfg_mult=1.0, cfg_
             n += 1
         rec.append((fr / max(n, 1)).cpu())
 
-    if R > 1 and mode == 'union':
+    if R > 1 and mode in ('union', 'union_thr', 'union_elem'):
         # UNION: every fine block keeps its own picks, and the group takes the superset.
-        # Lossless by construction; the price is density, not accuracy.
+        # Lossless by construction; the price is density, not accuracy. union_thr sizes
+        # each fine block by the threshold, so the union length varies per tile -- the
+        # thing only a dynamic-n_sel kernel can serve. The kernel would give every row
+        # the whole union (no per-row selection mask), so keep is g & causal, exactly.
         pad = (-NB) % R
         kk = keep
         if pad:
             kk = torch.cat([kk, torch.zeros(pad, Hkv, NB, dtype=torch.bool, device=q.device)], 0)
         g = kk.view(-1, R, Hkv, NB).any(1)
+        if cfg_sizes is not None:
+            # The KERNEL's cost driver: the union list length, as a fraction of the
+            # blocks available at the group-last row.
+            NG = g.shape[0]
+            fr = 0.0
+            for gi in range(NG):
+                a_last = min((gi + 1) * R - 1, NB - 1)
+                fr += (g[gi, :, :a_last + 1].float().sum(-1) / (a_last + 1)).mean().item()
+            cfg_sizes.append(fr / NG)
         keep = g.repeat_interleave(R, 0)[:NB]
         keep &= reach.unsqueeze(1)
     return keep
@@ -152,7 +210,8 @@ def sparse_attention(module, query, key, value, attention_mask, scaling, dropout
                          cfg['scorer'], cfg['mode'], cfg_mult=cfg.get('mult', 1.0),
                          cfg_sizes=cfg.setdefault('usize', []),
                          rec=cfg.setdefault('rec', {}).setdefault(il, []) if cfg.get('record') else None,
-                         cfg_head=cfg['tab'][il] if cfg['mode'] == 'perlayerhead' else None)
+                         cfg_head=cfg['tab'][il] if cfg['mode'] == 'perlayerhead' else None,
+                         cfg_shared=cfg.get('shared', False))
         cfg['density'].append(keep.float().mean().item() * 2)   # /2 for causal half
         NB = keep.shape[0]
         m = keep.repeat_interleave(cfg['bs'], 0)[:T]            # [T, Hkv, NB]
@@ -200,6 +259,7 @@ def main():
     ap.add_argument('--ctx', type=int, default=4096)
     ap.add_argument('--chunks', type=int, default=8)
     ap.add_argument('--out', default='sparse_ppl.json')
+    ap.add_argument('--suite', default='full', choices=['full', 'dynval', 'dynval2', 'devanchor', 'unionthr', 'unionelem'])
     a = ap.parse_args()
 
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -250,6 +310,70 @@ def main():
         print(f'  {tag:<26} PPL {ppl:8.3f}   density '
               f'{(sum(dd)/len(dd) if dd else 1.0):5.1%}', flush=True)
         return ppl, dict(CFG)
+
+    if a.suite == 'unionelem':
+        # The per-element rule against the cumulative rule at matched cost. c=1 keeps
+        # blocks that beat the uniform mass; smaller c keeps more.
+        run(dict(mode='dense', bs=64, bq=64, u_frac=1.0, scorer=sc_meanpool), 'dense')
+        for c in (0.3, 0.5, 1.0):
+            _, o = run(dict(mode='union_elem', bs=64, bq=256, u_frac=c, scorer=sc_meanpool,
+                            shared=False), f'bq256 per-head union-elem c={c}')
+            us = o.get('usize') or []
+            print(f'    union mean {sum(us)/len(us):.1%} of avail' if us else '    (no usize)', flush=True)
+        return
+
+    if a.suite == 'unionthr':
+        # Candidate B: dynamic n_sel at TODAY'S geometry (Br=256 kept). Each 64-query
+        # block thresholds its own head-shared list; the tile serves the UNION, sized
+        # per tile. Paired with fixed-u at the union's own mean length, so the pair
+        # isolates what the variable length buys at equal kernel cost.
+        run(dict(mode='dense', bs=64, bq=64, u_frac=1.0, scorer=sc_meanpool), 'dense')
+        for tau in (0.90, 0.80):
+            _, o = run(dict(mode='union_thr', bs=64, bq=256, u_frac=tau, scorer=sc_meanpool,
+                            shared=True), f'bq256 SHARED union-thr{tau}')
+            us = o.get('usize') or []
+            uf = sum(us) / len(us) if us else 0.5
+            run(dict(mode='topk', bs=64, bq=256, u_frac=uf, scorer=sc_meanpool, shared=True),
+                f'bq256 SHARED fixed ({uf:.0%})')
+        return
+
+    if a.suite == 'devanchor':
+        # Anchor against the DEVICE quality curve (llama-perplexity, Q4_0, bq256 shared
+        # coarsened fixed-u): dense 17.67, 75% 17.77 (+0.6%), 50% 18.33 (+3.7%),
+        # 25% 22.28 (+26.1%). If this harness is faithful, the same geometry at the same
+        # fraction must land near the same RELATIVE increment.
+        run(dict(mode='dense', bs=64, bq=64, u_frac=1.0, scorer=sc_meanpool), 'dense')
+        for f in (0.75, 0.625, 0.50, 0.25):
+            run(dict(mode='topk', bs=64, bq=256, u_frac=f, scorer=sc_meanpool, shared=True),
+                f'bq256 SHARED fixed {f:.0%}')
+        return
+
+    if a.suite in ('dynval', 'dynval2'):
+        # Adaptive (threshold) vs fixed-u, at each selection geometry the kernel could
+        # serve. bq64/per-head is the geometry thr0.9 was originally measured at (NOT
+        # deployable -- sel has no head axis and one list serves a 256-query tile);
+        # bq256/SHARED is what a dynamic-n_sel kernel would actually get. Density is
+        # matched within each pair, so each pair isolates adaptive-vs-fixed alone.
+        print('\n=== dynamic n_sel validation at deployment geometry ===', flush=True)
+        run(dict(mode='dense', bs=64, bq=64, u_frac=1.0, scorer=sc_meanpool), 'dense')
+        arms = [('bq64 per-head',  dict(bs=64, bq=64,  shared=False)),
+                ('bq256 per-head', dict(bs=64, bq=256, shared=False)),
+                ('bq256 SHARED',   dict(bs=64, bq=256, shared=True))]
+        if a.suite == 'dynval2':
+            # The cells that separate GRANULARITY from HEAD-SHARING. bq64 is reachable
+            # with Br=64 and today's shared-list sel format; per-head lists are the
+            # part the on-device scorer cannot currently produce (permuted-operand rule).
+            arms = [('bq64 SHARED',    dict(bs=64, bq=64,  shared=True)),
+                    ('bq128 SHARED',   dict(bs=64, bq=128, shared=True)),
+                    ('bq128 per-head', dict(bs=64, bq=128, shared=False))]
+        for name, g in arms:
+            _, o = run(dict(mode='thresh', u_frac=0.90, scorer=sc_meanpool, record=True, **g),
+                       f'thr0.9 {name}')
+            tab = {il: torch.stack(v).mean(0) for il, v in o['rec'].items()}
+            gmean = torch.stack([t.mean() for t in tab.values()]).mean().item()
+            run(dict(mode='topk', u_frac=gmean, scorer=sc_meanpool, **g),
+                f'fixed {name} ({gmean:.0%})')
+        return
 
     # ---- how much of an adaptive threshold survives being flattened? ----
     print('\n=== adaptivity decomposition (threshold -> per-layer -> global) ===', flush=True)
