@@ -39,7 +39,11 @@ n_kv_blocks = kv_eff / Bc = u / m
 m = largest divisor of u with m <= FA_SPARSE_MAX_M (8) and m*bs <= Bc_cap
 ```
 `m` must **divide** `u` or the last chunk is ragged and the staging buffers carry stale rows
-([flash-attn-ops.h:440-446](../../../ggml/src/ggml-hexagon/htp/flash-attn-ops.h#L440)). The cap
+([flash-attn-ops.h:440-446](../../../ggml/src/ggml-hexagon/htp/flash-attn-ops.h#L440)).
+> **Fixed-`u` only.** With per-row selection lengths (`src[6]`, `dynamic-sparse-attention.md`)
+> this rule is skipped — every row decomposes into its own `ceil(n/m)` chunks with a partial
+> final chunk, and the sawtooth it causes (`u=47 → 48` is 3.12× *faster* with one more block)
+> disappears. The rest of this section describes the fixed-`u` path. The cap
 on `Bc` is derived so `n_kv_blocks >= FA_MIN_KV_BLOCKS` (3) and the pipeline can run —
 `Bc_search = align_down((kv_len-1)/(FA_MIN_KV_BLOCKS-1), 64)`
 ([flash-attn-ops.h:396-406](../../../ggml/src/ggml-hexagon/htp/flash-attn-ops.h#L396)). Note the
@@ -281,7 +285,11 @@ production graph *inverts* it, because there the `nqb = Sq/BQ` batch items are w
 ## 6. What is not measured
 
 Every number here is latency. **No downstream accuracy result exists for any configuration in
-this document** — no task score, no perplexity. What does now exist is a *recall* proxy, in
+this document** — no task score, no perplexity. That was true when this document was written and
+is no longer true of the project: device perplexity for both the fixed-`u` and the adaptive
+pipelines is in `dynamic-sparse-attention.md` §4, and it is not kind to aggressive fixed
+densities — 25% costs **+26%** perplexity, while the adaptive rule costs +0.15% and is *faster*.
+What remains unmeasured everywhere is retrieval and long-context task scores. What does now exist is a *recall* proxy, in
 `oracle-block-scoring.md`, and it is not kind to the coarsest configurations: chunk-wide
 selection (`k=32`) at 25% density gives up **8.9 points** of absolute attention mass to the
 coarsening alone, against 1.0 at `k=4`, and at 6.25% it gives up 30. The evenly spaced query
@@ -293,6 +301,7 @@ and read the chunk-wide rows as trading roughly twice the recall of `k=4` for th
 
 | doc | what it settles |
 |:--|:--|
+| `dynamic-sparse-attention.md` | **per-row selection lengths, the threshold policy, and the device quality/speed tables** |
 | `flash-attn-htp-anatomy.md` | the kernel: tiling, phases, the per-query-block attribution, the barrier work |
 | `xattn-scoring.md` | XAttention scoring, the context-length curves, op-by-op shapes, the CPU/GPU split |
 | `xattn-block-selection.md` | the selection pipeline, the per-call constant, the OpenCL comparison |
