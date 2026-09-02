@@ -109,6 +109,35 @@ Two very different compute units land on the **same** number, because both are s
 same 1.14 GB of weights per token from the same DRAM. A second unit adds compute, not
 bandwidth. Splitting decode across them would at best match this and at worst thrash.
 
+## 4b. Decode, profiled: half DRAM-saturated streaming, half host overhead — the GPU touches neither
+
+`GGML_HEXAGON_PROFILE=1`, tg32 on HTP0. Device timestamps are on-DSP cycle counters, so the
+host-side logging cost of profiling does not contaminate them.
+
+| per decode token | |
+|:--|--:|
+| wall (unprofiled, tg64) | 32.7 ms (30.6 t/s) |
+| device busy (sum of op-batch walls) | **17.2 ms** |
+| of which `MUL_MAT*` (weight streaming) | 14.3 ms (85%) |
+| of which `FLASH_ATTN_EXT` | 1.6 ms (10%) |
+| ops dispatched | 396 |
+| **host / dispatch, device idle** | **~15.5 ms (47%)** |
+
+Two conclusions, both firm:
+
+- **The weight-streaming half runs at DRAM peak.** 1.22 GB of Q4_0 weights in 14.3 ms is
+  ~85 GB/s — at or above the quoted LPDDR5X peak. There is nothing a second compute unit can
+  add here; this is the half the tg64 table in §4 measured on both units.
+- **The other half is not on any device.** Per-op device time sums to 16.9 ms against a 17.2 ms
+  device wall, so ops run back-to-back once submitted — the missing ~15 ms per token is host
+  side: graph build/reuse, scheduler, dspqueue round trips, sampling, the ~620 µs per
+  `graph_compute`. **This half is a software problem, worth up to ~1.9× on decode with no GPU
+  at all**, and it is the only decode headroom that exists on this SoC.
+
+So "decode is the bigger space" is right, but the space is *dispatch*, not compute: fewer and
+fatter submissions, overlapping host work for token *t+1* with device work for token *t*,
+caching the decode graph. A GPU cannot help with either half.
+
 ## 5. What would change the answer
 
 - **Events in both backends.** OpenCL already uses `cl_event` throughout (its `synchronize` is a
