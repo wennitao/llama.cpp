@@ -69,6 +69,9 @@ static int    opt_etm     = 0;
 static int    opt_verbose = 0;
 static int    opt_profile = 0; // profiling mode (0-disabled, 1-basic, 2-pmu)
 static int    opt_hostbuf = 1; // hostbuf ON by default
+// Let the lm-head (src0->ne[1] > 32768) run on the HTP. Off by default: the cut below was
+// 'refuse the lm-head for now'; GGML_HEXAGON_LM_HEAD=1 lifts it so the cost can be measured.
+static int    opt_lm_head = 0;
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
@@ -3065,8 +3068,8 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
                 return false;
             }
 
-            // hardcoded limit to refuse the lm-head for now
-            if (src0->ne[1] > 32768) {
+            // hardcoded limit to refuse the lm-head for now (GGML_HEXAGON_LM_HEAD=1 lifts it)
+            if (src0->ne[1] > 32768 && !opt_lm_head) {
                 return false;
             }
 
@@ -4798,6 +4801,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_mm_select = getenv("GGML_HEXAGON_MM_SELECT");
     const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
     const char * str_fa_kvres = getenv("GGML_HEXAGON_FA_KV_RESIDENCY");
+    const char * str_lm_head   = getenv("GGML_HEXAGON_LM_HEAD");
     const char * str_fa_sparse = getenv("GGML_HEXAGON_FA_SPARSE");
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
@@ -4853,6 +4857,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
     opt_fa_kv_residency = str_fa_kvres ? atoi(str_fa_kvres)               : opt_fa_kv_residency;
     opt_fa_sparse = str_fa_sparse ? atoi(str_fa_sparse)                   : opt_fa_sparse;
+    opt_lm_head   = str_lm_head   ? atoi(str_lm_head)                     : opt_lm_head;
     opt_ndev      = str_ndev     ? strtoul(str_ndev, NULL, 0)             : opt_ndev;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf)                      : opt_hostbuf;
     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;

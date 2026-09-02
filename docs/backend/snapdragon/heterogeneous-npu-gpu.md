@@ -109,34 +109,70 @@ Two very different compute units land on the **same** number, because both are s
 same 1.14 GB of weights per token from the same DRAM. A second unit adds compute, not
 bandwidth. Splitting decode across them would at best match this and at worst thrash.
 
-## 4b. Decode, profiled: half DRAM-saturated streaming, half host overhead — the GPU touches neither
+## 4b. Decode, measured per operator with bus counters — and a correction
 
-`GGML_HEXAGON_PROFILE=1`, tg32 on HTP0. Device timestamps are on-DSP cycle counters, so the
-host-side logging cost of profiling does not contaminate them.
+The first pass at this section attributed ~47% of each decode token to "host/dispatch with the
+device idle". That was wrong in an instructive way, so both the wrong number and the fix are kept.
+
+### What the device profile showed (`GGML_HEXAGON_PROFILE=1`, tg32 on HTP0)
 
 | per decode token | |
 |:--|--:|
-| wall (unprofiled, tg64) | 32.7 ms (30.6 t/s) |
-| device busy (sum of op-batch walls) | **17.2 ms** |
-| of which `MUL_MAT*` (weight streaming) | 14.3 ms (85%) |
-| of which `FLASH_ATTN_EXT` | 1.6 ms (10%) |
-| ops dispatched | 396 |
-| **host / dispatch, device idle** | **~15.5 ms (47%)** |
+| wall (unprofiled tg64) | 32.7 ms (30.6 t/s) |
+| device busy | 17.2 ms — MUL_MAT 14.3 ms, attention 1.6 ms, 396 ops |
+| **weights streamed by the HTP** | **0.79 GB**, not the model's 1.14 GB |
+| unaccounted | ~15.5 ms |
 
-Two conclusions, both firm:
+The missing 0.35 GB is the lm-head. `output.weight` is Q6_K in a Q4_0 quantisation, and even
+re-quantised to Q8_0 it stays on the CPU (`CPU_REPACK` buffer 243 → 315 MiB) — not because of
+the type but because of an explicit cut in `ggml_hexagon_supported_mul_mat`:
+`// hardcoded limit to refuse the lm-head for now` at `src0->ne[1] > 32768`. So every decode
+token the CPU streams a quarter-gigabyte for one GEMV, and that — not dispatch — was the
+"host half".
 
-- **The weight-streaming half runs at DRAM peak.** 1.22 GB of Q4_0 weights in 14.3 ms is
-  ~85 GB/s — at or above the quoted LPDDR5X peak. There is nothing a second compute unit can
-  add here; this is the half the tg64 table in §4 measured on both units.
-- **The other half is not on any device.** Per-op device time sums to 16.9 ms against a 17.2 ms
-  device wall, so ops run back-to-back once submitted — the missing ~15 ms per token is host
-  side: graph build/reuse, scheduler, dspqueue round trips, sampling, the ~620 µs per
-  `graph_compute`. **This half is a software problem, worth up to ~1.9× on decode with no GPU
-  at all**, and it is the only decode headroom that exists on this SoC.
+### Lifting the cut (`GGML_HEXAGON_LM_HEAD=1`, Q8_0 lm-head)
 
-So "decode is the bigger space" is right, but the space is *dispatch*, not compute: fewer and
-fatter submissions, overlapping host work for token *t+1* with device work for token *t*,
-caching the decode graph. A GPU cannot help with either half.
+| | tg64 | device busy / token | host + dispatch |
+|:--|--:|--:|--:|
+| lm-head on CPU | 29.7 t/s | 17.2 ms | ~15.5 ms |
+| **lm-head on HTP** | **39.5 t/s (1.33×)** | 23.9 ms (lm-head 5.8 ms @ 57 GB/s) | **~1.4 ms (5%)** |
+
+Prefill is unchanged (1766 vs 1769 t/s at pp4096). The Q6_K → Q8_0 output type is
+quality-neutral or better; the perplexity check is in the commit message.
+
+### Per-operator bus bandwidth, hardware-counted
+
+`GGML_HEXAGON_PROFILE=0x3,0x41,0xce,0x43,0xcf,0x7d,0x8c,0x40` puts eight PMU counters on every
+op. On v79 the v60-era 32B/64B line counters read ~0, but `AXI_READ_REQUEST` (0x40) calibrates
+to a **constant 191 B per request across every weight-streaming op (p10 = p90)**, which makes it a
+clean linear proxy for bytes on the bus — including for ops that read no weights. Per token,
+lm-head still on CPU:
+
+| op class | µs/token | weights MB | **bus MB** | **bus GB/s** |
+|:--|--:|--:|--:|--:|
+| `MUL_MAT+MUL_MAT` (gate/up) | 7358 | 396 | 418 | **56.9** |
+| `MUL_MAT+ADD` (down, o-proj) | 5137 | 262 | 277 | 53.9 |
+| `MUL_MAT+MUL_MAT+MUL_MAT` (qkv) | 2558 | 132 | 140 | 54.6 |
+| `FLASH_ATTN_EXT` (KV reads) | 1645 | 0 | 44 | 26.8 |
+| `RMS_NORM+MUL`, `SWIGLU`, `ROPE`, `SET_ROWS` | ≈950 | ~0 | ~3 | 1–4 |
+| **total** | **17.7 ms** | **793** | **884** | **50.0** |
+
+Reading it:
+
+- **The GEMVs run at 54–57 GB/s**, ~70–75% of the ~77 GB/s theoretical LPDDR5X peak and close to
+  what is practically achievable. This is the number that was previously *inferred* at "~85 GB/s"
+  from the wrong byte count; the counters settle it.
+- **Non-weight traffic is 91 MB/token** (~10%): KV reads for attention, plus tiny activations.
+- **L2 miss counters see almost none of it** (815 misses/token): the weight stream bypasses L2
+  via DMA, as designed, so cache counters are the wrong instrument here — the AXI ones are right.
+
+### The decode picture, corrected
+
+With the lm-head on the HTP a token is ~25 ms, of which ~24 ms is the device streaming 1.11 GB
+of weights at ~50 GB/s and ~1.4 ms is everything else. Decode is **DRAM-bound with a small
+dispatch tail**, not dispatch-bound. The remaining single-stream headroom is therefore bytes and
+bandwidth utilisation, not scheduling: a smaller lm-head type (the Q8_0 one is now 28% of all
+bytes), and closing the ~25% gap to peak. A second compute unit still adds nothing to either.
 
 ## 5. What would change the answer
 
@@ -147,9 +183,8 @@ caching the decode graph. A GPU cannot help with either half.
 - **A faster GPU path.** The ratio in §1 is the whole story. A GPU kernel at ≥50% of the HMX
   rate would make a ~1.4× pipelined ceiling plausible; Adreno 830 through the current OpenCL
   backend is not that.
-- **Something that is not attention or GEMM.** The only cost the NPU does not dominate is the
-  fixed ~620 µs per `graph_compute` (`sparse-attention.md` §2). That is a host/dispatch cost, not
-  a compute one, and the GPU does not help with it.
+- **Something that is not attention or GEMM.** After the lm-head moves to the HTP (§4b) the
+  non-device share of a decode token is ~5%; there is no host-side cost left for a GPU to absorb.
 
 ## 6. Operational notes (they cost runs)
 
