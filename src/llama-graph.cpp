@@ -89,6 +89,14 @@ static ggml_tensor * build_attn_inp_sparse_sel(
     if (ubatch.n_seqs_unq != 1 || (cparams.kv_unified ? 1 : ubatch.n_seqs_unq) != 1) {
         SPARSE_BAIL("only single-sequence batches (n_seqs_unq %u)", ubatch.n_seqs_unq);
     }
+    // The ubatch check above is not enough: with a non-unified cache each sequence gets
+    // its own KV STREAM, and a per-sequence ubatch has n_seqs_unq == 1 while the cache
+    // still has n_seq_max streams -- get_k_pool_src pools a single-stream layout and
+    // asserts. Seen in llama-perplexity at n_batch > n_ctx, which packs n_batch/n_ctx
+    // sequences.
+    if (!cparams.kv_unified && cparams.n_seq_max > 1) {
+        SPARSE_BAIL("needs a single KV stream (n_seq_max %u, kv_unified off)", cparams.n_seq_max);
+    }
 
     const uint32_t bs = LLAMA_SPARSE_ATTN_BS;
     const uint32_t bq = LLAMA_SPARSE_ATTN_BQ;
