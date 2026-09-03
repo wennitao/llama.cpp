@@ -135,7 +135,11 @@ token the CPU streams a quarter-gigabyte for one GEMV, and that — not dispatch
 | | tg64 | device busy / token | host + dispatch |
 |:--|--:|--:|--:|
 | lm-head on CPU | 29.7 t/s | 17.2 ms | ~15.5 ms |
-| **lm-head on HTP** | **39.5 t/s (1.33×)** | 23.9 ms (lm-head 5.8 ms @ 57 GB/s) | **~1.4 ms (5%)** |
+| **lm-head on HTP** | **32–39.6 t/s (1.10–1.34×, bimodal across runs†)** | 23.9 ms (lm-head 5.8 ms @ 57 GB/s) | **~1.4 ms (5%)** |
+
+† Five runs of the HTP arm over two device sessions: 39.5, 39.5, 32.2, 33.1, 39.6 t/s — two
+clusters, nothing in between; the CPU arm is steady at 29.5–29.7. Not understood (a DSP clock
+state is the obvious suspect); reported as the range, not the best case.
 
 Prefill is unchanged (1766 vs 1769 t/s at pp4096). The Q6_K → Q8_0 output type is
 quality-neutral or better; the perplexity check is in the commit message.
@@ -173,6 +177,50 @@ of weights at ~50 GB/s and ~1.4 ms is everything else. Decode is **DRAM-bound wi
 dispatch tail**, not dispatch-bound. The remaining single-stream headroom is therefore bytes and
 bandwidth utilisation, not scheduling: a smaller lm-head type (the Q8_0 one is now 28% of all
 bytes), and closing the ~25% gap to peak. A second compute unit still adds nothing to either.
+
+### 4c. Context length: every decode number above is at depth ~0 — and depth changes the story
+
+`llama-bench -p 0 -n 64` sets `n_ctx = n_prompt + n_gen`, so the KV cache never exceeded 64
+tokens in §4/§4b. That is the best case for the weight-streaming picture and the worst
+representation of attention. With a real context (`-d`, lm-head on HTP):
+
+| depth | tg64 | ms/token | bytes model @ 50 GB/s | measured vs model |
+|--:|--:|--:|--:|:--|
+| 0 | 32–39.6* | 25–31 | 1.11 GB → 22 ms | at bus rate |
+| 4096 | 19.9 | 50 | 1.58 GB → 32 ms | **1.6× slower than bytes** |
+| 8192 | 14.6 | 69 | 2.05 GB → 41 ms | 1.7× |
+| 16384 | 9.1 | 110 | 2.99 GB → 60 ms | 1.8× |
+
+\* bimodal across runs, see §4b.
+
+The gap is attention, and the PMU profile at depth 4096 says why:
+
+| op class, decode @ d4096 | µs/token | bus MB | bus GB/s | kernel |
+|:--|--:|--:|--:|:--|
+| **`FLASH_ATTN_EXT`** | **28 010 (46%)** | 741 | **26.4** | `hvx Br 1 Bc 64 nkvb 68` |
+| lm-head `MUL_MAT` | 10 167 | 359 | 35.3 | |
+| `MUL_MAT+ADD` | 7 751 | 328 | 42.4 | |
+| `MUL_MAT+MUL_MAT` | 7 227 | 396 | 54.8 | |
+| qkv | 2 507 | 132 | 52.7 | |
+| total device-busy | 60.3 ms | 2033 | 33.7 | |
+
+Decode attention runs on the **HVX path** (`Br 1`, 64-token KV chunks, 68 chunks per layer at
+this depth), not the HMX pipeline prefill uses (`hmx-pipe Br 192 Bc 1024`), and it moves KV at
+**26 GB/s — half the GEMV rate**. So at 4k depth attention is already 46% of the token, and the
+token as a whole is no longer bandwidth-bound: total bus traffic is 33.7 GB/s against the 50+
+the GEMVs alone sustain. Past ~8k the KV stream is larger than the weights and this path is the
+whole story.
+
+Consequences for the two questions this document asks:
+
+- **Decode has a real kernel target after all** — the HVX decode-attention path. Two levers,
+  both on the NPU: fewer KV bytes (a decode-side block selection; today's sparse kernel only
+  engages for `ubatch > 256`), and a faster path (the HMX pipeline, or a wider-chunk HVX one)
+  to bring 26 GB/s toward 50.
+- **It still does not reopen the GPU case.** Within one token the layer chain is serial —
+  attention *L* must finish before o-proj *L* — so GPU attention cannot overlap with NPU GEMVs;
+  it would have to be *faster* than 28 ms for 470 MB of KV on its own, which is not where the
+  measured GPU sits.
 
 ## 5. What would change the answer
 
