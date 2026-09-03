@@ -275,6 +275,49 @@ bandwidth with no crossings, no shared KV buffer, and no second runtime. A GPU d
 kernel is only worth building if the HVX path cannot be brought toward its GEMV rate; §5 of the
 workflow synthesis addresses why it sits at 23 GB/s.
 
+#### 4d.2 The mllm decode kernel: it exists, it is good, and as-is it ties the HVX path
+
+`/mnt/raid0_ssd/wentao/mllm`, branch `opencl-flash-attention`, commit `5e9fef1a` "dedicated
+FlashAttention decode kernel — 5.5 → 43.7 GB/s (8.1×@4096)": `flash_attention_fp16_decode` +
+`flash_attention_fp16_decode_merge` in `mllm/backends/opencl/kernels/flash_attention.cl`,
+dispatched by `OpenCLFlashAttention2Op` for `S_q == 1`. It is the shape ggml-opencl's kernel is
+missing: no LDS staging (each K/V element is used once), lane *t* owns key row *t* for a full-D
+dot in registers, lane *t* owns output dim *t* for P·V, and **split-K over the KV axis**
+(`nsplit = ceil(S_kv/256)` capped at 16) with an unnormalised `(o, m, l)` partial per partition
+and a tiny merge kernel. Measured by its author on **this same unit (eb49fb9d)**:
+
+| S_kv | ms/op | GB/s | vs ggml-opencl FA (§4d) | vs HTP HVX (§4d) |
+|--:|--:|--:|--:|--:|
+| 1024 | 0.397 | 21.2 | 434 µs → 1.09× faster | 192 µs → 2.1× slower |
+| 2048 | 0.543 | 30.9 | | |
+| 4096 | **0.768** | **43.7** | 2777 µs → **3.6× faster** | 739 µs → **tie (0.96×)** |
+
+Two caveats decide how to read the tie:
+
+- **Its shape is MHA (`B=1, H=16, D=128`, "GQA pre-expanded, kernel sees `H_q == H_kv`").**
+  So 43.7 GB/s is for 33.5 MB of KV per op; our model's 8 KV heads under GQA 2 are 16.8 MB. The
+  kernel indexes K/V by *query* head with no group mapping, so on our cache as-is it reads each
+  KV head twice — same bytes, same time, hence the tie. A **GQA-aware variant** (one workgroup
+  per KV head serving both query heads) halves the traffic at the same streaming rate:
+  **~0.4 ms/op ≈ 11 ms/token at depth 4096**, against the HVX path's 20.7. That is the real
+  prize on the GPU side, and it is ~2×, not ~3×.
+- Its author's phase ablation puts the residual bottleneck in the **P·V phase** (strided V
+  reads; scores alone reach 48 GB/s). A packed-V layout is the next ~25%, and it is not free —
+  it needs a V repack the KV-cache writer does not do today.
+
+**Porting cost into ggml-opencl's `FLASH_ATTN_EXT` is modest.** Strides are generic and in
+elements (`K_h_stride`, `K_s_stride`), so ggml's cache layout — `[d, kv, n_kv_head]` f16 with
+the head *inside* the row, i.e. `K_s_stride = d·n_kv_heads`, `K_h_stride = d` — is passed
+directly; D is fixed at 128 by `FA_D`. Needed: an f32→f16 Q adapter (4 KB), an f16→f32 O
+adapter, the causal mask made a no-op for `S_q == 1` (already the kernel's assumption), the
+GQA head mapping, and the persistent split-K scratch buffer. Roughly a day.
+
+**What this does not change:** with the GQA-aware variant the GPU saves ~10 ms/token at depth
+4096 *before* 2×28 crossings, so the break-even crossing is ~170 µs and half the gain needs
+~85 µs; and the KV cache must be readable by both units without copies. Both are the
+scheduler/buffer questions in the synthesis below — and the on-NPU HVX fix (§4d.1) reaches the
+same ~8–11 ms/token with neither.
+
 ## 5. What would change the answer
 
 - **Events in both backends.** OpenCL already uses `cl_event` throughout (its `synchronize` is a
