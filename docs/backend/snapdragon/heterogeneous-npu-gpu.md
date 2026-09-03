@@ -245,6 +245,36 @@ What this does not settle is the *other* comparison in §4c: the HTP's own decod
 path is at ~23 GB/s where its GEMVs reach 55, so the honest target for decode at depth is that
 kernel, on the NPU.
 
+#### 4d.1 …but the GPU's 6 GB/s is the kernel, not the silicon
+
+A plain memory-bound GEMV (`MUL_MAT` m=4096, k=14336, n=1) on both backends, two alternations:
+
+| | weight bytes | GPUOpenCL | HTP0 |
+|:--|--:|--:|--:|
+| f16 | 117.4 MB | 1798 µs → **65 GB/s** | 1938 µs → 61 GB/s |
+| q8_0 | 62.4 MB | 1008 µs → 62 GB/s | (perf row aborts on HTP — see commit) |
+| q4_0 | 33.0 MB | 501 µs → 66 GB/s | (idem) |
+
+The Adreno streams ~65 GB/s when the kernel is shaped for it — *above* the HTP's GEMV rate.
+So ggml-opencl's flash-attention at 6 GB/s is under-parallelised by ~10× against its own
+hardware, and the ceiling for a well-written single-query GPU attention at kv=4096 is
+16.8 MB / 65 GB/s ≈ **260 µs/op ≈ 7.2 ms/token**, versus the HVX path's 20.7 ms/token.
+
+This is what makes the user's mllm kernel the operative question rather than a footnote. The
+gate arithmetic at depth 4096, per token:
+
+| | attention | crossings (2 × 28) | total |
+|:--|--:|--:|--:|
+| HTP HVX path today | 20.7 ms | — | 20.7 ms |
+| GPU at its streaming ceiling | 7.2 ms | 56 × *c* | 7.2 + 56*c* |
+| HTP HVX path fixed to its GEMV rate (~57 GB/s) | ~8.3 ms | — | **~8.3 ms** |
+
+The GPU route breaks even against *today's* HTP path at *c* ≈ 240 µs per crossing and gets half
+the gain at *c* ≈ 120 µs — but it never beats the **on-NPU fix**, which reaches the same
+bandwidth with no crossings, no shared KV buffer, and no second runtime. A GPU decode-attention
+kernel is only worth building if the HVX path cannot be brought toward its GEMV rate; §5 of the
+workflow synthesis addresses why it sits at 23 GB/s.
+
 ## 5. What would change the answer
 
 - **Events in both backends.** OpenCL already uses `cl_event` throughout (its `synchronize` is a
