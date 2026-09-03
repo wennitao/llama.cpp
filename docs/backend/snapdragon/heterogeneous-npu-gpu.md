@@ -222,6 +222,29 @@ Consequences for the two questions this document asks:
   it would have to be *faster* than 28 ms for 470 MB of KV on its own, which is not where the
   measured GPU sits.
 
+### 4d. Decode attention on the GPU: the kernel-only A/B says no before anything else does
+
+`test-backend-ops perf`, the Qwen3-1.7B decode shape (hs=128, 8 KV heads, GQA 2, one query,
+causal mask, f16 KV), same rows on both backends, two alternations each (spread ≤ 0.2%):
+
+| per op (×28 layers per token) | HTP0 (HVX path) | GPUOpenCL | GPU / HTP |
+|--:|--:|--:|--:|
+| kv = 1024 | 192 µs | 434 µs | 2.3× slower |
+| kv = 4096 | 739 µs → 20.7 ms/token | 2777 µs → 78 ms/token | **3.8×** |
+| kv = 8192 | 1470 µs | 5480 µs | 3.7× |
+| kv = 16384 | 2957 µs | 10690 µs | 3.6× |
+
+At kv=4096 the op reads 16.8 MB of KV: the HTP does it at ~23 GB/s (the 26 GB/s in §4c
+includes mask and padding), the Adreno at ~6 GB/s. The GPU's time grows 6.4× for 4× KV, so
+this is not launch overhead — the kernel is per-byte slow, i.e. under-parallelised over the KV
+axis for a single query. **Attention on the GPU would make decode slower at every depth even
+with free crossings and a zero-copy KV cache.** A GPU kernel would have to be ~4× faster than
+ggml-opencl's at this shape merely to tie the HVX path, and then also pay 2×28 crossings.
+
+What this does not settle is the *other* comparison in §4c: the HTP's own decode-attention
+path is at ~23 GB/s where its GEMVs reach 55, so the honest target for decode at depth is that
+kernel, on the NPU.
+
 ## 5. What would change the answer
 
 - **Events in both backends.** OpenCL already uses `cl_event` throughout (its `synchronize` is a
