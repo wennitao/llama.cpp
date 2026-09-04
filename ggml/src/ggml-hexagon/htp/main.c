@@ -796,6 +796,9 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_TRI:
             return op_unary(octx);
 
+        case HTP_OP_SYNC_PROBE:
+            return op_sync_probe(octx);
+
         case HTP_OP_INVALID:
             break;
     }

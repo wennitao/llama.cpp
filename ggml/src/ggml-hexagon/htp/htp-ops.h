@@ -100,9 +100,49 @@ enum htp_op_code {
     HTP_OP_CLAMP,
     HTP_OP_IM2COL,
     HTP_OP_XATTN_SCORE,
+    HTP_OP_SYNC_PROBE,
 
     HTP_OP_INVALID
 };
+
+// HTP_OP_SYNC_PROBE: dev-only flag round-trip probe (host gates it behind GGML_HEXAGON_SYNC_PROBE=1).
+// The op raises a 'ready' word in src[0], spin-polls a 'done' word another agent (CPU or GPU) writes,
+// checks a payload that agent wrote, and records qtimer stamps into dst. op_params layout:
+enum htp_sync_probe_param {
+    HTP_SYNC_PROBE_P_MAGIC = 0,       // HTP_SYNC_PROBE_MAGIC
+    HTP_SYNC_PROBE_P_MODE,            // 0 handshake, 1 ping (stamp entry and return)
+    HTP_SYNC_PROBE_P_TIMEOUT_US,      // give up polling after this (0 = never)
+    HTP_SYNC_PROBE_P_PAYLOAD_WORDS,   // uint32 words to check at PAYLOAD_OFF (0 = none)
+    HTP_SYNC_PROBE_P_INVAL,           // poll read: 0 dcinva, 1 qurt invalidate, 2 none, 3 dma (cache bypass)
+    HTP_SYNC_PROBE_P_READY_OFF,       // byte offsets into src[0]
+    HTP_SYNC_PROBE_P_DONE_OFF,
+    HTP_SYNC_PROBE_P_PAYLOAD_OFF,
+    HTP_SYNC_PROBE_P_SEED,            // payload word i must equal seed ^ i
+    HTP_SYNC_PROBE_P_FLUSH,           // ready publish: 0 qurt flush, 1 dccleana + syncht
+    HTP_SYNC_PROBE_P_READY_VAL,
+    HTP_SYNC_PROBE_P_DONE_VAL,
+    HTP_SYNC_PROBE_P_DSP_PAYLOAD_WORDS, // words the DSP writes (seed ^ 0xA5A5A5A5 ^ i) and flushes before ready
+    HTP_SYNC_PROBE_P_DSP_PAYLOAD_OFF,
+};
+
+// dst record, uint64 words
+enum htp_sync_probe_rec {
+    HTP_SYNC_PROBE_R_T_ENTRY = 0,     // qtimer at op entry
+    HTP_SYNC_PROBE_R_T_READY,         // qtimer after the ready word was published
+    HTP_SYNC_PROBE_R_T_DONE,          // qtimer when the done word was observed (or timeout)
+    HTP_SYNC_PROBE_R_T_CHECKED,       // qtimer after the payload check
+    HTP_SYNC_PROBE_R_POLLS,           // poll iterations
+    HTP_SYNC_PROBE_R_MISMATCH,        // payload words that did not match
+    HTP_SYNC_PROBE_R_FIRST_BAD,       // index of the first mismatch (~0 if none)
+    HTP_SYNC_PROBE_R_STATUS,          // 0 ok, 1 timeout
+    HTP_SYNC_PROBE_R_DONE_RAW,        // last value read from the done word
+    HTP_SYNC_PROBE_R_T_FIRST_POLL,    // qtimer of the first poll read
+    HTP_SYNC_PROBE_R_FIRST_VAL,       // value of the first poll read
+    HTP_SYNC_PROBE_R_T_DSP_PAYLOAD,   // qtimer after the DSP payload was written and flushed
+    HTP_SYNC_PROBE_R_N
+};
+
+#define HTP_SYNC_PROBE_MAGIC 0x53594e43
 
 #define HTP_OP_MAX_DIMS    4    // aka GGML_MAX_DIMS
 #define HTP_OP_MAX_INPUTS  7    // sparse flash-attention carries sel (src 5) and its per-row count (src 6)

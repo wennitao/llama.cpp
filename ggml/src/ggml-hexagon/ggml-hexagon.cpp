@@ -75,6 +75,9 @@ static int    opt_lm_head = 0;
 // Split-KV, GQA-grouped HVX decode attention (default on); GGML_HEXAGON_FA_DECODE=0 restores
 // the row-per-thread kernel for A/B.
 static int    opt_fa_decode = 1;
+// Dev-only: let a GGML_OP_CUSTOM node tagged with HTP_SYNC_PROBE_MAGIC run as HTP_OP_SYNC_PROBE
+// (flag round-trip probe, examples/hetero-sync-probe). Off by default.
+static int    opt_sync_probe = 0;
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
@@ -3740,6 +3743,11 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_TRI:             return HTP_OP_TRI;
         case GGML_OP_PAD:             return HTP_OP_PAD;
         case GGML_OP_IM2COL:          return HTP_OP_IM2COL;
+        case GGML_OP_CUSTOM:
+            if (opt_sync_probe && (uint32_t) t->op_params[HTP_SYNC_PROBE_P_MAGIC] == HTP_SYNC_PROBE_MAGIC) {
+                return HTP_OP_SYNC_PROBE;
+            }
+            break;
 
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(t)) {
@@ -4569,6 +4577,10 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
             supp = ggml_hexagon_supported_flash_attn_ext(sess, op);
             break;
 
+        case GGML_OP_CUSTOM:
+            supp = opt_sync_probe && (uint32_t) op->op_params[HTP_SYNC_PROBE_P_MAGIC] == HTP_SYNC_PROBE_MAGIC;
+            break;
+
         case GGML_OP_SET_ROWS:
             supp = ggml_hexagon_supported_set_rows(sess, op);
             break;
@@ -4808,6 +4820,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_lm_head   = getenv("GGML_HEXAGON_LM_HEAD");
     const char * str_fa_decode = getenv("GGML_HEXAGON_FA_DECODE");
     const char * str_fa_sparse = getenv("GGML_HEXAGON_FA_SPARSE");
+    const char * str_sync_probe = getenv("GGML_HEXAGON_SYNC_PROBE");
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
     const char * str_vmem     = getenv("GGML_HEXAGON_VMEM");
@@ -4864,6 +4877,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_fa_sparse = str_fa_sparse ? atoi(str_fa_sparse)                   : opt_fa_sparse;
     opt_lm_head   = str_lm_head   ? atoi(str_lm_head)                     : opt_lm_head;
     opt_fa_decode = str_fa_decode ? atoi(str_fa_decode)                   : opt_fa_decode;
+    opt_sync_probe = str_sync_probe ? atoi(str_sync_probe)                  : opt_sync_probe;
     opt_ndev      = str_ndev     ? strtoul(str_ndev, NULL, 0)             : opt_ndev;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf)                      : opt_hostbuf;
     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;

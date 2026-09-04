@@ -476,12 +476,102 @@ Two levers, in order of size:
    `fa_phase_k_interleave` does) so the dot is a broadcast-MAC over 64 keys with no reductions,
    amortised across the unit's rows. The ≥2× lever, and a real kernel design.
 
+## 4g. Measured: the no-barrier handshake (`examples/hetero-sync-probe`)
+
+The proposal that reopened the GPU question: let the GPU own some KV splits of the decode
+attention and let the HTP *merge* consume its partials through shared memory, with no graph
+barrier -- the HTP op raises `ready`, the GPU writes partials + `done`, the HTP op polls `done`.
+Section 4f's split-KV kernel already produces `(M, S, acc)` partials and merges them, so the
+merge side is the existing phase with more inputs. What decides the usable GPU share is the
+fixed cost of that handshake per layer, so it was measured before anything was built on it.
+
+### What was built
+
+- `HTP_OP_SYNC_PROBE` (`htp/sync-probe-ops.c`), dev-only, reached through a `GGML_OP_CUSTOM`
+  node tagged with `HTP_SYNC_PROBE_MAGIC` when `GGML_HEXAGON_SYNC_PROBE=1`. Inside a normal op
+  batch it writes a payload and flushes it, publishes `ready`, spin-polls `done` with a cache
+  invalidate per read, checks a payload the other agent wrote, and records qtimer stamps.
+- `llama-hetero-sync-probe`: allocates one 1 MiB hexagon rpcmem buffer, aliases it into
+  OpenCL with `CL_MEM_EXT_HOST_PTR_QCOM` + `cl_mem_ion_host_ptr{ION_HOST_PTR, IOCOHERENT, fd,
+  base}` (the mllm recipe; `rpcmem_to_fd` on the buffer base), and drives the handshake in
+  several modes. Host stamps are `cntvct_el0`; the HTP's `c31:30` qtimer turned out to be the
+  same 19.2 MHz counter (offset bounded to 0.3 us by the handshake itself), so every
+  cross-domain split below is direct. The HTP round trip itself is single-clock.
+
+```
+cmake --build build-sparse --target htp-v79 ggml-hexagon llama-hetero-sync-probe -j 32
+adb push build-sparse/bin/llama-hetero-sync-probe build-sparse/bin/libggml-hexagon.so \
+         build-sparse/ggml/src/ggml-hexagon/libggml-htp-v79.so /data/local/tmp/llama-hetero/
+LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. ./llama-hetero-sync-probe --iters 10 --cpu 7 \
+         --modes ping,cpu,gpu1,gpusvm --b2b 10
+```
+
+### Flag mechanics, all directions (SM8750, Adreno 830 driver 0800.70)
+
+| path | measured | note |
+|---|---|---|
+| HTP write -> CPU sees it | ~0.1 us | no CPU cache maintenance needed: 5/5 correct and faster with `--host-inval 0 --host-clean 0` (the CPU<->cDSP path is IO-coherent both ways) |
+| CPU write -> HTP sees it | ~0.1 us | the HTP must invalidate its own L2 line before every poll: `Q6_dcinva_A` 0.2 us/poll; `qurt_mem_cache_clean(INVALIDATE)` 0.2-0.3; DMA (bypass) 0.4. Without an invalidate it never sees the update (5/5 timeouts) |
+| HTP publish `ready` | 0.3-0.7 us | `qurt_mem_cache_clean(FLUSH)` on the line, or `dccleana` + `syncht` |
+| HTP writes data, flushes, raises `ready`; CPU reads the data | correct 30/30 | 2 KB 3.5 us, 8 KB 3.9 us, 64 KB 6.1 us incl. the scalar write loop |
+| same data read by a **pre-launched** GPU kernel after the flag | correct 30/30 | the Q / new-K/V direction: the kernel was already running when the HTP wrote |
+| GPU kernel end -> HTP sees its stores | 2-4 us | GPU stores into the alias reach memory at kernel end |
+| GPU polling the rpcmem alias mid-kernel | never sees an update (0/10, 5M loads) | Adreno caches ION buffers within a kernel, `IOCOHERENT` or not; its mid-kernel stores are invisible too |
+| GPU polling a fine-grain SVM word | sees it 2-4 us after the host store; mid-kernel SVM stores visible to the host 10/10 | `CL_DEVICE_SVM_FINE_GRAIN_BUFFER` + `ATOMICS` are supported (no `FINE_GRAIN_SYSTEM`) |
+
+### The round trip as the merge op would see it (`T_DONE - T_READY`, HTP clock; main thread on CPU 7)
+
+| variant | HTP round trip | where it goes |
+|---|---|---|
+| CPU writes 64 KB + `done` | 4.9 us | all of it is the host writing |
+| fresh GPU launch, one fused kernel (64 KB + flag) | **245 us** | enqueue + `clFlush` 36 us, launch 196 us, kernel 8 us, visibility 4 us |
+| fresh GPU launch, two kernels | 264 us | on a little core: 320-460 us (enqueue alone 130-280 us) |
+| `clFlush` skipped | never runs before the 300 ms timeout | the driver does not auto-submit |
+| **pre-launched GPU kernel, host relays the flag through SVM**, 40-64 KB | **7.1-8.9 us** | ready->host 0.1, relay store 0.0, SVM->GPU 2-3, GPU writes, end->HTP 2.5-3.5 |
+| same, main thread unpinned (little core) | 9.1 us | |
+| pre-launched, GPU reads a 64 KB HTP payload first | 17.8 us | one work-group reading 64 KB scalar: the kernel, not the sync |
+| back-to-back pre-enqueued kernels, A end -> B start | 0-1 us | in-order queue; a per-layer chain can be armed at token start |
+
+Side finding, not this section's object: the op-batch dispatch (`compute_async` -> op entry)
+is 90-130 us with the main thread on a big core and 160-650 us unpinned; a ping round trip is
+233 us vs 356-834 us. Part of the ~620 us per-`graph_compute` constant quoted in Section 4e may
+be little-core scheduling. Worth an A/B on `llama-bench` with `taskset` before it is quoted
+again.
+
+### What it means for the design
+
+- The handshake is not the obstacle. With the GPU kernel pre-launched and the flag relayed
+  through SVM, the per-layer fixed cost is ~15 us (flush Q and the new K/V rows ~4, relay
+  7-9, done visibility ~3) instead of the >=250 us of a fresh launch that Section 4e's budget
+  assumed. The usable GPU share is no longer dispatch-bound.
+- Each layer's GPU kernel must be **already running** when the HTP raises `ready`: the GPU
+  cannot poll HTP memory, so a host thread on a big core relays the flag into SVM, and the
+  per-layer kernels are enqueued as a chain (0-1 us between them). The kernel spins while it
+  waits -- ~1 ms per layer at 4k -- which is power, not latency.
+- The HTP side is the existing split-KV merge with extra partial slots, plus: flush Q and the
+  token's K/V rows before `ready`, poll `done` with `dcinva` (0.2 us per read), invalidate the
+  partial range before merging. On a late GPU the merge waits; on a timeout it can compute the
+  missing splits itself, so correctness never depends on timing.
+- **The ceiling is now DRAM, not sync.** At depth 4k a token reads ~470 MB of KV over the 28
+  layers; the HVX path does that in ~17 ms (~27 GB/s, compute-bound, Section 4f). Two engines
+  streaming it together sit against the ~55-60 GB/s the GEMVs already reach, so attention
+  cannot drop below ~8 ms: <=2.1x on attention, <=~1.28x on the token at 4k, <=~1.45x at 16k
+  where attention is 60% of the token. Those are the honest ceilings; the kernel-side levers of
+  Section 4f (fused two-query micro-kernels, transposed-K dot) reach part of the same gain with
+  no cross-device machinery, and the two compose.
+- Still unmeasured: the GPU decode kernel itself in this setting (mllm's `flash_attention_fp16_decode`
+  with GQA, f32 Q/O adapters and Section 4f's partial format), DRAM contention while both engines
+  stream KV, and whether a spinning kernel disturbs the Adreno driver over a whole token.
+
 ## 5. What would change the answer
 
 - **Events in both backends.** OpenCL already uses `cl_event` throughout (its `synchronize` is a
   barrier + wait), so `event_new/record/wait` is plumbing. Hexagon would need a completion
   marker on the dspqueue. This unlocks §3.1 — a ≤1.19× ceiling that needs ≥8k context and a
   smaller ubatch than the sparse kernel wants.
+- **A pre-launched GPU kernel with a flag relay** (§4g) bypasses the scheduler and the
+  dispatch cost entirely for decode attention; what is left to prove is the GPU kernel and the
+  shared DRAM budget, not the synchronization.
 - **A faster GPU path.** The ratio in §1 is the whole story. A GPU kernel at ≥50% of the HMX
   rate would make a ~1.4× pipelined ceiling plausible; Adreno 830 through the current OpenCL
   backend is not that.
