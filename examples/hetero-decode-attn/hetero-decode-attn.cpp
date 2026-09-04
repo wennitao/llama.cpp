@@ -92,12 +92,13 @@ struct options {
     int    cpu       = 7;
     int    verbose   = 0;
     int    mask_frac_permille = 10;   // ~1% of keys masked, exercises the -inf path
+    int    layers    = 1;      // >1 = sustained token mode: chain N pre-enqueued GPU kernels, one relayed per layer
     bool   run_htp = true, run_gpu = true, run_both = true;
 };
 
 static void usage() {
     printf("usage: llama-hetero-decode-attn [--kv N] [--gpu-frac F] [--iters N] [--span N] [--nh N] [--nkvh N]\n"
-           "         [--cpu N] [--modes htp,gpu,both] [--mask-permille N] [-v]\n");
+           "         [--cpu N] [--modes htp,gpu,both] [--mask-permille N] [--layers N] [-v]\n");
 }
 
 static bool parse(int argc, char ** argv, options & o) {
@@ -113,6 +114,7 @@ static bool parse(int argc, char ** argv, options & o) {
         else if (a == "--nkvh")     { if (!next_i(o.nkvh)) return false; }
         else if (a == "--cpu")      { if (!next_i(o.cpu)) return false; }
         else if (a == "--mask-permille") { if (!next_i(o.mask_frac_permille)) return false; }
+        else if (a == "--layers")   { if (!next_i(o.layers)) return false; }
         else if (a == "-v")         { o.verbose = 1; }
         else if (a == "--modes") {
             if (i + 1 >= argc) return false;
@@ -150,7 +152,7 @@ __kernel void fa_dec_gqa(__global uchar * base,
                          uint q_off, uint k_off, uint v_off, uint m_off, uint p_off,
                          uint nbq2, uint nbk1, uint nbk2, uint nbv1, uint nbv2,
                          uint n_kv, uint span, uint nsplit, float scale, uint part_stride,
-                         __global uint * svm, uint want) {
+                         __global uint * svm, uint want, uint max_spin) {
     const int t   = get_local_id(0);
     const int kvh = get_group_id(1);
     const int sp  = get_group_id(2);
@@ -164,9 +166,10 @@ __kernel void fa_dec_gqa(__global uchar * base,
     if (want) {
         if (t == 0) {
             if (kvh == 0 && sp == 0) {
-                atomic_store_explicit((volatile __global atomic_uint *)(svm + 16), 1u, memory_order_seq_cst, memory_scope_all_svm_devices);
+                atomic_store_explicit((volatile __global atomic_uint *)(svm + 1), 1u, memory_order_seq_cst, memory_scope_all_svm_devices);
             }
-            while (atomic_load_explicit((volatile __global atomic_uint *) svm, memory_order_acquire, memory_scope_all_svm_devices) != want) { }
+            uint it = 0;
+            while (atomic_load_explicit((volatile __global atomic_uint *) svm, memory_order_acquire, memory_scope_all_svm_devices) != want && it < max_spin) { it++; }
         }
         barrier(CLK_GLOBAL_MEM_FENCE);
     }
@@ -468,7 +471,7 @@ int main(int argc, char ** argv) {
     uint64_t * rec1 = (uint64_t *) (base + L.rec1);
     uint64_t * rec2 = (uint64_t *) (base + L.rec2);
 
-    auto gpu_enqueue = [&](cl_uint want, cl_event * ev) {
+    auto gpu_enqueue = [&](cl_uint want, cl_event * ev, cl_uint svm_off = 0, cl_uint max_spin = 2000000000u) {
         cl_uint a_q = L.q, a_k = L.k, a_v = L.v, a_m = L.mask, a_p = L.parts;
         cl_uint a_nbq2 = o.d * 4, a_nbk1 = L.nbk1, a_nbk2 = L.nbk2, a_nkv = gpu_kv, a_span = o.span, a_ns = nsplit, a_ps = L.part_stride;
         cl_float a_scale = 1.0f / sqrtf((float) o.d);
@@ -483,8 +486,9 @@ int main(int argc, char ** argv) {
         clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_nkv); clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_span);
         clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_ns); clSetKernelArg(g.k_fa, i++, sizeof(cl_float), &a_scale);
         clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_ps);
-        clSetKernelArgSVMPointer(g.k_fa, i++, g.svm);
+        clSetKernelArgSVMPointer(g.k_fa, i++, g.svm + svm_off);
         clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &want);
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &max_spin);
         size_t gsz[3] = { (size_t) o.d, (size_t) o.nkvh, (size_t) nsplit }, lsz[3] = { (size_t) o.d, 1, 1 };
         return clEnqueueNDRangeKernel(g.q, g.k_fa, 3, nullptr, gsz, lsz, 0, nullptr, ev);
     };
@@ -532,6 +536,71 @@ int main(int argc, char ** argv) {
     bool checked_gpu = false, checked_htp = false;
     const size_t htp_bytes = 2 * (size_t) htp_kv * L.nbk1, gpu_bytes = 2 * (size_t) gpu_kv * L.nbk1;
 
+    // Sustained token mode: pre-enqueue N GPU decode kernels on the in-order queue, each spinning
+    // on its own SVM ready word; loop over N "layers" running the HTP FA op and relaying one word
+    // per layer. Tests whether a chain of spinning kernels holds up, and whether per-layer time
+    // drifts across a whole token (thermal / driver). Reuses the parts/dst regions each layer, so
+    // the last layer's outputs remain for a correctness check.
+    auto run_token = [&]() {
+        const int N = o.layers;
+        if ((size_t) N * 4 + 8 > 1024) { fprintf(stderr, "too many layers for the 4KB svm block\n"); return; }
+        if (!(need_gpu && fa)) { fprintf(stderr, "token mode needs both htp and gpu (kv split with gpu-frac in (0,1))\n"); return; }
+        stat_acc lay_htp, lay_gpu, tok_htp_wall, tok_gpu_wall, drift;
+        std::vector<cl_event> evs(N);
+        int alive_total = 0, alive_runs = 0;
+        for (int pass = -1; pass < o.iters; ++pass) {
+            for (int i = 0; i < N; ++i) { __atomic_store_n(&g.svm[i * 4], 0u, __ATOMIC_SEQ_CST); __atomic_store_n(&g.svm[i * 4 + 1], 0u, __ATOMIC_SEQ_CST); }
+            memset(base + L.parts, 0, L.parts_size); dc_cvac(base + L.parts, L.parts_size);
+            for (int i = 0; i < N; ++i) { evs[i] = nullptr; if (!cl_check(gpu_enqueue(1, &evs[i], (cl_uint) (i * 4), 2000000000u), "chain enqueue")) return; }
+            clFlush(g.q);
+            std::vector<double> htp_layer(N, 0.0);
+            const uint64_t T0 = cnt_now();
+            for (int i = 0; i < N; ++i) {
+                *ready = 0; *done = 0; memset(rec1, 0, 512); memset(rec2, 0, 512); dc_cvac(base, L.flags_end);
+                ggml_backend_graph_compute_async(be, graph);
+                const uint64_t t0 = cnt_now();
+                for (;;) { dc_civac((const void *) ready, 4); if (__atomic_load_n(ready, __ATOMIC_ACQUIRE) == 1u) break; if (cnt_now() - t0 > 3000ull * 19200ull) { fprintf(stderr, "layer %d ready timeout\n", i); return; } }
+                __atomic_store_n(&g.svm[i * 4], 1u, __ATOMIC_SEQ_CST);   // release GPU kernel i
+                __atomic_store_n(done, 1u, __ATOMIC_RELEASE);
+                ggml_backend_synchronize(be);
+                dc_civac(rec1, 512); dc_civac(rec2, 512);
+                const uint64_t fa_start = rec1[HTP_SYNC_PROBE_R_T_DONE], fa_end = rec2[HTP_SYNC_PROBE_R_T_ENTRY];
+                if (rec1[HTP_SYNC_PROBE_R_STATUS] != 0 || !fa_end) { fprintf(stderr, "layer %d probe bad\n", i); return; }
+                htp_layer[i] = ticks_us((double) (fa_end - fa_start));
+            }
+            const uint64_t T_htp_end = cnt_now();
+            clFinish(g.q);
+            double first_start = 1e30, last_end = 0;
+            std::vector<double> gpu_layer(N, 0.0);
+            for (int i = 0; i < N; ++i) {
+                cl_ulong ts = 0, te = 0;
+                clGetEventProfilingInfo(evs[i], CL_PROFILING_COMMAND_START, sizeof(ts), &ts, nullptr);
+                clGetEventProfilingInfo(evs[i], CL_PROFILING_COMMAND_END, sizeof(te), &te, nullptr);
+                const double se = cnt_of_realtime(ts), ee = cnt_of_realtime(te);
+                gpu_layer[i] = ticks_us(ee - se);
+                first_start = std::min(first_start, se); last_end = std::max(last_end, ee);
+                clReleaseEvent(evs[i]);
+            }
+            int alive = 0; for (int i = 0; i < N; ++i) alive += (__atomic_load_n(&g.svm[i * 4 + 1], __ATOMIC_ACQUIRE) == 1u);
+            if (pass < 0) continue;
+            alive_total += alive; alive_runs++;
+            tok_htp_wall.add(ticks_us((double) (T_htp_end - T0)));
+            tok_gpu_wall.add(ticks_us(last_end - first_start));
+            double f3 = 0, l3 = 0; int nf = 0, nl = 0;
+            for (int i = 0; i < N; ++i) { lay_htp.add(htp_layer[i]); lay_gpu.add(gpu_layer[i]); if (i < N / 3) { f3 += htp_layer[i]; nf++; } if (i >= 2 * N / 3) { l3 += htp_layer[i]; nl++; } }
+            if (nf && nl && f3 > 0) drift.add((l3 / nl) / (f3 / nf));
+        }
+        dc_civac(base + L.parts, L.parts_size);
+        const bool ok = check_gpu();
+        printf("\nsustained token: %d layers x %d passes | GPU chain: %d/%d kernels ran per pass | last-pass partials %s\n",
+               N, o.iters, alive_runs ? alive_total / alive_runs : 0, N, ok ? "OK" : "MISMATCH");
+        printf("  %-32s %9.1f %9.1f %9.1f us  (median/min/max over %zu layer-instances)\n", "HTP FA op per layer", lay_htp.med(), lay_htp.mn(), lay_htp.mx(), lay_htp.v.size());
+        printf("  %-32s %9.1f %9.1f %9.1f us\n", "GPU kernel per layer", lay_gpu.med(), lay_gpu.mn(), lay_gpu.mx());
+        printf("  %-32s %9.1f us   GPU busy span %.1f us\n", "HTP token wall (attn only)", tok_htp_wall.med(), tok_gpu_wall.med());
+        printf("  %-32s %.3f  (>~1.05 would mean thermal/driver drift over the token)\n", "per-layer HTP drift (last/first 3rd)", drift.med());
+    };
+
+    if (o.layers > 1) { run_token(); } else {
     for (int it = -1; it < o.iters; ++it) {
         for (int r = 0; r < R_N; ++r) {
             const bool use_htp = (r != R_GPU) && (o.run_htp || r == R_BOTH) && fa;
@@ -545,11 +614,11 @@ int main(int argc, char ** argv) {
             dc_cvac(base, L.flags_end);
             cl_event ev = nullptr;
             if (use_gpu) {
-                __atomic_store_n(&g.svm[0], 0u, __ATOMIC_SEQ_CST); __atomic_store_n(&g.svm[16], 0u, __ATOMIC_SEQ_CST);
+                __atomic_store_n(&g.svm[0], 0u, __ATOMIC_SEQ_CST); __atomic_store_n(&g.svm[1], 0u, __ATOMIC_SEQ_CST);
                 if (!cl_check(gpu_enqueue(1, &ev), "enqueue")) return 1;
                 clFlush(g.q);
                 const uint64_t t0 = cnt_now();
-                while (__atomic_load_n(&g.svm[16], __ATOMIC_ACQUIRE) != 1u && cnt_now() - t0 < 500ull * 19200ull) {}
+                while (__atomic_load_n(&g.svm[1], __ATOMIC_ACQUIRE) != 1u && cnt_now() - t0 < 500ull * 19200ull) {}
             }
             uint64_t T_rel = 0, T1 = 0;
             if (use_htp) {
@@ -617,6 +686,7 @@ int main(int argc, char ** argv) {
     if (!s_htp[R_HTP].empty() && !s_htp[R_BOTH].empty()) printf("\ncontention: HTP x%.2f slower with the GPU streaming", s_htp[R_BOTH].med() / s_htp[R_HTP].med());
     if (!s_gpu[R_GPU].empty() && !s_gpu[R_BOTH].empty()) printf(", GPU x%.2f slower with the HTP streaming", s_gpu[R_BOTH].med() / s_gpu[R_GPU].med());
     printf("\n");
+    } // end single-shot
 
     if (g.svm) clSVMFree(g.ctx, g.svm);
     if (g.alias) clReleaseMemObject(g.alias);

@@ -615,8 +615,46 @@ this setting, and DRAM contention when the HTP and the GPU stream the KV cache a
 - What is left is integration (Section 4g's design, now with a validated kernel): the FA op
   starting at block `gpu_blocks`, raising `ready`, merging the GPU's partials from the shared
   buffer after polling `done`; a host relay thread that pre-enqueues one kernel per layer and
-  copies each `ready` into SVM; the token-level measurement with `llama-bench`; and the third
-  open item, a spinning kernel's behaviour across a whole token.
+  copies each `ready` into SVM; and the token-level measurement with `llama-bench`. The third
+  open item (a spinning kernel across a whole token) is answered below.
+
+### Sustained across a whole token (`--layers 28`)
+
+The third open item: does a chain of pre-launched spinning GPU kernels hold up over a token,
+and does dual-streaming drift? The tool pre-enqueues 28 decode kernels on the in-order queue,
+each spinning on its own SVM word, and relays one per "layer" while the HTP runs its FA op.
+
+| kv | layers x passes | GPU chain | last-pass partials | HTP FA op / layer | per-layer drift (last/first third) |
+|--:|---|---|---|--:|--:|
+| 4096  | 28 x 5 | 28/28 ran each pass | OK | 289 us (282-292) | 1.000 |
+| 16384 | 28 x 4 | 28/28 ran each pass | OK | 1103 us (1093-1124) | 1.003 |
+
+The chain holds: every kernel runs, in order, correct, and the GPU busy span tracks the HTP
+token wall. Per-layer HTP FA time is flat -- no thermal or driver drift over the token, and it
+matches the single-shot numbers, so the spinning kernels do not disturb the HTP. (The GPU
+kernel's own event span inflates to ~550 us/layer because it includes the spin waiting for its
+relay; that is idle power, not added latency -- the compute is still ~300 us and it finishes
+before the next relay.) The one cost that remains real is the spin itself: ~1 ms of GPU
+occupancy per layer at 4k, pure power.
+
+### Correction to the 4g dispatch side-finding: big-core pinning hurts real decode
+
+Section 4g found the sync-probe dispatch ~3-5x cheaper with the main thread pinned to a big
+core, and flagged the ~620 us per-`graph_compute` constant as possibly little-core scheduling.
+The `llama-bench` A/B settles it the other way (Qwen3-1.7B, tg64 @ d4096, taskset, 3x4 reps,
+interleaved):
+
+| process affinity | tg64 @ d4096 |
+|---|--:|
+| big cores only (6,7) | 8.9 t/s |
+| all 8 cores (default) | 13.3 t/s |
+
+Forcing the process onto the two big cores is **1.5x slower**, because decode has real
+CPU-resident work (the lm-head GEMV unless `GGML_HEXAGON_LM_HEAD=1`, sampling, graph build)
+that then contends for two cores. The isolated dispatch latency does drop when a lone thread
+owns a big core, but at the process level the scheduler's default spread wins. So the ~620 us
+constant is not something process-level pinning fixes; a gain would need thread-level affinity
+for the dispatch thread only, which is a separate change and not pursued here.
 
 ## 5. What would change the answer
 
