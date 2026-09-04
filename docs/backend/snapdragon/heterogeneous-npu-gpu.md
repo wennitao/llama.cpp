@@ -5,9 +5,10 @@ compute move to it, and can the data movement be arranged so the two do not figh
 
 Short answer: **not with the current scheduler, and not by much even with a better one.** The
 GPU delivers ~1/5 of the NPU's prefill throughput on this model, the scheduler can only run the
-two *serially* (neither backend implements events), and decode — where a second unit would be
-most welcome — is bandwidth-bound on DRAM the two units share, so the GPU measures the **same**
-decode rate as the NPU and can add nothing.
+two *serially* (neither backend implements events), and decode at depth ~0 is bandwidth-bound on
+DRAM the two units share, so the GPU measures the **same** decode rate as the NPU. At real
+context depth decode is bound by the NPU's own attention kernel instead (§4c) — and moving
+that kernel to the GPU loses to crossings before it starts (§4e); the fix is on the NPU.
 
 Everything below is SM8750 (Hexagon v79 + Adreno 830), Qwen3-1.7B Q4_0, `llama-bench`
 `-fa 1 -ngl 99`, one binary carrying both backends (`GGML_HEXAGON=ON GGML_OPENCL=ON`).
@@ -317,6 +318,78 @@ GQA head mapping, and the persistent split-K scratch buffer. Roughly a day.
 ~85 µs; and the KV cache must be readable by both units without copies. Both are the
 scheduler/buffer questions in the synthesis below — and the on-NPU HVX fix (§4d.1) reaches the
 same ~8–11 ms/token with neither.
+
+## 4e. Decision: GPU decode attention — no; the HVX decode path — yes
+
+Four read-only investigations (scheduler placement, ggml-opencl's FA, the HVX decode path,
+the mllm kernel) plus the measurements above. Their adversarial-verification stage did not run
+(session limit), so claims below are single-source unless marked *verified*; the ones the
+decision rests on were re-read in source.
+
+### Why the GPU route cannot pay through `ggml_backend_sched`, regardless of kernel
+
+- **Placement.** Making ggml-hexagon reject decode FA would send it to the **CPU**, not the
+  GPU: pass 3 assigns an unassigned node to the backend with the most *buffer-supported*
+  inputs, hexagon's rpcmem buffers are host-visible, the CPU accepts any host buft, and
+  OpenCL's `supports_buft` accepts only its own (*verified*, `ggml-backend.cpp:1199-1226`,
+  `ggml-opencl.cpp:11711-11722`). The only route is the existing user-pin API
+  `ggml_backend_sched_set_tensor_backend`, which llama-context already uses for `norm`/`l_last`
+  (*verified*, `llama-context.cpp:2532`) — ~10 lines in `graph_get_cb`, gated on `n_tokens==1`.
+- **Crossings.** A pinned FA turns each layer into HTP → GPU → HTP: **28 HTP graph_computes per
+  token instead of ~1**, each a blocking dspqueue round trip measured at ~620 µs
+  (`sparse-attention.md` §2) → ~17 ms/token before the GPU does anything; plus, per layer, three
+  blocking 8 KB transfers and ≥3 barrier+wait round trips on the OpenCL side (no events, no
+  async copies on either backend) at ~0.36 ms per small dispatch by mllm's own measurement on
+  this SoC. **Crossing overhead alone is ~1–2 ms/layer = 28–56 ms/token — at or above the entire
+  28 ms the HVX attention costs today.** The break-even crossing computed in §4d.1 was ~170 µs;
+  the stack delivers ~1000+.
+- **KV sharing is solvable, and is not the wall.** ggml-opencl has no host-pointer import at all
+  (`buffer_from_host_ptr` returns nullptr), so today the scheduler would copy the K/V views —
+  470 MB/token at 4k. But mllm's `het-pipeline` branch has a *validated* zero-copy recipe on this
+  SoC: `clCreateBuffer(CL_MEM_USE_HOST_PTR | CL_MEM_EXT_HOST_PTR_QCOM)` with a
+  `cl_mem_ion_host_ptr{CL_MEM_ION_HOST_PTR_QCOM, CL_MEM_HOST_IOCOHERENT_QCOM, fd, ptr}` over an
+  rpcmem allocation — GPU reads of DSP-written K/V byte-exact 30/30. ggml-hexagon's buffers
+  already carry the `(base, fd)` pair it needs. (The generic `cl_khr_external_memory_dma_buf`
+  import silently creates a separate buffer on Adreno 8xx; do not use it.)
+
+So the GPU path needs, in order: events + async copies in *both* backends, an OpenCL-side
+import of hexagon buffers, a GQA-aware port of the mllm kernel — and at the end of all that it
+ties or modestly beats the on-NPU fix.
+
+### Why the HVX path is at 23 GB/s, and how to double it
+
+The investigation's arithmetic reproduces the PMU measurement: 16 heads × 4352 rows × 2 tensors
+× 28 layers = 3.90 M AXI requests × 191 B = 745 MB against the measured 741 MB (0.5%). That
+implies each 256 B K/V row (2 KB stride in the cache) is one bus request, so the 191 B/request
+proxy *undercounts* here and the true traffic is ~1.0 GB/token — the DMA engine is running at
+~45 GB/s, near the GEMV rate. The useful half is lost to structure, not to hardware:
+
+1. **2× redundant fetch.** The HVX kernel's unit of work is one flattened (token, head) query row
+   per thread, so both query heads of a GQA-2 group independently DMA the same KV head
+   (`ggml-hexagon.cpp:2217`, `flash-attn-ops.c:468`). 33.6 MB moved per op for 16.8 MB unique.
+2. **16 rows over 6 threads** = 3,3,3,3,3,1 — all six busy for only the first third.
+3. **Two 64-row blocks in flight per thread**, busy-wait pop.
+4. Decode takes HVX by an explicit gate (`DK <= 128 && neq1 < 5`, `ggml-hexagon.cpp:2030`); HMX at
+   `Br=1` would fill 2 of 32 tile rows and is correctly rejected.
+
+Ranked fixes, attention ms/token at depth 4096 (today 20.7 kernel-only / 28 in-model):
+
+| fix | est. attention | what it is |
+|:--|--:|:--|
+| **#1 split-KV "flash-decoding" on HVX** | **~9** | work unit = (kv head, KV range) serving both query heads; per-split `(m, l, acc)` partials + combine. Unique bytes, perfect 6-way balance. Mirrors the mllm kernel's structure, on the NPU. |
+| #2 head-grouping only | ~14 | iterate 8 KV-head rows, G dots per fetched block; 8 rows over 6 threads leaves two rounds |
+| #3 decode-side block selection (25%) | ~5.5 alone, ~3 on top of #1 | needs `src[5]/src[6]` in the HVX path and a single-query scorer; quality unvalidated |
+| #4 deeper prefetch / `Bc=128` | ≤10–15% | VTCM has room (0.5 of 8 MB used) but the aggregate is already near rate |
+
+Fix #1 alone takes the token from ~50 to ~38 ms at depth 4096 (≈1.3×) with no second runtime,
+and is the same idea the GPU route would need anyway.
+
+### The one measurement that decides fix #1's size
+
+The split between DMA-bound and HVX-compute-bound inside the decode kernel is inferred, not
+measured. `GGML_HEXAGON_PROFILE=3` on one decode FA op at kv=4096 gives per-thread
+`HVX_FA_QK + HVX_FA_SFM` busy vs DMA-event coverage: DMA ~100% and compute < 40% → #1 delivers
+its full ~2×; compute > 60% → the HVX chain is the ceiling and #1 buys only the imbalance.
 
 ## 5. What would change the answer
 
