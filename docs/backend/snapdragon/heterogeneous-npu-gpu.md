@@ -563,6 +563,61 @@ again.
   with GQA, f32 Q/O adapters and Section 4f's partial format), DRAM contention while both engines
   stream KV, and whether a spinning kernel disturbs the Adreno driver over a whole token.
 
+## 4h. Measured: the GPU decode kernel, and both engines streaming the same KV (`examples/hetero-decode-attn`)
+
+Section 4g left three things unmeasured. This closes two of them: the GPU decode kernel in
+this setting, and DRAM contention when the HTP and the GPU stream the KV cache at once.
+
+### What was built
+
+- `fa_dec_gqa` (OpenCL, in the tool): one work-group per (KV head, KV split), 128 lanes, the
+  G query heads of a KV head share every K/V read (GQA-aware). It reads Q (f32), K/V (f16) and
+  the mask straight from the ggml layouts through the ION alias and emits the split-KV partial
+  of Section 4f -- 128-byte header (M, S), then acc[DV] f32, scores in scale*q.k + mask units
+  with natural exp -- so the HTP merge can combine partials from both engines. Correct against
+  a CPU reference to 1e-8 after a host-side merge; the HTP FA output over its range to 2e-5.
+- `llama-hetero-decode-attn`: one hexagon rpcmem buffer holds Q, K, V, mask, the partials and
+  the sync-probe words; the HTP graph is [probe handshake] -> [FLASH_ATTN_EXT over K/V views of
+  positions [gpu_kv, kv)] -> [probe ping], the GPU kernel is pre-launched over [0, gpu_kv) and
+  released through SVM at the handshake, so both start within a few microseconds and the FA
+  op's own start/end come from the probe stamps on the HTP qtimer.
+
+```
+./llama-hetero-decode-attn --kv 4096 --gpu-frac 0.6 --span 512 --iters 7   # Qwen3-1.7B shapes: nh 16, nkvh 8, d 128
+```
+
+### Results (median of 7, main thread on CPU 7, Qwen3-1.7B shapes, ~1% keys masked)
+
+| kv | HTP alone, full range | GPU alone, full range | best split measured | wall (both) | vs HTP alone | HTP / GPU slowdown when both stream |
+|--:|--:|--:|---|--:|--:|--:|
+| 4096  | 636 us (26.4 GB/s)  | 436 us (38.5 GB/s)  | GPU 0.6, span 512: HTP 287 / GPU 299 | **299 us** | **2.13x** | x1.03 / x1.30 |
+| 8192  | 1195 us (28.1 GB/s) | 774 us (43.3 GB/s)  | GPU 0.5, span 256: HTP 636 / GPU 617  | **638 us** | **1.87x** | x1.00 / x1.39 |
+| 16384 | 2349 us (28.6 GB/s) | 1481 us (45.3 GB/s) | GPU 0.5, span 256: HTP 1203 / GPU 1178 | **1203 us** | **1.95x** | x1.00 / x1.49 |
+
+- The HTP does not feel the GPU: it is compute-bound at ~27 GB/s (Section 4f), so a second
+  reader costs it 0-3%. The GPU is the one that pays for contention (x1.2-1.5), which is why
+  the balance point sits at a GPU share of 0.5-0.6 rather than at the ratio of the standalone
+  speeds. Combined traffic at the balance point is 50-56 GB/s -- inside what the GEMVs already
+  draw, below the ~77 GB/s peak.
+- Span (keys per GPU work-group): 512 beats 256 beats 128 at 4k (GPU alone 229 / 255 / 292
+  us); at 16k 512 and 256 tie and 1024 loses (too few, too long work-groups). 512 is the
+  default to carry forward, or nsplit ~5-8 per KV head.
+- The GPU kernel alone is already 1.45-1.6x faster than the HVX path over the full range
+  (its 45 GB/s at 16k vs the HTP's 28.6). A GPU-only attention would still lose to the split,
+  which uses both.
+
+### What it means
+
+- Per layer the attention wall halves at every depth measured. On Qwen3-1.7B (28 layers) that
+  is 28 x (636 - 300) = 9.4 ms off a ~43 ms token at 4k (~1.28x) and 28 x (2349 - 1150) = 34 ms
+  off a ~110 ms token at 16k (~1.44x), before the ~15 us/layer handshake of Section 4g. These
+  are the same ceilings Section 4g projected from bandwidth; now they are measured per layer.
+- What is left is integration (Section 4g's design, now with a validated kernel): the FA op
+  starting at block `gpu_blocks`, raising `ready`, merging the GPU's partials from the shared
+  buffer after polling `done`; a host relay thread that pre-enqueues one kernel per layer and
+  copies each `ready` into SVM; the token-level measurement with `llama-bench`; and the third
+  open item, a spinning kernel's behaviour across a whole token.
+
 ## 5. What would change the answer
 
 - **Events in both backends.** OpenCL already uses `cl_event` throughout (its `synchronize` is a

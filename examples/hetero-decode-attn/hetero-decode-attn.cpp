@@ -1,0 +1,629 @@
+// hetero-decode-attn: decode attention split between the HTP (tail of the KV range) and the
+// Adreno GPU (head of the KV range), with both engines streaming the same KV cache at once.
+//
+// What it measures, for the heterogeneous decode design of docs/backend/snapdragon/heterogeneous-npu-gpu.md
+// section 4g: (1) a GQA-aware OpenCL decode kernel on the real ggml KV layout that emits the
+// split-KV partial format of the HVX decode kernel (M, S, acc[DV]); (2) its time and bandwidth
+// alone; (3) the HVX decode op alone over its range; (4) both at once, started within a few
+// microseconds of each other through the sync-probe handshake, so DRAM contention shows up
+// as the slowdown of each side.
+//
+// Layout: one hexagon rpcmem buffer holds everything and is aliased into OpenCL zero-copy.
+// The HTP graph is [sync-probe handshake] -> [FLASH_ATTN_EXT over K/V views of the HTP range]
+// -> [sync-probe ping]; the probe stamps give the FA op's start and end on the HTP qtimer,
+// which is the same counter as the CPU's cntvct (section 4g). The GPU kernel is pre-launched
+// and spins on a fine-grain SVM word the host releases when the handshake fires.
+
+#include "ggml.h"
+#include "ggml-backend.h"
+
+#define GGML_COMMON_DECL_CPP
+#include "ggml-common.h"
+#include "htp-ops.h"
+
+#include <CL/cl.h>
+#include <CL/cl_ext.h>
+
+#include <algorithm>
+#include <cinttypes>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <random>
+#include <sched.h>
+#include <string>
+#include <time.h>
+#include <unistd.h>
+#include <vector>
+
+extern "C" int rpcmem_to_fd(void * po);
+
+// ---------------------------------------------------------------------------------------
+// clocks / cache maintenance (aarch64 EL0), as in hetero-sync-probe
+// ---------------------------------------------------------------------------------------
+
+static inline uint64_t cnt_now() {
+    uint64_t v;
+    asm volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(v) : : "memory");
+    return v;
+}
+static inline double ticks_us(double t) { return t / 19.2; }
+static inline uint64_t realtime_ns() {
+    timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
+static double g_rt_off_ns = 0;
+static void calibrate_realtime() {
+    double best = 1e30, best_off = 0;
+    for (int i = 0; i < 64; i++) {
+        const uint64_t c0 = cnt_now(), r = realtime_ns(), c1 = cnt_now();
+        const double w = (double) (c1 - c0);
+        if (w < best) { best = w; best_off = (double) r - ((double) c0 + (double) c1) * 0.5 * 1e9 / 19.2e6; }
+    }
+    g_rt_off_ns = best_off;
+}
+static inline double cnt_of_realtime(uint64_t ns) { return ((double) ns - g_rt_off_ns) * 19.2e6 / 1e9; }
+
+static inline void dc_civac(const void * p, size_t n) {
+    uintptr_t a = (uintptr_t) p & ~(uintptr_t) 63; const uintptr_t e = (uintptr_t) p + n;
+    for (; a < e; a += 64) asm volatile("dc civac, %0" : : "r"(a) : "memory");
+    asm volatile("dsb sy" : : : "memory");
+}
+static inline void dc_cvac(const void * p, size_t n) {
+    uintptr_t a = (uintptr_t) p & ~(uintptr_t) 63; const uintptr_t e = (uintptr_t) p + n;
+    for (; a < e; a += 64) asm volatile("dc cvac, %0" : : "r"(a) : "memory");
+    asm volatile("dsb sy" : : : "memory");
+}
+
+// ---------------------------------------------------------------------------------------
+// options
+// ---------------------------------------------------------------------------------------
+
+struct options {
+    int    kv        = 4096;
+    double gpu_frac  = 0.5;     // fraction of the KV range given to the GPU (block aligned)
+    int    iters     = 10;
+    int    span      = 256;     // keys per GPU work-group (one split)
+    int    nh        = 16;
+    int    nkvh      = 8;
+    int    d         = 128;
+    int    cpu       = 7;
+    int    verbose   = 0;
+    int    mask_frac_permille = 10;   // ~1% of keys masked, exercises the -inf path
+    bool   run_htp = true, run_gpu = true, run_both = true;
+};
+
+static void usage() {
+    printf("usage: llama-hetero-decode-attn [--kv N] [--gpu-frac F] [--iters N] [--span N] [--nh N] [--nkvh N]\n"
+           "         [--cpu N] [--modes htp,gpu,both] [--mask-permille N] [-v]\n");
+}
+
+static bool parse(int argc, char ** argv, options & o) {
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        auto next_i = [&](int & v) { if (i + 1 >= argc) return false; v = (int) strtol(argv[++i], nullptr, 0); return true; };
+        auto next_d = [&](double & v) { if (i + 1 >= argc) return false; v = strtod(argv[++i], nullptr); return true; };
+        if (a == "--kv")            { if (!next_i(o.kv)) return false; }
+        else if (a == "--gpu-frac") { if (!next_d(o.gpu_frac)) return false; }
+        else if (a == "--iters")    { if (!next_i(o.iters)) return false; }
+        else if (a == "--span")     { if (!next_i(o.span)) return false; }
+        else if (a == "--nh")       { if (!next_i(o.nh)) return false; }
+        else if (a == "--nkvh")     { if (!next_i(o.nkvh)) return false; }
+        else if (a == "--cpu")      { if (!next_i(o.cpu)) return false; }
+        else if (a == "--mask-permille") { if (!next_i(o.mask_frac_permille)) return false; }
+        else if (a == "-v")         { o.verbose = 1; }
+        else if (a == "--modes") {
+            if (i + 1 >= argc) return false;
+            std::string m = argv[++i];
+            o.run_htp = m.find("htp") != std::string::npos;
+            o.run_gpu = m.find("gpu") != std::string::npos;
+            o.run_both = m.find("both") != std::string::npos;
+        }
+        else { usage(); return false; }
+    }
+    if (o.kv % 64 || o.kv < 64) { fprintf(stderr, "--kv must be a positive multiple of 64\n"); return false; }
+    if (o.d != 128) { fprintf(stderr, "only d=128 is built into the GPU kernel\n"); return false; }
+    if (o.nh % o.nkvh) { fprintf(stderr, "nh must be a multiple of nkvh\n"); return false; }
+    if (o.gpu_frac < 0 || o.gpu_frac > 1) { fprintf(stderr, "--gpu-frac in [0,1]\n"); return false; }
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------
+// GPU kernel: one work-group per (KV head, split); FA_D lanes; the G query heads of the KV
+// head share every K/V read. Emits the HVX split-KV partial: 128-byte header (M, S), then
+// acc[FA_D] f32. Scores are scale*q.k + mask, exp is natural: the same units as the HVX
+// kernel, so the HTP merge can combine partials from both engines.
+// ---------------------------------------------------------------------------------------
+
+static const char * cl_src_fa = R"CL(
+#ifndef FA_D
+#define FA_D 128
+#endif
+#ifndef FA_G
+#define FA_G 2
+#endif
+#define HTP_M_INIT (-10000.0f)
+
+__kernel void fa_dec_gqa(__global uchar * base,
+                         uint q_off, uint k_off, uint v_off, uint m_off, uint p_off,
+                         uint nbq2, uint nbk1, uint nbk2, uint nbv1, uint nbv2,
+                         uint n_kv, uint span, uint nsplit, float scale, uint part_stride,
+                         __global uint * svm, uint want) {
+    const int t   = get_local_id(0);
+    const int kvh = get_group_id(1);
+    const int sp  = get_group_id(2);
+
+    __local float Q_l[FA_G][FA_D];
+    __local float S_l[FA_G][FA_D];
+    __local float sh_a[FA_G];
+    __local float sh_m[FA_G];
+    __local float sh_l[FA_G];
+
+    if (want) {
+        if (t == 0) {
+            if (kvh == 0 && sp == 0) {
+                atomic_store_explicit((volatile __global atomic_uint *)(svm + 16), 1u, memory_order_seq_cst, memory_scope_all_svm_devices);
+            }
+            while (atomic_load_explicit((volatile __global atomic_uint *) svm, memory_order_acquire, memory_scope_all_svm_devices) != want) { }
+        }
+        barrier(CLK_GLOBAL_MEM_FENCE);
+    }
+
+    for (int g = 0; g < FA_G; ++g) {
+        Q_l[g][t] = ((__global const float *)(base + q_off + (kvh * FA_G + g) * nbq2))[t] * scale;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int kv_begin = sp * span;
+    const int kv_end   = min((int) n_kv, kv_begin + (int) span);
+
+    float m_run = -INFINITY, l_run = 0.0f;   // valid on lanes t < FA_G (lane t owns head t)
+    float o_acc[FA_G];
+    for (int g = 0; g < FA_G; ++g) o_acc[g] = 0.0f;
+
+    if (kv_begin < kv_end) {
+        for (int bs = kv_begin; bs < kv_end; bs += FA_D) {
+            const int blk_n = min(FA_D, kv_end - bs);
+
+            float s[FA_G];
+            for (int g = 0; g < FA_G; ++g) s[g] = -INFINITY;
+            if (t < blk_n) {
+                __global const half * krow = (__global const half *)(base + k_off + (ulong)(bs + t) * nbk1 + kvh * nbk2);
+                float8 acc[FA_G];
+                for (int g = 0; g < FA_G; ++g) acc[g] = (float8)(0.0f);
+                #pragma unroll
+                for (int d8 = 0; d8 < FA_D / 8; ++d8) {
+                    const float8 k8 = convert_float8(vload8(d8, krow));
+                    for (int g = 0; g < FA_G; ++g) acc[g] += k8 * vload8(d8, Q_l[g]);
+                }
+                float mval = 0.0f;
+                if (m_off) mval = (float)((__global const half *)(base + m_off))[bs + t];
+                for (int g = 0; g < FA_G; ++g) {
+                    const float8 a = acc[g];
+                    s[g] = (a.s0 + a.s1 + a.s2 + a.s3 + a.s4 + a.s5 + a.s6 + a.s7) + mval;
+                }
+            }
+            for (int g = 0; g < FA_G; ++g) S_l[g][t] = s[g];
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            if (t < FA_G) {
+                float m_t = -INFINITY;
+                for (int c = 0; c < FA_D; ++c) m_t = fmax(m_t, S_l[t][c]);
+                const float m_new = fmax(m_run, m_t);
+                const float a = (m_run == -INFINITY) ? 0.0f : native_exp(m_run - m_new);
+                float l = 0.0f;
+                for (int c = 0; c < FA_D; ++c) {
+                    const float sc = S_l[t][c];
+                    const float p = (isinf(sc) || m_new == -INFINITY) ? 0.0f : native_exp(sc - m_new);
+                    S_l[t][c] = p;
+                    l += p;
+                }
+                l_run = a * l_run + l;
+                m_run = m_new;
+                sh_a[t] = a;
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            {
+                float pv[FA_G];
+                for (int g = 0; g < FA_G; ++g) pv[g] = 0.0f;
+                __global const half * vb = (__global const half *)(base + v_off + (ulong) bs * nbv1 + kvh * nbv2) + t;
+                const int vstep = nbv1 / 2;
+                #pragma unroll 8
+                for (int c = 0; c < blk_n; ++c) {
+                    const float vf = (float) vb[(ulong) c * vstep];
+                    for (int g = 0; g < FA_G; ++g) pv[g] += S_l[g][c] * vf;
+                }
+                for (int g = 0; g < FA_G; ++g) o_acc[g] = o_acc[g] * sh_a[g] + pv[g];
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+    }
+
+    if (t < FA_G) { sh_m[t] = (kv_begin < kv_end) ? m_run : HTP_M_INIT; sh_l[t] = l_run; }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int g = 0; g < FA_G; ++g) {
+        const int row = kvh * FA_G + g;   // decode: one token, row = query head
+        __global float * part = (__global float *)(base + p_off + ((ulong) row * nsplit + sp) * part_stride);
+        if (t == 0) { part[0] = sh_m[g]; part[1] = sh_l[g]; }
+        part[32 + t] = o_acc[g];
+    }
+}
+)CL";
+
+// ---------------------------------------------------------------------------------------
+
+struct gpu_side {
+    cl_platform_id plat = nullptr; cl_device_id dev = nullptr; cl_context ctx = nullptr; cl_command_queue q = nullptr;
+    cl_program prog = nullptr; cl_kernel k_fa = nullptr; cl_mem alias = nullptr; uint32_t * svm = nullptr;
+};
+
+static bool cl_check(cl_int err, const char * what) {
+    if (err != CL_SUCCESS) { fprintf(stderr, "OpenCL: %s failed (%d)\n", what, err); return false; }
+    return true;
+}
+
+static bool gpu_init(gpu_side & g, const options & o, uint8_t * base, size_t buf_size, int fd) {
+    cl_int err; cl_uint n = 0;
+    if (!cl_check(clGetPlatformIDs(1, &g.plat, &n), "clGetPlatformIDs") || !n) return false;
+    if (!cl_check(clGetDeviceIDs(g.plat, CL_DEVICE_TYPE_GPU, 1, &g.dev, &n), "clGetDeviceIDs") || !n) return false;
+    char name[256] = {0}; clGetDeviceInfo(g.dev, CL_DEVICE_NAME, sizeof(name), name, nullptr);
+    cl_device_svm_capabilities svm = 0; clGetDeviceInfo(g.dev, CL_DEVICE_SVM_CAPABILITIES, sizeof(svm), &svm, nullptr);
+    if (!(svm & CL_DEVICE_SVM_FINE_GRAIN_BUFFER) || !(svm & CL_DEVICE_SVM_ATOMICS)) { fprintf(stderr, "gpu: no fine-grain SVM atomics\n"); return false; }
+    g.ctx = clCreateContext(nullptr, 1, &g.dev, nullptr, nullptr, &err); if (!cl_check(err, "clCreateContext")) return false;
+    cl_queue_properties qp[] = { CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0 };
+    g.q = clCreateCommandQueueWithProperties(g.ctx, g.dev, qp, &err); if (!cl_check(err, "queue")) return false;
+
+    char opts[128]; snprintf(opts, sizeof(opts), "-cl-std=CL2.0 -DFA_D=%d -DFA_G=%d", o.d, o.nh / o.nkvh);
+    g.prog = clCreateProgramWithSource(g.ctx, 1, &cl_src_fa, nullptr, &err); if (!cl_check(err, "program")) return false;
+    err = clBuildProgram(g.prog, 1, &g.dev, opts, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        size_t ln = 0; clGetProgramBuildInfo(g.prog, g.dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &ln);
+        std::string log(ln, '\0'); clGetProgramBuildInfo(g.prog, g.dev, CL_PROGRAM_BUILD_LOG, ln, log.data(), nullptr);
+        fprintf(stderr, "OpenCL build failed (%d):\n%s\n", err, log.c_str()); return false;
+    }
+    g.k_fa = clCreateKernel(g.prog, "fa_dec_gqa", &err); if (!cl_check(err, "kernel")) return false;
+
+    cl_uint page = 0; clGetDeviceInfo(g.dev, CL_DEVICE_PAGE_SIZE_QCOM, sizeof(page), &page, nullptr); if (!page) page = 4096;
+    cl_mem_ion_host_ptr ion = {};
+    ion.ext_host_ptr.allocation_type = CL_MEM_ION_HOST_PTR_QCOM;
+    ion.ext_host_ptr.host_cache_policy = CL_MEM_HOST_IOCOHERENT_QCOM;
+    ion.ion_filedesc = fd; ion.ion_hostptr = base;
+    g.alias = clCreateBuffer(g.ctx, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR | CL_MEM_EXT_HOST_PTR_QCOM, buf_size, &ion, &err);
+    if (!cl_check(err, "ION alias")) return false;
+    g.svm = (uint32_t *) clSVMAlloc(g.ctx, CL_MEM_READ_WRITE | CL_MEM_SVM_FINE_GRAIN_BUFFER | CL_MEM_SVM_ATOMICS, 4096, 64);
+    if (!g.svm) { fprintf(stderr, "clSVMAlloc failed\n"); return false; }
+    printf("gpu: %s, alias %zu MB, kernel opts '%s'\n", name, buf_size >> 20, opts);
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------
+// layout inside the shared buffer
+// ---------------------------------------------------------------------------------------
+
+struct layout {
+    size_t ready = 0, done = 4096, rec1 = 8192, rec2 = 12288, flags_end = 16384;
+    size_t q = 65536, mask = 131072, dst = 262144, parts = 524288, parts_size = 1 << 20;
+    size_t k = 2 << 20, v = 0, total = 0;
+    size_t nbk1 = 0, nbk2 = 0;     // K/V: position-major, heads contiguous within a position
+    size_t part_stride = 0;
+};
+
+static ggml_tensor * place(ggml_backend_buffer_t buf, uint8_t * base, size_t off, ggml_tensor * t, const char * name) {
+    t->buffer = buf; t->data = base + off; ggml_set_name(t, name);
+    ggml_backend_buffer_init_tensor(buf, t);
+    return t;
+}
+
+static void noop_custom(ggml_tensor *, int, int, void *) {}
+
+static void set_probe_params(ggml_tensor * t, int mode /*0 handshake, 1 ping*/, const layout & L, int timeout_ms) {
+    int32_t * p = t->op_params; memset(p, 0, sizeof(t->op_params));
+    p[HTP_SYNC_PROBE_P_MAGIC] = (int32_t) HTP_SYNC_PROBE_MAGIC;
+    p[HTP_SYNC_PROBE_P_MODE] = mode;
+    p[HTP_SYNC_PROBE_P_TIMEOUT_US] = timeout_ms * 1000;
+    p[HTP_SYNC_PROBE_P_INVAL] = 0;         // dcinva per poll
+    p[HTP_SYNC_PROBE_P_READY_OFF] = (int32_t) L.ready;
+    p[HTP_SYNC_PROBE_P_DONE_OFF]  = (int32_t) L.done;
+    p[HTP_SYNC_PROBE_P_PAYLOAD_OFF] = (int32_t) L.done + 128;
+    p[HTP_SYNC_PROBE_P_READY_VAL] = 1; p[HTP_SYNC_PROBE_P_DONE_VAL] = 1;
+}
+
+// CPU reference: full softmax attention of head h over keys [k0, k1). Natural units.
+static void ref_attn(const options & o, const uint8_t * base, const layout & L, int h, int k0, int k1, std::vector<double> & out,
+                     double * M_out, double * S_out) {
+    const int kvh = h / (o.nh / o.nkvh);
+    const float * q = (const float *) (base + L.q + (size_t) h * o.d * 4);
+    const ggml_fp16_t * mask = (const ggml_fp16_t *) (base + L.mask);
+    const double scale = 1.0 / sqrt((double) o.d);
+    std::vector<double> s(k1 - k0);
+    double M = -INFINITY;
+    for (int p = k0; p < k1; ++p) {
+        const ggml_fp16_t * kr = (const ggml_fp16_t *) (base + L.k + (size_t) p * L.nbk1 + (size_t) kvh * L.nbk2);
+        double dot = 0;
+        for (int d = 0; d < o.d; ++d) dot += (double) q[d] * ggml_fp16_to_fp32(kr[d]);
+        const double mv = ggml_fp16_to_fp32(mask[p]);
+        s[p - k0] = dot * scale + mv;
+        M = std::max(M, s[p - k0]);
+    }
+    out.assign(o.d, 0.0);
+    double S = 0;
+    for (int p = k0; p < k1; ++p) {
+        if (std::isinf(s[p - k0])) continue;
+        const double w = exp(s[p - k0] - M);
+        S += w;
+        const ggml_fp16_t * vr = (const ggml_fp16_t *) (base + L.v + (size_t) p * L.nbk1 + (size_t) kvh * L.nbk2);
+        for (int d = 0; d < o.d; ++d) out[d] += w * ggml_fp16_to_fp32(vr[d]);
+    }
+    if (M_out) *M_out = M;
+    if (S_out) *S_out = S;
+}
+
+struct stat_acc {
+    std::vector<double> v;
+    void add(double x) { v.push_back(x); }
+    double med() { if (v.empty()) return NAN; auto s = v; std::sort(s.begin(), s.end()); return s[s.size() / 2]; }
+    double mn() { return v.empty() ? NAN : *std::min_element(v.begin(), v.end()); }
+    double mx() { return v.empty() ? NAN : *std::max_element(v.begin(), v.end()); }
+    bool empty() const { return v.empty(); }
+};
+
+int main(int argc, char ** argv) {
+    options o;
+    if (!parse(argc, argv, o)) return 1;
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    setenv("GGML_HEXAGON_SYNC_PROBE", "1", 1);
+    setenv("GGML_HEXAGON_ASYNC", "1", 1);
+    setenv("GGML_HEXAGON_FA_SELECT", "1", 0);   // HVX path (the decode kernel lives there)
+    if (o.cpu >= 0) { cpu_set_t set; CPU_ZERO(&set); CPU_SET(o.cpu, &set); if (sched_setaffinity(0, sizeof(set), &set)) perror("sched_setaffinity"); }
+    calibrate_realtime();
+
+    const int gpu_kv = ((int) (o.gpu_frac * o.kv) / 64) * 64;   // GPU owns [0, gpu_kv), HTP owns [gpu_kv, kv)
+    const int htp_kv = o.kv - gpu_kv;
+    const int nsplit = std::max(1, (gpu_kv + o.span - 1) / o.span);
+
+    layout L;
+    L.nbk2 = (size_t) o.d * 2;
+    L.nbk1 = L.nbk2 * o.nkvh;
+    L.part_stride = 128 + (size_t) o.d * 4;
+    const size_t kv_bytes = (size_t) o.kv * L.nbk1;
+    L.v = L.k + kv_bytes;
+    L.total = ((L.v + kv_bytes + (1 << 20) - 1) >> 20) << 20;
+    if ((size_t) o.nh * nsplit * L.part_stride > L.parts_size) { fprintf(stderr, "too many GPU splits for the partial area\n"); return 1; }
+
+    // backend + buffer
+    ggml_backend_dev_t dev = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) if (!strcmp(ggml_backend_dev_name(ggml_backend_dev_get(i)), "HTP0")) dev = ggml_backend_dev_get(i);
+    if (!dev) { fprintf(stderr, "HTP0 not found\n"); return 1; }
+    ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(dev), L.total);
+    if (!buf) { fprintf(stderr, "buffer alloc (%zu MB) failed\n", L.total >> 20); return 1; }
+    uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(buf);
+    const int fd = rpcmem_to_fd(base);
+
+    // data
+    {
+        std::mt19937 rng(1234);
+        std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+        float * q = (float *) (base + L.q);
+        for (int i = 0; i < o.nh * o.d; ++i) q[i] = u(rng);
+        ggml_fp16_t * m = (ggml_fp16_t *) (base + L.mask);
+        std::uniform_int_distribution<int> pm(0, 999);
+        for (int p = 0; p < o.kv; ++p) m[p] = ggml_fp32_to_fp16(pm(rng) < o.mask_frac_permille ? -INFINITY : 0.0f);
+        ggml_fp16_t * k = (ggml_fp16_t *) (base + L.k);
+        ggml_fp16_t * v = (ggml_fp16_t *) (base + L.v);
+        const size_t n = kv_bytes / 2;
+        for (size_t i = 0; i < n; ++i) { k[i] = ggml_fp32_to_fp16(u(rng)); v[i] = ggml_fp32_to_fp16(u(rng)); }
+        memset(base + L.parts, 0, L.parts_size);
+        memset(base, 0, L.flags_end);
+        dc_cvac(base, L.total);
+    }
+
+    // HTP graph: probe(handshake) -> FA over [gpu_kv, kv) -> probe(ping)
+    ggml_init_params ip = { ggml_tensor_overhead() * 32 + ggml_graph_overhead_custom(16, false), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * flags = place(buf, base, 0, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) (L.flags_end / 4)), "flags");
+    ggml_tensor * fargs[1] = { flags };
+    ggml_tensor * probe1 = place(buf, base, L.rec1, ggml_custom_4d(ctx, GGML_TYPE_F32, 64, 1, 1, 1, fargs, 1, noop_custom, 1, nullptr), "probe1");
+    ggml_tensor * probe2 = place(buf, base, L.rec2, ggml_custom_4d(ctx, GGML_TYPE_F32, 64, 1, 1, 1, fargs, 1, noop_custom, 1, nullptr), "probe2");
+    set_probe_params(probe1, 0, L, 2000);
+    set_probe_params(probe2, 1, L, 2000);
+
+    ggml_tensor * q  = place(buf, base, L.q, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, o.d, 1, o.nh, 1), "q");
+    ggml_tensor * kb = place(buf, base, L.k, ggml_new_tensor_1d(ctx, GGML_TYPE_F16, (int64_t) (kv_bytes / 2)), "kbase");
+    ggml_tensor * vb = place(buf, base, L.v, ggml_new_tensor_1d(ctx, GGML_TYPE_F16, (int64_t) (kv_bytes / 2)), "vbase");
+    ggml_tensor * mb = place(buf, base, L.mask, ggml_new_tensor_1d(ctx, GGML_TYPE_F16, o.kv), "mbase");
+    ggml_tensor * fa = nullptr;
+    if (htp_kv > 0) {
+        ggml_tensor * kh = ggml_view_4d(ctx, kb, o.d, htp_kv, o.nkvh, 1, L.nbk1, L.nbk2, kv_bytes, (size_t) gpu_kv * L.nbk1);
+        ggml_tensor * vh = ggml_view_4d(ctx, vb, o.d, htp_kv, o.nkvh, 1, L.nbk1, L.nbk2, kv_bytes, (size_t) gpu_kv * L.nbk1);
+        ggml_tensor * mh = ggml_view_2d(ctx, mb, htp_kv, 1, (size_t) htp_kv * 2, (size_t) gpu_kv * 2);
+        kh->buffer = vh->buffer = mh->buffer = buf;
+        ggml_set_name(kh, "k_htp"); ggml_set_name(vh, "v_htp"); ggml_set_name(mh, "mask_htp");
+        fa = ggml_flash_attn_ext(ctx, q, kh, vh, mh, 1.0f / sqrtf((float) o.d), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+        place(buf, base, L.dst, fa, "fa_out");
+    }
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16, false);
+    ggml_build_forward_expand(graph, probe1);
+    if (fa) ggml_build_forward_expand(graph, fa);
+    ggml_build_forward_expand(graph, probe2);
+    if (!ggml_backend_supports_op(be, probe1) || (fa && !ggml_backend_supports_op(be, fa))) {
+        fprintf(stderr, "HTP0 rejects the probe or FA op (probe %d, fa %d)\n", ggml_backend_supports_op(be, probe1), fa ? ggml_backend_supports_op(be, fa) : -1);
+        return 1;
+    }
+
+    gpu_side g;
+    const bool need_gpu = (o.run_gpu || o.run_both) && gpu_kv > 0;
+    if (need_gpu && !gpu_init(g, o, base, L.total, fd)) return 1;
+
+    printf("decode attention split: kv %d = GPU [0,%d) (%d splits of %d) + HTP [%d,%d) | nh %d nkvh %d d %d | K+V bytes: GPU %.1f MB, HTP %.1f MB\n",
+           o.kv, gpu_kv, nsplit, o.span, gpu_kv, o.kv, o.nh, o.nkvh, o.d,
+           2.0 * gpu_kv * L.nbk1 / 1048576.0, 2.0 * htp_kv * L.nbk1 / 1048576.0);
+
+    volatile uint32_t * ready = (volatile uint32_t *) (base + L.ready);
+    volatile uint32_t * done  = (volatile uint32_t *) (base + L.done);
+    uint64_t * rec1 = (uint64_t *) (base + L.rec1);
+    uint64_t * rec2 = (uint64_t *) (base + L.rec2);
+
+    auto gpu_enqueue = [&](cl_uint want, cl_event * ev) {
+        cl_uint a_q = L.q, a_k = L.k, a_v = L.v, a_m = L.mask, a_p = L.parts;
+        cl_uint a_nbq2 = o.d * 4, a_nbk1 = L.nbk1, a_nbk2 = L.nbk2, a_nkv = gpu_kv, a_span = o.span, a_ns = nsplit, a_ps = L.part_stride;
+        cl_float a_scale = 1.0f / sqrtf((float) o.d);
+        int i = 0;
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_mem), &g.alias);
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_q); clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_k);
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_v); clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_m);
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_p);
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_nbq2);
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_nbk1); clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_nbk2);
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_nbk1); clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_nbk2);
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_nkv); clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_span);
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_ns); clSetKernelArg(g.k_fa, i++, sizeof(cl_float), &a_scale);
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_ps);
+        clSetKernelArgSVMPointer(g.k_fa, i++, g.svm);
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &want);
+        size_t gsz[3] = { (size_t) o.d, (size_t) o.nkvh, (size_t) nsplit }, lsz[3] = { (size_t) o.d, 1, 1 };
+        return clEnqueueNDRangeKernel(g.q, g.k_fa, 3, nullptr, gsz, lsz, 0, nullptr, ev);
+    };
+
+    // Check GPU partials once against the CPU reference over the GPU range (merged on host).
+    auto check_gpu = [&]() -> bool {
+        double worst = 0;
+        for (int h = 0; h < o.nh; ++h) {
+            std::vector<double> ref; double Mref, Sref;
+            ref_attn(o, base, L, h, 0, gpu_kv, ref, &Mref, &Sref);
+            double M = -INFINITY;
+            for (int s = 0; s < nsplit; ++s) M = std::max(M, (double) ((float *) (base + L.parts + ((size_t) h * nsplit + s) * L.part_stride))[0]);
+            std::vector<double> acc(o.d, 0.0); double S = 0;
+            for (int s = 0; s < nsplit; ++s) {
+                const float * part = (const float *) (base + L.parts + ((size_t) h * nsplit + s) * L.part_stride);
+                const double d = (double) part[0] - M;
+                if (d < -80.0) continue;
+                const double w = exp(d);
+                S += w * part[1];
+                for (int dd = 0; dd < o.d; ++dd) acc[dd] += w * part[32 + dd];
+            }
+            for (int dd = 0; dd < o.d; ++dd) {
+                const double got = S > 0 ? acc[dd] / S : 0.0, want = Sref > 0 ? ref[dd] / Sref : 0.0;
+                worst = std::max(worst, fabs(got - want));
+            }
+        }
+        printf("gpu: partials merged on host vs CPU reference over [0,%d): max |err| %.3e -> %s\n", gpu_kv, worst, worst < 2e-3 ? "OK" : "MISMATCH");
+        return worst < 2e-3;
+    };
+    auto check_htp = [&]() -> bool {
+        double worst = 0;
+        for (int h = 0; h < o.nh; ++h) {
+            std::vector<double> ref; double Mref, Sref;
+            ref_attn(o, base, L, h, gpu_kv, o.kv, ref, &Mref, &Sref);
+            const float * out = (const float *) (base + L.dst + (size_t) h * o.d * 4);
+            for (int dd = 0; dd < o.d; ++dd) worst = std::max(worst, fabs((double) out[dd] - (Sref > 0 ? ref[dd] / Sref : 0.0)));
+        }
+        printf("htp: FA output vs CPU reference over [%d,%d): max |err| %.3e -> %s\n", gpu_kv, o.kv, worst, worst < 2e-2 ? "OK" : "MISMATCH");
+        return worst < 2e-2;
+    };
+
+    enum { R_HTP, R_GPU, R_BOTH, R_N };
+    const char * rname[R_N] = { "htp alone", "gpu alone", "both" };
+    stat_acc s_htp[R_N], s_gpu[R_N], s_gpu_from_start[R_N], s_wall[R_N];
+    bool checked_gpu = false, checked_htp = false;
+    const size_t htp_bytes = 2 * (size_t) htp_kv * L.nbk1, gpu_bytes = 2 * (size_t) gpu_kv * L.nbk1;
+
+    for (int it = -1; it < o.iters; ++it) {
+        for (int r = 0; r < R_N; ++r) {
+            const bool use_htp = (r != R_GPU) && (o.run_htp || r == R_BOTH) && fa;
+            const bool use_gpu = (r != R_HTP) && need_gpu;
+            if (r == R_HTP && !o.run_htp) continue;
+            if (r == R_GPU && !o.run_gpu) continue;
+            if (r == R_BOTH && !o.run_both) continue;
+            if (!use_htp && !use_gpu) continue;
+
+            *ready = 0; *done = 0; memset(rec1, 0, 512); memset(rec2, 0, 512);
+            dc_cvac(base, L.flags_end);
+            cl_event ev = nullptr;
+            if (use_gpu) {
+                __atomic_store_n(&g.svm[0], 0u, __ATOMIC_SEQ_CST); __atomic_store_n(&g.svm[16], 0u, __ATOMIC_SEQ_CST);
+                if (!cl_check(gpu_enqueue(1, &ev), "enqueue")) return 1;
+                clFlush(g.q);
+                const uint64_t t0 = cnt_now();
+                while (__atomic_load_n(&g.svm[16], __ATOMIC_ACQUIRE) != 1u && cnt_now() - t0 < 500ull * 19200ull) {}
+            }
+            uint64_t T_rel = 0, T1 = 0;
+            if (use_htp) {
+                ggml_backend_graph_compute_async(be, graph);
+                const uint64_t t0 = cnt_now();
+                for (;;) {
+                    dc_civac((const void *) ready, 4);
+                    if (__atomic_load_n(ready, __ATOMIC_ACQUIRE) == 1u) break;
+                    if (cnt_now() - t0 > 2000ull * 19200ull) { fprintf(stderr, "probe ready never seen\n"); return 1; }
+                }
+                if (use_gpu) __atomic_store_n(&g.svm[0], 1u, __ATOMIC_SEQ_CST);
+                __atomic_store_n(done, 1u, __ATOMIC_RELEASE);
+                T_rel = cnt_now();
+                ggml_backend_synchronize(be);
+                T1 = cnt_now();
+            } else {
+                T_rel = cnt_now();
+                __atomic_store_n(&g.svm[0], 1u, __ATOMIC_SEQ_CST);
+            }
+            double gpu_start = 0, gpu_end = 0;
+            if (use_gpu) {
+                clWaitForEvents(1, &ev);
+                cl_ulong ts = 0, te = 0;
+                clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(ts), &ts, nullptr);
+                clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof(te), &te, nullptr);
+                gpu_start = cnt_of_realtime(ts); gpu_end = cnt_of_realtime(te);
+                clReleaseEvent(ev);
+                if (!checked_gpu) { dc_civac(base + L.parts, L.parts_size); checked_gpu = check_gpu(); }
+            }
+            double htp_us = NAN, gpu_us = NAN, gpu_from_start_us = NAN, wall_us = NAN;
+            if (use_htp) {
+                dc_civac(rec1, 512); dc_civac(rec2, 512);
+                const uint64_t fa_start = rec1[HTP_SYNC_PROBE_R_T_DONE], fa_end = rec2[HTP_SYNC_PROBE_R_T_ENTRY];
+                if (rec1[HTP_SYNC_PROBE_R_STATUS] != 0 || !fa_end) { fprintf(stderr, "probe timeout / bad record\n"); return 1; }
+                htp_us = ticks_us((double) (fa_end - fa_start));
+                if (!checked_htp) { dc_civac(base + L.dst, o.nh * o.d * 4); checked_htp = check_htp(); }
+                if (use_gpu) {
+                    // the GPU was released ~1 us before the FA started; both measured from the release
+                    gpu_from_start_us = ticks_us(gpu_end - (double) T_rel);
+                    wall_us = std::max(htp_us, gpu_from_start_us);
+                }
+            }
+            if (use_gpu) {
+                gpu_us = ticks_us(gpu_end - std::max(gpu_start, (double) T_rel));   // pre-launched: time after release
+                if (!use_htp) { gpu_from_start_us = ticks_us(gpu_end - (double) T_rel); wall_us = gpu_from_start_us; }
+            }
+            if (!use_gpu) wall_us = htp_us;
+            if (it < 0) continue;   // warm-up
+            if (use_htp) s_htp[r].add(htp_us);
+            if (use_gpu) { s_gpu[r].add(gpu_us); s_gpu_from_start[r].add(gpu_from_start_us); }
+            s_wall[r].add(wall_us);
+            if (o.verbose) printf("  [%s #%d] htp %.1f us  gpu %.1f us (release->end %.1f)  wall %.1f us  host total %.1f us\n", rname[r], it, htp_us, gpu_us, gpu_from_start_us, wall_us, T1 ? ticks_us((double) (T1 - T_rel)) : NAN);
+        }
+    }
+
+    printf("\n%-12s | %-28s %9s %9s %9s   %s\n", "run", "metric", "median", "min", "max", "GB/s (median)");
+    for (int r = 0; r < R_N; ++r) {
+        if (s_wall[r].empty()) continue;
+        printf("%-12s |\n", rname[r]);
+        if (!s_htp[r].empty()) printf("%-12s | %-28s %9.1f %9.1f %9.1f   %.1f\n", "", "HTP FA op (qtimer)", s_htp[r].med(), s_htp[r].mn(), s_htp[r].mx(), htp_bytes / (s_htp[r].med() * 1e-6) / 1e9);
+        if (!s_gpu[r].empty()) printf("%-12s | %-28s %9.1f %9.1f %9.1f   %.1f\n", "", "GPU kernel after release", s_gpu[r].med(), s_gpu[r].mn(), s_gpu[r].mx(), gpu_bytes / (s_gpu[r].med() * 1e-6) / 1e9);
+        if (!s_gpu_from_start[r].empty()) printf("%-12s | %-28s %9.1f %9.1f %9.1f\n", "", "GPU release -> end", s_gpu_from_start[r].med(), s_gpu_from_start[r].mn(), s_gpu_from_start[r].mx());
+        printf("%-12s | %-28s %9.1f %9.1f %9.1f   %.1f\n", "", "attention wall (max of both)", s_wall[r].med(), s_wall[r].mn(), s_wall[r].mx(), (double) (htp_bytes + gpu_bytes) / (s_wall[r].med() * 1e-6) / 1e9);
+    }
+    if (!s_htp[R_HTP].empty() && !s_htp[R_BOTH].empty()) printf("\ncontention: HTP x%.2f slower with the GPU streaming", s_htp[R_BOTH].med() / s_htp[R_HTP].med());
+    if (!s_gpu[R_GPU].empty() && !s_gpu[R_BOTH].empty()) printf(", GPU x%.2f slower with the HTP streaming", s_gpu[R_BOTH].med() / s_gpu[R_GPU].med());
+    printf("\n");
+
+    if (g.svm) clSVMFree(g.ctx, g.svm);
+    if (g.alias) clReleaseMemObject(g.alias);
+    if (g.k_fa) clReleaseKernel(g.k_fa);
+    if (g.prog) clReleaseProgram(g.prog);
+    if (g.q) clReleaseCommandQueue(g.q);
+    if (g.ctx) clReleaseContext(g.ctx);
+    ggml_free(ctx); ggml_backend_buffer_free(buf); ggml_backend_free(be);
+    return 0;
+}
