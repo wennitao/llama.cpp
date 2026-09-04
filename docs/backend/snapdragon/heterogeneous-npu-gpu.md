@@ -476,6 +476,43 @@ Two levers, in order of size:
    `fa_phase_k_interleave` does) so the dot is a broadcast-MAC over 64 keys with no reductions,
    amortised across the unit's rows. The ≥2× lever, and a real kernel design.
 
+### 4f-bis. One pass on the HVX decode chain: QK reduction tree, no V shuffle (+12%), and where the cycles really are
+
+Section 4f named two levers on the per-row chain. Reading the primitives changed the target:
+sharing K/V loads between the GQA rows buys nothing (VTCM loads dual-issue), the waste is in
+the QK reduction (4 keys at a time, serial rotate-add, ~17x off MAC rate) and in a `vshuff` of
+every V vector for every row in P*V. Shipped (`GGML_HEXAGON_FA_DECODE` path only):
+
+- `hvx_dot_f16_f16_aa_rx32_tree`: 32 keys reduced together by single-level `vshuff` exchanges
+  (4/8/16/32/64 B) + adds, 31+31 ops, lands in key order; drop-in for `rx32`.
+- P*V accumulates whole padded V vectors without the shuffle; the accumulator lives in the
+  widened (even, odd) lane order and is un-permuted once at partial write-back
+  (`hvx_unshuff_copy_f32_aa`). Accumulator = 2 f32 vectors per padded V vector.
+
+| kv | before | after | | tg64 @ d4096 |
+|--:|--:|--:|--|--:|
+| 4096  | 636 us | 563 us (1.13x) | | 13.6 t/s vs 12.6 with the row kernel |
+| 8192  | 1195 us | 1067 us (1.12x) | | |
+| 16384 | 2349 us | 2099 us (1.12x) | | |
+
+FLASH_ATTN_EXT suite: 0 non-`sinks` failures over 2196 cases including every head size;
+the `sinks=1` near-threshold flappers moved (21 vs 16, same error class, all `sinks=1`).
+
+**Why only 12%, per the per-thread trace at kv=4096 (DSP at 1710 MHz):** per row-block QK is
+1879 cycles and softmax+P*V 2159, i.e. ~4000 traced of ~5440 wall per row-block; the DMA of a
+64-key K+V block takes ~12k cycles per thread, about the compute of the block's 2 rows. So the
+kernel now sits at the DMA limit of its access pattern -- 64 rows of 256 B with a 2 KB stride
+per K/V block, 2 in flight per thread -- at ~30 GB/s, while the GPU streams the same layout at
+45 GB/s. Both compute halves are latency-bound, not op-bound: P*V is one 64-long
+load-FMA-store chain through VTCM per accumulator, QK has 4 FMA chains in flight.
+
+**Tried and rejected:** register-resident 4-chain P*V with scalar-splat broadcasts plus an
+8-chain DK=128 unrolled tree. It overflowed the 16 KB worker stack (DSP process died; 64 KB
+stacks cure it), and with the spills it is *slower*: 682 us at 4k. Rolled back; the functions
+stay in `hvx-fa-kernels.h` unused. The next real step on this path is the DMA pattern (contiguous
+all-head blocks, deeper prefetch), not the arithmetic -- parked, since the heterogeneous split
+(4h) is the research direction and already halves this op.
+
 ## 4g. Measured: the no-barrier handshake (`examples/hetero-sync-probe`)
 
 The proposal that reopened the GPU question: let the GPU own some KV splits of the decode

@@ -3201,8 +3201,8 @@ static void flash_attn_ext_f16_dec_thread(unsigned int nth, unsigned int ith, vo
 
                 HVX_Vector scores_f16 = Q6_V_vzero();
                 if (bsz > 0) {
-                    HVX_Vector scores0 = hvx_dot_f16_f16_aa_rx32(q_ptr_vtcm, k_base, factx->size_k_row_padded, DK, factx->scale);
-                    HVX_Vector scores1 = (bsz > 32) ? hvx_dot_f16_f16_aa_rx32(q_ptr_vtcm, k_base + 32 * factx->size_k_row_padded, factx->size_k_row_padded, DK, factx->scale) : Q6_V_vzero();
+                    HVX_Vector scores0 = hvx_dot_f16_f16_aa_rx32_tree(q_ptr_vtcm, k_base, factx->size_k_row_padded, DK, factx->scale);
+                    HVX_Vector scores1 = (bsz > 32) ? hvx_dot_f16_f16_aa_rx32_tree(q_ptr_vtcm, k_base + 32 * factx->size_k_row_padded, factx->size_k_row_padded, DK, factx->scale) : Q6_V_vzero();
                     scores_f16 = hvx_vec_f32_to_f16(scores0, scores1);
                 }
 
@@ -3237,7 +3237,7 @@ static void flash_attn_ext_f16_dec_thread(unsigned int nth, unsigned int ith, vo
                     HVX_Vector ms_f16     = hvx_vec_exp2_f16(diff_base2);
                     HVX_Vector ms_vec     = Q6_V_lo_W(hvx_vec_f16_to_f32(ms_f16));
 
-                    hvx_scale_vec_f32_aa((uint8_t *) VKQ32, (const uint8_t *) VKQ32, DV, ms_vec);
+                    hvx_scale_vec_f32_aa((uint8_t *) VKQ32, (const uint8_t *) VKQ32, factx->size_vkq_acc / sizeof(float), ms_vec);
 
                     HVX_Vector v_m_vec_f16 = hvx_vec_f32_to_f16(M_new_vec, M_new_vec);
                     HVX_Vector v_s_minus_m = Q6_Vqf16_vsub_VhfVhf(scores_f16, v_m_vec_f16);
@@ -3254,15 +3254,16 @@ static void flash_attn_ext_f16_dec_thread(unsigned int nth, unsigned int ith, vo
                     Sr[r] = hvx_vec_get_f32(S_vec);
 
                     const uint8_t * v_ptr = v_base;
+                    const uint32_t nvec_v = factx->size_v_row_padded / VLEN;
                     for (uint32_t j = 0; j < bsz; j += 2) {
                         if (j + 1 == bsz) {
                             HVX_Vector S0 = hvx_vec_repl_f16(Q6_V_vror_VR(P, j * 2));
-                            hvx_mad_f32_f16_aa_vec(VKQ32, v_ptr, S0, DV);
+                            hvx_mad_f32_f16_aa_vec_noshuff(VKQ32, v_ptr, S0, nvec_v);
                             break;
                         }
                         HVX_Vector S0 = hvx_vec_repl_f16(Q6_V_vror_VR(P, j * 2));
                         HVX_Vector S1 = hvx_vec_repl_f16(Q6_V_vror_VR(P, (j + 1) * 2));
-                        hvx_mad_f32_f16_aa_rx2_vec(VKQ32, v_ptr, v_ptr + factx->size_v_row_padded, S0, S1, DV);
+                        hvx_mad_f32_f16_aa_rx2_vec_noshuff(VKQ32, v_ptr, v_ptr + factx->size_v_row_padded, S0, S1, nvec_v);
                         v_ptr += stride_v2;
                     }
                 }
@@ -3291,7 +3292,7 @@ static void flash_attn_ext_f16_dec_thread(unsigned int nth, unsigned int ith, vo
             uint8_t * part = hvx_fa_dec_partial(factx, row_global0 + g * neq1 + t, sp);
             ((float *) part)[0] = Mr[r];
             ((float *) part)[1] = Sr[r];
-            hvx_copy_f32_aa(part + HVX_FA_DEC_PART_HDR, spad_a + r * factx->size_vkq_acc, factx->size_vkq_acc / sizeof(float));
+            hvx_unshuff_copy_f32_aa(part + HVX_FA_DEC_PART_HDR, spad_a + r * factx->size_vkq_acc, factx->size_v_row_padded / VLEN);
         }
     }
 }
@@ -3491,6 +3492,10 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
 
     if (dec) {
         const uint32_t rows_total = neq1 * neq2 * neq3;
+        // The dec thread accumulates P*V without shuffling V, so its accumulator is the
+        // widened (even, odd) pair per padded V vector: two f32 vectors per V vector.
+        size_vkq_acc       = factx.size_v_row_padded * 2;
+        factx.size_vkq_acc = size_vkq_acc;
         factx.dec_G      = G;
         factx.dec_R      = R;
         factx.dec_n_mseg = (mask && mask->ne[2] != 1) ? R : neq1;
