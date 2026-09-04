@@ -655,6 +655,18 @@ this setting, and DRAM contention when the HTP and the GPU stream the KV cache a
   copies each `ready` into SVM; and the token-level measurement with `llama-bench`. The third
   open item (a spinning kernel across a whole token) is answered below.
 
+### Re-measured with the faster HTP kernel (4f-bis), span 512
+
+| kv | HTP alone (tree kernel) | split wall (GPU share) | vs HTP alone | limiting engine |
+|--:|--:|--:|--:|---|
+| 4096  | 563 us  | 295 us (0.55; HTP 282 / GPU 295) | 1.91x | GPU (x1.33 under contention) |
+| 8192  | 1067 us | 590 us (0.50; HTP 569 / GPU 590) | 1.81x | GPU (x1.38) |
+| 16384 | 2099 us | 1204 us (0.55; HTP 983 / GPU 1204) | 1.74x | GPU (x1.40-1.48) |
+
+The HTP side got 12% faster, so the balance point moved toward the HTP and the GPU kernel under
+contention (26-31 GB/s) is now what bounds the wall. Against this morning's starting point
+(636/1195/2349 us) the combined effect is 2.2x/2.0x/1.95x on the per-layer attention wall.
+
 ### Sustained across a whole token (`--layers 28`)
 
 The third open item: does a chain of pre-launched spinning GPU kernels hold up over a token,
