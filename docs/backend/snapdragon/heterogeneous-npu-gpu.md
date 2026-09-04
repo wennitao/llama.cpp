@@ -391,6 +391,91 @@ measured. `GGML_HEXAGON_PROFILE=3` on one decode FA op at kv=4096 gives per-thre
 `HVX_FA_QK + HVX_FA_SFM` busy vs DMA-event coverage: DMA ~100% and compute < 40% → #1 delivers
 its full ~2×; compute > 60% → the HVX chain is the ceiling and #1 buys only the imbalance.
 
+## 4f. Built: the split-KV, GQA-grouped HVX decode path (`GGML_HEXAGON_FA_DECODE`, default on)
+
+### The sizing trace first
+
+`GGML_HEXAGON_PROFILE=3` on one decode `FLASH_ATTN_EXT` at kv=4096 (Qwen3 geometry), per
+thread, from the on-DSP event trace:
+
+| thread | rows | span (kcycles) | HVX compute busy | of which QK / softmax+PV |
+|--:|--:|--:|--:|:--|
+| 0–4 | 3 each | 1310–1608 | **~65%** | 33% / 32% |
+| 5 | 1 | 468 (36% of the others) | ~63% | |
+
+DMA descriptors overlap ~3.6-deep. So the kernel was *not* DMA-starved — it was 65%
+compute-bound per thread, with one idle thread and 2× redundant bytes. That caps what a
+structural rewrite alone can return: balance (16 rows over 6 threads → 18 slots, 1.125×) plus
+the DMA-wait share, not the full 2× the byte count suggested.
+
+### What was built
+
+`flash_attn_ext_f16_dec_thread` + `flash_attn_ext_f16_merge_thread`
+(`ggml/src/ggml-hexagon/htp/flash-attn-ops.c`). The unit of work is **(sequence, KV head, KV
+range)**: the range's 64-row K/V blocks are DMA'd once and every query row of that KV head — all
+G GQA heads × all n_tokens — consumes them from VTCM. `n_split` ranges per KV head are chosen to
+minimise `ceil(units/threads) × blocks_per_split` (3 for 8 heads on 6 threads at kv=4096: 24
+units, 4 per thread, ~22 blocks each). Each unit leaves an unnormalised `(M, S, acc[DV])` partial
+per row in shared VTCM; a second `work_queue_run` merges the splits with `w_s = exp(M_s − M)`,
+applies sinks, normalises and stores. Every numeric step (dot, softcap, mask+ALiBi, online
+softmax, P·V) is the row-per-thread kernel's HVX sequence, run once per row against a block
+staged once — the flash-decoding structure of a split-K GPU kernel, on the NPU, with no
+crossings. The row-per-thread kernel stays selectable (`GGML_HEXAGON_FA_DECODE=0`) for A/B and
+as the fallback when rows-per-unit exceed the scratch bound.
+
+Two bugs found by the eval suite on the way, both in the merge: an f32 `exp` of the empty-split
+sentinel (`M = −1e4`, which the row kernel only ever fed to the saturating f16 `exp2`) now
+short-circuits to weight 0; and the accumulate loop walked `DV/32` whole vectors, truncating head
+dims that are not multiples of 32 (`hsv = 40, 72, 80` — 228 of the suite's 243 failures). It
+now walks the padded `size_vkq_acc` span.
+
+### Measured
+
+Kernel-only, `test-backend-ops perf`, decode shape, two alternations (spread ≤ 0.5%):
+
+| kv | row-per-thread | **split-KV** | gain |
+|--:|--:|--:|--:|
+| 1024 | 191 µs | 182 µs | 1.05× |
+| 4096 | 740 µs | **619 µs** | **1.20×** |
+| 8192 | 1474 µs | 1192 µs | 1.24× |
+| 16384 | 2952 µs | 2370 µs | 1.25× |
+
+End-to-end `llama-bench` tg64, lm-head on HTP, two alternations:
+
+| depth | before | **after** | gain |
+|--:|--:|--:|--:|
+| 0 | 39.3 / 39.4 | 39.5 / 39.8 | flat (attention is ~5% of the token) |
+| 4096 | 21.0 / 21.0 | **23.1 / 23.1** | **1.10×** |
+| 8192 | 14.6 / 14.6 | **16.8 / 16.8** | **1.15×** |
+
+Correctness: the full `FLASH_ATTN_EXT` eval suite (2198 rows: nr2 up to 32, nr3 ∈ {1,3},
+nb ∈ {1,3,32,75}, mask/sinks/ALiBi/softcap, all KV types) run with the new path and with the old
+path on the same binary; the failure sets differ only by the known sinks/large-head flappers,
+which flip in both directions: new path 27 / 22 failing rows over two runs, old path 18 (24 and
+23 on earlier builds), all with `sinks=1`, errors 5.1e-4 – 7.7e-3 against the 5e-4 gate versus
+5.3e-4 – 2.3e-2 for the old path's own failures; the same binary flips 20 / 15 rows between two
+consecutive runs. **No non-sinks row fails under the new path, and 1088 sinks rows are in the
+suite.** Judge this family by the diff, never by the absolute count.
+
+### Where the rest of the time is
+
+At kv=4096 the new kernel spends ~3.6 µs per 64-key block per row — the same per-row cost as
+before; the structure removed the imbalance and the redundant bytes, so it is now compute-bound
+on the per-row HVX chain. Reading the primitives:
+
+- **QK** (`hvx_dot_f16_f16_aa_rx32`) is eight 4-row dots, each ending in a horizontal
+  reduction: for 64 keys × 128 dims (8 k MACs) it costs ~2.2 k cycles, ~17× off the HVX MAC rate.
+- **P·V** (`hvx_mad_f32_f16_aa_rx2_vec` per key pair) pays a `vror`+`repl` broadcast per key and
+  a V load + `vshuff` per row.
+
+Two levers, in order of size:
+
+1. **Fused two-query micro-kernels**: the GQA pair's rows already sit in one unit, so one K
+   load can feed both dots and one V load + shuffle both accumulators. ~1.3× more on the kernel.
+2. **Transposed-K dot**: stage each K block interleaved once per unit (what the HMX path's
+   `fa_phase_k_interleave` does) so the dot is a broadcast-MAC over 64 keys with no reductions,
+   amortised across the unit's rows. The ≥2× lever, and a real kernel design.
+
 ## 5. What would change the answer
 
 - **Events in both backends.** OpenCL already uses `cl_event` throughout (its `synchronize` is a

@@ -106,6 +106,9 @@ struct htp_fa_kernel_params {
             uint32_t size_q_row_padded;
             uint32_t size_k_row_padded;
             uint32_t size_v_row_padded;
+            // 1 = split-KV, GQA-grouped decode path (flash_attn_ext_f16_dec_thread);
+            // 0 = the row-per-thread kernel. Host default 1; GGML_HEXAGON_FA_DECODE=0 opts out.
+            uint32_t split_kv;
             struct fastdiv_values src0_div21;
             struct fastdiv_values src0_div1;
         } hvx;

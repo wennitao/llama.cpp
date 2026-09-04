@@ -85,6 +85,18 @@ struct htp_fa_context {
     uint8_t * spad_m;
     uint8_t * spad_a;
 
+    // Split-KV decode path (flash_attn_ext_f16_dec_thread); zero when the row-per-thread
+    // path runs. The unit of work is (sequence, KV head, KV range) and every query row of
+    // that KV head -- G GQA heads x n_tokens -- consumes each DMA'd block from VTCM.
+    uint32_t  dec_G;           // query heads per KV head
+    uint32_t  dec_R;           // rows per unit = n_tokens * G
+    uint32_t  dec_n_split;     // KV ranges per (sequence, KV head)
+    uint32_t  dec_bps;         // blocks per split
+    uint32_t  dec_n_units;     // n_seqs * n_kv_heads * n_split
+    uint32_t  dec_n_mseg;      // mask segments per block: n_tokens (broadcast mask) or R
+    size_t    dec_stride_part; // bytes per (row, split) partial: 128 (M, S) + size_vkq_acc
+    uint8_t * dec_partials;    // shared VTCM: [rows_total][n_split] partials
+
     uint64_t t_start;
 };
 
@@ -3001,6 +3013,393 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     return HTP_STATUS_OK;
 }
 
+
+// ============================================================================
+// HVX decode path: split-KV, GQA-grouped
+// ============================================================================
+//
+// The row-per-thread kernel above fetches a KV head once per QUERY row. With GQA both
+// query heads of a group therefore stream the same K/V (2x the bytes), and 16 rows over
+// 6 threads leaves one thread a single row. Measured on Qwen3-1.7B at kv=4096 (per-thread
+// trace): threads are ~65% busy on HVX compute and finish at 100/100/100/100/100/36% of
+// the span. Here the unit of work is (sequence, KV head, KV range): the range's K/V
+// blocks are DMA'd once and every query row of that KV head -- all G GQA heads x all
+// n_tokens -- consumes them from VTCM. n_split ranges per KV head give the pool enough
+// units to balance. Each unit leaves an UNNORMALISED partial (M, S, acc[DV]) per row in
+// shared VTCM; flash_attn_ext_f16_merge_thread combines the splits with the standard
+// w_s = exp(M_s - M) weighting, applies sinks, normalises and stores -- the same
+// flash-decoding structure as a split-K GPU kernel, on the NPU, with no crossings.
+//
+// Everything numeric (dot, softcap, mask, online softmax, P*V) is the SAME HVX sequence
+// as the row-per-thread kernel, run once per row against a block staged once.
+
+#define HVX_FA_DEC_PART_HDR 128     // bytes: M, S, then acc[DV] f32 follows
+#define HVX_FA_DEC_R_MAX    64      // rows per unit (n_tokens * G); larger falls back
+
+static inline uint8_t * hvx_fa_dec_partial(const struct htp_fa_context * factx, uint32_t row_global, uint32_t sp) {
+    return factx->dec_partials + ((size_t) row_global * factx->dec_n_split + sp) * factx->dec_stride_part;
+}
+
+static void flash_attn_ext_f16_dec_thread(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_fa_context * factx = (struct htp_fa_context *) data;
+    const struct htp_ops_context * octx = factx->octx;
+    const struct htp_tensor * q     = octx->src[0];
+    const struct htp_tensor * k     = octx->src[1];
+    const struct htp_tensor * v     = octx->src[2];
+    const struct htp_tensor * mask  = (octx->src[3] && octx->src[3]->data) ? octx->src[3] : NULL;
+
+    const uint32_t neq1 = q->ne[1];
+    const uint32_t neq2 = q->ne[2];
+    const uint32_t nek1 = k->ne[1];
+    const uint32_t nek2 = k->ne[2];
+
+    const uint32_t nbq1 = q->nb[1], nbq2 = q->nb[2], nbq3 = q->nb[3];
+    const uint32_t nbk1 = k->nb[1], nbk2 = k->nb[2], nbk3 = k->nb[3];
+    const uint32_t nbv1 = v->nb[1], nbv2 = v->nb[2], nbv3 = v->nb[3];
+
+    const uint32_t DK = k->ne[0];
+    const uint32_t DV = v->ne[0];
+
+    const size_t size_q_row = DK * ((q->type == HTP_TYPE_F32) ? 4 : 2);
+    const size_t size_k_row = DK * sizeof(__fp16);
+    const size_t size_v_row = DV * sizeof(__fp16);
+
+    const uint32_t G       = factx->dec_G;
+    const uint32_t R       = factx->dec_R;
+    const uint32_t n_split = factx->dec_n_split;
+    const uint32_t bps     = factx->dec_bps;
+    const uint32_t n_mseg  = factx->dec_n_mseg;
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    dma_queue * dma = octx->ctx->dma[ith];
+
+    uint8_t * spad_q = factx->spad_q + factx->size_q_block * R * ith;
+    uint8_t * spad_k = factx->spad_k + factx->size_k_block * 2 * ith;
+    uint8_t * spad_v = factx->spad_v + factx->size_v_block * 2 * ith;
+    uint8_t * spad_m = factx->spad_m + (mask ? factx->size_m_block * HVX_FA_DMA_CACHE_SIZE : 0) * ith;
+    uint8_t * spad_a = factx->spad_a + factx->size_vkq_acc * R * ith;
+
+    dma_cache m_cache;
+    dma_cache_init(&m_cache, spad_m, factx->size_m_block, HVX_FA_DMA_CACHE_SIZE);
+
+    const HVX_Vector v_neg_inf = Q6_Vh_vsplat_R(0xfbff);
+    const HVX_Vector v_cap     = (factx->logit_softcap != 0.0f) ? hvx_vec_splat_f16(factx->logit_softcap) : Q6_V_vzero();
+    const HVX_Vector vinf      = Q6_Vh_vsplat_R(0xFC00);
+    const HVX_Vector vmin      = Q6_Vh_vsplat_R(0xFBFF);
+    const HVX_Vector v_log2e   = hvx_vec_splat_f16(EXP_LOG2E_F);
+    const uint32_t stride_v2   = factx->size_v_row_padded * 2;
+
+    float Mr[HVX_FA_DEC_R_MAX];
+    float Sr[HVX_FA_DEC_R_MAX];
+
+    for (uint32_t unit = ith; unit < factx->dec_n_units; unit += nth) {
+        const uint32_t per_seq = nek2 * n_split;
+        const uint32_t iq3 = unit / per_seq;
+        const uint32_t rem = unit - iq3 * per_seq;
+        const uint32_t kvh = rem / n_split;
+        const uint32_t sp  = rem - kvh * n_split;
+
+        const uint32_t b0 = sp * bps;
+        const uint32_t b1 = (b0 + bps < factx->n_blocks) ? b0 + bps : factx->n_blocks;
+
+        // Row r = t*G + g of this unit is query row (iq1 = t, iq2 = kvh*G + g), i.e. global
+        // row (iq3*neq2 + kvh*G + g)*neq1 + t.
+        const uint32_t row_global0 = (iq3 * neq2 + kvh * G) * neq1;
+
+        if (b0 >= b1) {
+            // Empty range: neutral partials so the merge sees M very negative, S = 0, acc = 0.
+            for (uint32_t r = 0; r < R; ++r) {
+                const uint32_t t = r / G, g = r - t * G;
+                uint8_t * part = hvx_fa_dec_partial(factx, row_global0 + g * neq1 + t, sp);
+                ((float *) part)[0] = HTP_FA_M_INITIAL_VAL;
+                ((float *) part)[1] = 0.0f;
+                hvx_splat_f32_a(part + HVX_FA_DEC_PART_HDR, 0.0f, factx->size_vkq_acc / sizeof(float));
+            }
+            continue;
+        }
+
+        const uint32_t ik3 = fastdiv(iq3, &factx->broadcast_rk3);
+        const uint32_t iv3 = fastdiv(iq3, &factx->broadcast_rv3);
+        const uint32_t ik2 = kvh;
+        const uint32_t iv2 = kvh;
+
+        // Mask row base per segment; segment of row r is t when the mask broadcasts over
+        // heads, else r itself.
+        const __fp16 * mp_base[HVX_FA_DEC_R_MAX];
+        if (mask) {
+            const uint32_t im3 = fastmodulo(iq3, mask->ne[3], &factx->src3_div3);
+            for (uint32_t m = 0; m < n_mseg; ++m) {
+                const uint32_t t   = (n_mseg == neq1) ? m : m / G;
+                const uint32_t g   = (n_mseg == neq1) ? 0 : m - t * G;
+                const uint32_t iq2 = kvh * G + g;
+                const uint32_t im2 = fastmodulo(iq2, mask->ne[2], &factx->src3_div2);
+                mp_base[m] = (const __fp16 *) ((const uint8_t *) mask->data + t * mask->nb[1] + im2 * mask->nb[2] + im3 * mask->nb[3]);
+            }
+        }
+
+        // Q rows into VTCM, in small batches so the DMA ring is never loaded with many rows.
+        for (uint32_t r0 = 0; r0 < R; r0 += 4) {
+            const uint32_t r1 = (r0 + 4 < R) ? r0 + 4 : R;
+            for (uint32_t r = r0; r < r1; ++r) {
+                const uint32_t t = r / G, g = r - t * G;
+                const uint32_t iq2 = kvh * G + g;
+                const uint8_t * q_row_ptr = (const uint8_t *) q->data + (t * nbq1 + iq2 * nbq2 + iq3 * nbq3);
+                dma_queue_push(dma, dma_make_ptr(spad_q + r * factx->size_q_block, q_row_ptr), factx->size_q_row_padded, nbq1, size_q_row, 1);
+            }
+            for (uint32_t r = r0; r < r1; ++r) {
+                uint8_t * qv = dma_queue_pop(dma).dst;
+                if (factx->is_q_fp32) {
+                    hvx_copy_f16_f32_aa(qv, qv, DK);   // in place f32 -> f16
+                }
+            }
+        }
+
+        // Stage the first two blocks of the range. Block j of the unit lands in slot j % 2.
+        for (uint32_t ib = b0; ib < b1 && ib < b0 + 2; ++ib) {
+            const uint32_t ic_start = ib * FLASH_ATTN_BLOCK_SIZE;
+            const uint32_t bsz      = MIN(FLASH_ATTN_BLOCK_SIZE, nek1 - ic_start);
+            const uint32_t slot     = (ib - b0) % 2;
+            const uint8_t * k_src = (const uint8_t *) k->data + (ic_start * nbk1 + ik2 * nbk2 + ik3 * nbk3);
+            const uint8_t * v_src = (const uint8_t *) v->data + (ic_start * nbv1 + iv2 * nbv2 + iv3 * nbv3);
+            dma_queue_push(dma, dma_make_ptr(spad_k + slot * factx->size_k_block, k_src), factx->size_k_row_padded, nbk1, size_k_row, bsz);
+            dma_queue_push(dma, dma_make_ptr(spad_v + slot * factx->size_v_block, v_src), factx->size_v_row_padded, nbv1, size_v_row, bsz);
+            if (mask) {
+                for (uint32_t m = 0; m < n_mseg; ++m) {
+                    dma_cache_push(dma, &m_cache, (const uint8_t *) (mp_base[m] + ic_start), bsz * 2, bsz * 2, bsz * 2, 1);
+                }
+            }
+        }
+
+        for (uint32_t r = 0; r < R; ++r) {
+            Mr[r] = HTP_FA_M_INITIAL_VAL;
+            Sr[r] = 0.0f;
+            hvx_splat_f32_a(spad_a + r * factx->size_vkq_acc, 0.0f, factx->size_vkq_acc / sizeof(float));
+        }
+
+        for (uint32_t ib = b0; ib < b1; ++ib) {
+            const uint32_t ic_start = ib * FLASH_ATTN_BLOCK_SIZE;
+            const uint32_t bsz      = MIN(FLASH_ATTN_BLOCK_SIZE, nek1 - ic_start);
+
+            uint8_t * k_base = dma_queue_pop(dma).dst;
+            uint8_t * v_base = dma_queue_pop(dma).dst;
+            const __fp16 * m_base[HVX_FA_DEC_R_MAX];
+            if (mask) {
+                for (uint32_t m = 0; m < n_mseg; ++m) {
+                    m_base[m] = (const __fp16 *) dma_queue_pop(dma).dst;
+                }
+            }
+
+            const HVX_VectorPred q_tail_keep = Q6_Q_vsetq2_R(bsz * sizeof(__fp16));
+
+            for (uint32_t r = 0; r < R; ++r) {
+                const uint32_t t = r / G, g = r - t * G;
+                const uint32_t h = kvh * G + g;
+                const uint8_t * q_ptr_vtcm = spad_q + r * factx->size_q_block;
+                float * VKQ32 = (float *) (spad_a + r * factx->size_vkq_acc);
+
+                htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_QK, unit);
+
+                HVX_Vector scores_f16 = Q6_V_vzero();
+                if (bsz > 0) {
+                    HVX_Vector scores0 = hvx_dot_f16_f16_aa_rx32(q_ptr_vtcm, k_base, factx->size_k_row_padded, DK, factx->scale);
+                    HVX_Vector scores1 = (bsz > 32) ? hvx_dot_f16_f16_aa_rx32(q_ptr_vtcm, k_base + 32 * factx->size_k_row_padded, factx->size_k_row_padded, DK, factx->scale) : Q6_V_vzero();
+                    scores_f16 = hvx_vec_f32_to_f16(scores0, scores1);
+                }
+
+                if (factx->logit_softcap != 0.0f) {
+                    scores_f16 = hvx_vec_tanh_f16(scores_f16);
+                    scores_f16 = hvx_vec_mul_f16_f16(scores_f16, v_cap);
+                }
+
+                if (mask) {
+                    const uint32_t m = (n_mseg == neq1) ? t : r;
+                    HVX_Vector m_vals_f16 = *(const HVX_UVector *) m_base[m];
+                    HVX_VectorPred is_inf = Q6_Q_vcmp_eq_VhVh(m_vals_f16, vinf);
+                    m_vals_f16 = Q6_V_vmux_QVV(is_inf, vmin, m_vals_f16);
+                    HVX_Vector m_scaled = hvx_vec_mul_f16_f16(m_vals_f16, hvx_vec_splat_f16(factx->slopes[h]));
+                    scores_f16 = Q6_V_vmux_QVV(q_tail_keep, hvx_vec_add_f16_f16(scores_f16, m_scaled), v_neg_inf);
+                } else {
+                    scores_f16 = Q6_V_vmux_QVV(q_tail_keep, scores_f16, v_neg_inf);
+                }
+
+                HVX_Vector v_max_f16 = hvx_vec_reduce_max_f16(scores_f16);
+                HVX_Vector v_max     = Q6_V_lo_W(hvx_vec_f16_to_f32(v_max_f16));
+                htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_QK, unit);
+
+                htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_SFM, unit);
+                {
+                    HVX_Vector M_vec     = hvx_vec_splat_f32(Mr[r]);
+                    HVX_Vector M_new_vec = Q6_Vsf_vmax_VsfVsf(v_max, M_vec);
+                    HVX_Vector diff_vec  = HVX_OP_SUB_F32(M_vec, M_new_vec);
+
+                    HVX_Vector diff_f16   = hvx_vec_f32_to_f16(diff_vec, diff_vec);
+                    HVX_Vector diff_base2 = hvx_vec_mul_f16_f16(diff_f16, v_log2e);
+                    HVX_Vector ms_f16     = hvx_vec_exp2_f16(diff_base2);
+                    HVX_Vector ms_vec     = Q6_V_lo_W(hvx_vec_f16_to_f32(ms_f16));
+
+                    hvx_scale_vec_f32_aa((uint8_t *) VKQ32, (const uint8_t *) VKQ32, DV, ms_vec);
+
+                    HVX_Vector v_m_vec_f16 = hvx_vec_f32_to_f16(M_new_vec, M_new_vec);
+                    HVX_Vector v_s_minus_m = Q6_Vqf16_vsub_VhfVhf(scores_f16, v_m_vec_f16);
+                    HVX_Vector v_s_minus_m_base2 = hvx_vec_mul_f16_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m), v_log2e);
+
+                    HVX_Vector P = hvx_vec_exp2_f16(v_s_minus_m_base2);
+                    P = Q6_V_vmux_QVV(q_tail_keep, P, Q6_V_vzero());
+
+                    HVX_VectorPair P_pair = hvx_vec_f16_to_f32(P);
+                    HVX_Vector p_sum_vec  = hvx_vec_reduce_sum_f32(HVX_OP_ADD_F32(Q6_V_lo_W(P_pair), Q6_V_hi_W(P_pair)));
+
+                    HVX_Vector S_vec = HVX_OP_ADD_F32(HVX_OP_MUL_F32(hvx_vec_splat_f32(Sr[r]), ms_vec), p_sum_vec);
+                    Mr[r] = hvx_vec_get_f32(M_new_vec);
+                    Sr[r] = hvx_vec_get_f32(S_vec);
+
+                    const uint8_t * v_ptr = v_base;
+                    for (uint32_t j = 0; j < bsz; j += 2) {
+                        if (j + 1 == bsz) {
+                            HVX_Vector S0 = hvx_vec_repl_f16(Q6_V_vror_VR(P, j * 2));
+                            hvx_mad_f32_f16_aa_vec(VKQ32, v_ptr, S0, DV);
+                            break;
+                        }
+                        HVX_Vector S0 = hvx_vec_repl_f16(Q6_V_vror_VR(P, j * 2));
+                        HVX_Vector S1 = hvx_vec_repl_f16(Q6_V_vror_VR(P, (j + 1) * 2));
+                        hvx_mad_f32_f16_aa_rx2_vec(VKQ32, v_ptr, v_ptr + factx->size_v_row_padded, S0, S1, DV);
+                        v_ptr += stride_v2;
+                    }
+                }
+                htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_SFM, unit);
+            }
+
+            // Prefetch block ib + 2 of this range into the slot just consumed.
+            if (ib + 2 < b1) {
+                const uint32_t nib  = ib + 2;
+                const uint32_t nic  = nib * FLASH_ATTN_BLOCK_SIZE;
+                const uint32_t nbsz = MIN(FLASH_ATTN_BLOCK_SIZE, nek1 - nic);
+                const uint8_t * k_src = (const uint8_t *) k->data + (nic * nbk1 + ik2 * nbk2 + ik3 * nbk3);
+                const uint8_t * v_src = (const uint8_t *) v->data + (nic * nbv1 + iv2 * nbv2 + iv3 * nbv3);
+                dma_queue_push(dma, dma_make_ptr(k_base, k_src), factx->size_k_row_padded, nbk1, size_k_row, nbsz);
+                dma_queue_push(dma, dma_make_ptr(v_base, v_src), factx->size_v_row_padded, nbv1, size_v_row, nbsz);
+                if (mask) {
+                    for (uint32_t m = 0; m < n_mseg; ++m) {
+                        dma_cache_push(dma, &m_cache, (const uint8_t *) (mp_base[m] + nic), nbsz * 2, nbsz * 2, nbsz * 2, 1);
+                    }
+                }
+            }
+        }
+
+        for (uint32_t r = 0; r < R; ++r) {
+            const uint32_t t = r / G, g = r - t * G;
+            uint8_t * part = hvx_fa_dec_partial(factx, row_global0 + g * neq1 + t, sp);
+            ((float *) part)[0] = Mr[r];
+            ((float *) part)[1] = Sr[r];
+            hvx_copy_f32_aa(part + HVX_FA_DEC_PART_HDR, spad_a + r * factx->size_vkq_acc, factx->size_vkq_acc / sizeof(float));
+        }
+    }
+}
+
+// Merge the n_split partials of each row, apply sinks, normalise, store. Rows go
+// round-robin to threads; a row's acc is assembled in the thread's first accumulator slot.
+static void flash_attn_ext_f16_merge_thread(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_fa_context * factx = (struct htp_fa_context *) data;
+    const struct htp_ops_context * octx = factx->octx;
+    const struct htp_tensor * q     = octx->src[0];
+    const struct htp_tensor * v     = octx->src[2];
+    const struct htp_tensor * sinks = octx->src[4];
+    const struct htp_tensor * dst   = octx->dst;
+
+    const uint32_t neq1 = q->ne[1], neq2 = q->ne[2], neq3 = q->ne[3];
+    const uint32_t DV   = v->ne[0];
+    const uint32_t rows_total = neq1 * neq2 * neq3;
+    const uint32_t n_split    = factx->dec_n_split;
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+
+    float * acc = (float *) (factx->spad_a + factx->size_vkq_acc * factx->dec_R * ith);
+
+    for (uint32_t row = ith; row < rows_total; row += nth) {
+        const uint32_t iq3 = row / (neq2 * neq1);
+        const uint32_t rem = row - iq3 * neq2 * neq1;
+        const uint32_t iq2 = rem / neq1;
+        const uint32_t iq1 = rem - iq2 * neq1;
+
+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_O_PROC, row);
+
+        float M = HTP_FA_M_INITIAL_VAL;
+        for (uint32_t sp = 0; sp < n_split; ++sp) {
+            const float m = ((const float *) hvx_fa_dec_partial(factx, row, sp))[0];
+            M = (m > M) ? m : M;
+        }
+
+        // The accumulators are padded to size_vkq_acc (a multiple of 128 B); work on the
+        // whole padded span so head dims that are not multiples of 32 (40, 72, 80, ...)
+        // keep their tail lanes -- only DV floats are stored below.
+        const uint32_t nvec_acc = factx->size_vkq_acc / sizeof(HVX_Vector);
+        float S = 0.0f;
+        hvx_splat_f32_a(acc, 0.0f, factx->size_vkq_acc / sizeof(float));
+        for (uint32_t sp = 0; sp < n_split; ++sp) {
+            const uint8_t * part = hvx_fa_dec_partial(factx, row, sp);
+            const float m_s = ((const float *) part)[0];
+            const float s_s = ((const float *) part)[1];
+            // An empty split carries M = HTP_FA_M_INITIAL_VAL; its weight must be exactly 0
+            // rather than whatever the f32 exp does with an argument of -1e4 (the row kernel
+            // only ever routes that case through the saturating f16 exp2).
+            const float d_s = m_s - M;
+            if (d_s < -80.0f) {
+                continue;
+            }
+            HVX_Vector w_vec = hvx_vec_exp_f32(hvx_vec_splat_f32(d_s));
+            const float w = hvx_vec_get_f32(w_vec);
+            S += w * s_s;
+            const HVX_Vector * pv = (const HVX_Vector *) (part + HVX_FA_DEC_PART_HDR);
+            HVX_Vector * av = (HVX_Vector *) acc;
+            for (uint32_t i = 0; i < nvec_acc; ++i) {
+                av[i] = HVX_OP_ADD_F32(av[i], HVX_OP_MUL_F32(w_vec, pv[i]));
+            }
+        }
+
+        if (sinks) {
+            const float s = ((const float *) sinks->data)[iq2];
+            float vs = 1.0f;
+            if (s > M) {
+                HVX_Vector ms_vec = hvx_vec_exp_f32(hvx_vec_splat_f32(M - s));
+                hvx_scale_vec_f32_aa((uint8_t *) acc, (const uint8_t *) acc, DV, ms_vec);
+                S = S * hvx_vec_get_f32(ms_vec) + vs;
+            } else {
+                vs = hvx_vec_get_f32(hvx_vec_exp_f32(hvx_vec_splat_f32(s - M)));
+                S += vs;
+            }
+        }
+
+        const float S_inv = (S == 0.0f) ? 0.0f : 1.0f / S;
+        hvx_scale_f32_aa((uint8_t *) acc, (const uint8_t *) acc, DV, S_inv);
+
+        uint8_t * dst_ptr = (uint8_t *) dst->data + iq2 * dst->nb[1] + iq1 * dst->nb[2] + iq3 * dst->nb[3];
+        if (dst->type == HTP_TYPE_F32) {
+            hvx_copy_f32_ua(dst_ptr, (const uint8_t *) acc, DV);
+        } else if (dst->type == HTP_TYPE_F16) {
+            hvx_copy_f16_f32_ua(dst_ptr, (const uint8_t *) acc, DV);
+        }
+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_O_PROC, row);
+    }
+}
+
+// Pick n_split so the (sequence, KV head, split) units balance across the pool: minimise
+// the makespan ceil(units / nth) * ceil(n_blocks / n_split); smallest n_split on ties.
+static uint32_t hvx_fa_dec_pick_split(uint32_t n_seq_heads, uint32_t n_blocks, uint32_t nth, uint32_t max_split) {
+    uint32_t best = 1, best_ms = UINT32_MAX;
+    const uint32_t lim = (n_blocks < max_split) ? n_blocks : max_split;
+    for (uint32_t s = 1; s <= lim; ++s) {
+        const uint32_t units  = n_seq_heads * s;
+        const uint32_t rounds = (units + nth - 1) / nth;
+        const uint32_t bps    = (n_blocks + s - 1) / s;
+        const uint32_t ms     = rounds * bps;
+        if (ms < best_ms) {
+            best_ms = ms;
+            best    = s;
+        }
+    }
+    return best;
+}
+
 int op_flash_attn_ext(struct htp_ops_context * octx) {
     const struct htp_tensor * q    = octx->src[0];
     const struct htp_tensor * k    = octx->src[1];
@@ -3079,6 +3478,53 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     factx.size_vkq_acc = size_vkq_acc;
 
     uint8_t * vtcm_cur = octx->ctx->vtcm_base;
+
+    // Split-KV decode path (flash_attn_ext_f16_dec_thread). Host opt-out via
+    // kparams->u.hvx.split_kv == 0; falls back when rows-per-unit exceed the scratch bound,
+    // when query heads do not divide evenly over KV heads, or when there is nothing to do.
+    const uint32_t neq1 = q->ne[1], neq2 = q->ne[2], neq3 = q->ne[3];
+    const uint32_t nek2 = k->ne[2];
+    const uint32_t G    = (nek2 && (neq2 % nek2) == 0) ? neq2 / nek2 : 0;
+    const uint32_t R    = neq1 * G;
+    bool dec = kparams->u.hvx.split_kv != 0 && G > 0 && R >= 1 && R <= HVX_FA_DEC_R_MAX &&
+               v->ne[2] == nek2 && factx.n_blocks > 0;
+
+    if (dec) {
+        const uint32_t rows_total = neq1 * neq2 * neq3;
+        factx.dec_G      = G;
+        factx.dec_R      = R;
+        factx.dec_n_mseg = (mask && mask->ne[2] != 1) ? R : neq1;
+        factx.dec_stride_part = HVX_FA_DEC_PART_HDR + size_vkq_acc;
+        factx.dec_n_split = hvx_fa_dec_pick_split(neq3 * nek2, factx.n_blocks, octx->n_threads, 8);
+        for (;;) {
+            factx.dec_bps     = (factx.n_blocks + factx.dec_n_split - 1) / factx.dec_n_split;
+            factx.dec_n_units = neq3 * nek2 * factx.dec_n_split;
+            vtcm_cur = octx->ctx->vtcm_base;
+            factx.spad_q = vtcm_seq_alloc(&vtcm_cur, size_q_block * R * octx->n_threads);
+            factx.spad_k = vtcm_seq_alloc(&vtcm_cur, factx.size_k_block * 2 * octx->n_threads);
+            factx.spad_v = vtcm_seq_alloc(&vtcm_cur, factx.size_v_block * 2 * octx->n_threads);
+            factx.spad_m = vtcm_seq_alloc(&vtcm_cur, (mask ? factx.size_m_block * HVX_FA_DMA_CACHE_SIZE : 0) * octx->n_threads);
+            factx.spad_a = vtcm_seq_alloc(&vtcm_cur, size_vkq_acc * R * octx->n_threads);
+            factx.dec_partials = vtcm_seq_alloc(&vtcm_cur, factx.dec_stride_part * rows_total * factx.dec_n_split);
+            if ((size_t) (vtcm_cur - octx->ctx->vtcm_base) <= octx->ctx->vtcm_size) {
+                break;
+            }
+            if (factx.dec_n_split == 1) {
+                dec = false;              // even unsplit does not fit: use the row path
+                vtcm_cur = octx->ctx->vtcm_base;
+                break;
+            }
+            factx.dec_n_split = 1;        // retry once without splitting
+        }
+    }
+
+    if (dec) {
+        if (!(octx->flags & HTP_OPFLAGS_SKIP_COMPUTE)) {
+            work_queue_run(octx->ctx->work_queue, flash_attn_ext_f16_dec_thread,   &factx, octx->n_threads);
+            work_queue_run(octx->ctx->work_queue, flash_attn_ext_f16_merge_thread, &factx, octx->n_threads);
+        }
+        return HTP_STATUS_OK;
+    }
 
     factx.spad_q = vtcm_seq_alloc(&vtcm_cur, size_q_block * octx->n_threads);
     factx.spad_k = vtcm_seq_alloc(&vtcm_cur, factx.size_k_block * 2 * octx->n_threads);
