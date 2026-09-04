@@ -93,6 +93,8 @@ struct options {
     int    verbose   = 0;
     int    mask_frac_permille = 10;   // ~1% of keys masked, exercises the -inf path
     int    layers    = 1;      // >1 = sustained token mode: chain N pre-enqueued GPU kernels, one relayed per layer
+    int    pad_mb    = 0;      // place K/V this many MB into a larger buffer (alias/TLB footprint experiment)
+    int    integrated = 0;     // drive the backend's own hetero path (GGML_HEXAGON_HETERO_FRAC = gpu_frac) on a full-range FA op and check vs CPU
     bool   run_htp = true, run_gpu = true, run_both = true;
 };
 
@@ -115,6 +117,8 @@ static bool parse(int argc, char ** argv, options & o) {
         else if (a == "--cpu")      { if (!next_i(o.cpu)) return false; }
         else if (a == "--mask-permille") { if (!next_i(o.mask_frac_permille)) return false; }
         else if (a == "--layers")   { if (!next_i(o.layers)) return false; }
+        else if (a == "--pad-mb")   { if (!next_i(o.pad_mb)) return false; }
+        else if (a == "--integrated") { o.integrated = 1; }
         else if (a == "-v")         { o.verbose = 1; }
         else if (a == "--modes") {
             if (i + 1 >= argc) return false;
@@ -380,6 +384,12 @@ int main(int argc, char ** argv) {
     setenv("GGML_HEXAGON_SYNC_PROBE", "1", 1);
     setenv("GGML_HEXAGON_ASYNC", "1", 1);
     setenv("GGML_HEXAGON_FA_SELECT", "1", 0);   // HVX path (the decode kernel lives there)
+    if (o.integrated) {
+        char fr[32]; snprintf(fr, sizeof(fr), "%.3f", o.gpu_frac);
+        if (o.gpu_frac > 0) setenv("GGML_HEXAGON_HETERO_FRAC", fr, 1); else unsetenv("GGML_HEXAGON_HETERO_FRAC");
+        setenv("GGML_HEXAGON_HETERO_SPAN", std::to_string(o.span).c_str(), 1);
+        setenv("GGML_HEXAGON_ASYNC", "0", 1);
+    }
     if (o.cpu >= 0) { cpu_set_t set; CPU_ZERO(&set); CPU_SET(o.cpu, &set); if (sched_setaffinity(0, sizeof(set), &set)) perror("sched_setaffinity"); }
     calibrate_realtime();
 
@@ -392,6 +402,7 @@ int main(int argc, char ** argv) {
     L.nbk1 = L.nbk2 * o.nkvh;
     L.part_stride = 128 + (size_t) o.d * 4;
     const size_t kv_bytes = (size_t) o.kv * L.nbk1;
+    L.k += (size_t) o.pad_mb << 20;
     L.v = L.k + kv_bytes;
     L.total = ((L.v + kv_bytes + (1 << 20) - 1) >> 20) << 20;
     if ((size_t) o.nh * nsplit * L.part_stride > L.parts_size) { fprintf(stderr, "too many GPU splits for the partial area\n"); return 1; }
@@ -456,6 +467,44 @@ int main(int argc, char ** argv) {
     if (!ggml_backend_supports_op(be, probe1) || (fa && !ggml_backend_supports_op(be, fa))) {
         fprintf(stderr, "HTP0 rejects the probe or FA op (probe %d, fa %d)\n", ggml_backend_supports_op(be, probe1), fa ? ggml_backend_supports_op(be, fa) : -1);
         return 1;
+    }
+
+    if (o.integrated) {
+        // Full-range FA op; the backend tags it (src[7], op_params[8..10]) and runs the GPU share itself.
+        ggml_tensor * kf = ggml_view_4d(ctx, kb, o.d, o.kv, o.nkvh, 1, L.nbk1, L.nbk2, kv_bytes, 0);
+        ggml_tensor * vf = ggml_view_4d(ctx, vb, o.d, o.kv, o.nkvh, 1, L.nbk1, L.nbk2, kv_bytes, 0);
+        ggml_tensor * mf = ggml_view_2d(ctx, mb, o.kv, 1, (size_t) o.kv * 2, 0);
+        kf->buffer = vf->buffer = mf->buffer = buf;
+        ggml_tensor * fa_full = ggml_flash_attn_ext(ctx, q, kf, vf, mf, 1.0f / sqrtf((float) o.d), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(fa_full, GGML_PREC_F32);
+        place(buf, base, L.dst, fa_full, "fa_full");
+        ggml_cgraph * gfull = ggml_new_graph_custom(ctx, 8, false);
+        ggml_build_forward_expand(gfull, fa_full);
+        if (!ggml_backend_supports_op(be, fa_full)) { fprintf(stderr, "HTP0 rejects the full-range FA op\n"); return 1; }
+        printf("integrated: full-range FA on HTP0 with GGML_HEXAGON_HETERO_FRAC=%s, kv %d\n", o.gpu_frac > 0 ? getenv("GGML_HEXAGON_HETERO_FRAC") : "(off)", o.kv);
+        stat_acc s_t;
+        double worst = 0;
+        for (int it = -1; it < o.iters; ++it) {
+            memset(base + L.dst, 0, (size_t) o.nh * o.d * 4);
+            const uint64_t t0 = cnt_now();
+            ggml_backend_graph_compute(be, gfull);
+            const uint64_t t1 = cnt_now();
+            dc_civac(base + L.dst, (size_t) o.nh * o.d * 4);
+            double w = 0;
+            for (int h = 0; h < o.nh; ++h) {
+                std::vector<double> ref; double Mref, Sref;
+                ref_attn(o, base, L, h, 0, o.kv, ref, &Mref, &Sref);
+                const float * out = (const float *) (base + L.dst + (size_t) h * o.d * 4);
+                for (int dd = 0; dd < o.d; ++dd) w = std::max(w, fabs((double) out[dd] - (Sref > 0 ? ref[dd] / Sref : 0.0)));
+            }
+            worst = std::max(worst, w);
+            if (it >= 0) s_t.add(ticks_us((double) (t1 - t0)));
+            if (o.verbose) printf("  [integrated #%d] graph_compute %.1f us  max|err| %.3e\n", it, ticks_us((double) (t1 - t0)), w);
+        }
+        printf("integrated: max |err| vs CPU reference over %d runs: %.3e -> %s; graph_compute median %.1f us (min %.1f max %.1f)\n",
+               o.iters, worst, worst < 2e-2 ? "OK" : "MISMATCH", s_t.med(), s_t.mn(), s_t.mx());
+        ggml_free(ctx); ggml_backend_buffer_free(buf); ggml_backend_free(be);
+        return worst < 2e-2 ? 0 : 2;
     }
 
     gpu_side g;

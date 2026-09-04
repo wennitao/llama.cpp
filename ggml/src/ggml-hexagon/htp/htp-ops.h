@@ -144,8 +144,23 @@ enum htp_sync_probe_rec {
 
 #define HTP_SYNC_PROBE_MAGIC 0x53594e43
 
+// Heterogeneous decode attention (dev prototype, host env GGML_HEXAGON_HETERO_FRAC). The GPU owns the
+// leading KV blocks of a decode FLASH_ATTN_EXT and hands (M, S, acc) partials to the HTP merge through
+// a shared control buffer the host attaches as src[7]. The parameters ride in the node's op_params.
+#define HTP_FA_HETERO_OPP_GPU_BLOCKS 8      // op_params[8]: leading 64-key blocks owned by the GPU (0 = off)
+#define HTP_FA_HETERO_OPP_SLOT       9      // op_params[9]: control slot (per FA node in the graph)
+#define HTP_FA_HETERO_OPP_GPU_NSPLIT 10     // op_params[10]: GPU partials per row
+// control buffer layout (bytes)
+#define HTP_FA_HETERO_SLOT_STRIDE    256            // slot s: ready_seq @ s*256 (DSP writes), done_seq @ s*256+128 (GPU writes)
+#define HTP_FA_HETERO_STATUS_OFF     (96 * 1024)    // [0] DSP-side done timeouts
+#define HTP_FA_HETERO_PARTS_OFF      (128 * 1024)   // partials: slot * HTP_FA_HETERO_PART_SLOT, [row][gpu_split] x part stride
+#define HTP_FA_HETERO_PART_SLOT      (256 * 1024)
+#define HTP_FA_HETERO_MAX_SLOTS      30
+#define HTP_FA_HETERO_BUF_SIZE       (8 * 1024 * 1024)
+#define HTP_FA_HETERO_DONE_TIMEOUT_US 50000
+
 #define HTP_OP_MAX_DIMS    4    // aka GGML_MAX_DIMS
-#define HTP_OP_MAX_INPUTS  7    // sparse flash-attention carries sel (src 5) and its per-row count (src 6)
+#define HTP_OP_MAX_INPUTS  8    // sparse flash-attention carries sel (src 5) and its per-row count (src 6); hetero decode FA carries its control buffer (src 7)
 #define HTP_OP_MAX_OUTPUTS 4
 #define HTP_OP_MAX_PARAMS  16   // aka GGML_MAX_OP_PARAMS
 #define HTP_OP_MAX_KERN_PARAMS 32
@@ -194,8 +209,7 @@ struct htp_op_desc {
     int32_t  params[HTP_OP_MAX_PARAMS]; // Params for the op, e.g. epsilon of RMS norm
     int32_t  kernel_params[HTP_OP_MAX_KERN_PARAMS]; // generic blob for host-precomputed parameters
     uint16_t src[HTP_OP_MAX_INPUTS];    // Input tensors indices
-    uint16_t dst[HTP_OP_MAX_OUTPUTS];   // Output tensor indices
-    uint16_t pad[1];                    // padding to align to 64 bits
+    uint16_t dst[HTP_OP_MAX_OUTPUTS];   // Output tensor indices (8 + 4 uint16 = 24 B, 64-bit aligned)
 };
 
 #ifndef HTP_MAX_NTHREADS

@@ -63,6 +63,17 @@ ggml_add_backend_library(${TARGET_NAME}
 target_link_libraries(${TARGET_NAME} PRIVATE htp_iface)
 target_include_directories(${TARGET_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/htp ${CMAKE_CURRENT_BINARY_DIR})
 
+# Heterogeneous decode attention prototype (GGML_HEXAGON_HETERO_FRAC): the HTP backend drives GPU
+# kernels through OpenCL directly. Compiled in only when OpenCL is available in the tree.
+if (GGML_OPENCL)
+    find_package(OpenCL QUIET)
+    if (OpenCL_FOUND)
+        target_compile_definitions(${TARGET_NAME} PRIVATE GGML_HEXAGON_HETERO=1)
+        target_link_libraries(${TARGET_NAME} PRIVATE OpenCL::OpenCL)
+        message(STATUS "ggml-hexagon: heterogeneous decode attention prototype enabled (OpenCL found)")
+    endif()
+endif()
+
 # Build HTP skels
 set(HTP_SKELS)
 function(build_htp_skel V)

@@ -55,6 +55,15 @@
 #include "htp_iface.h"
 #include "htp-drv.h"
 
+#ifdef GGML_HEXAGON_HETERO
+#define CL_TARGET_OPENCL_VERSION 300
+#include <CL/cl.h>
+#include <CL/cl_ext.h>
+#include <condition_variable>
+#include <deque>
+#include <sched.h>
+#endif
+
 using intvec  = std::vector<int>;
 using uintvec = std::vector<unsigned int>;
 using u32vec  = std::vector<uint32_t>;
@@ -78,6 +87,12 @@ static int    opt_fa_decode = 1;
 // Dev-only: let a GGML_OP_CUSTOM node tagged with HTP_SYNC_PROBE_MAGIC run as HTP_OP_SYNC_PROBE
 // (flag round-trip probe, examples/hetero-sync-probe). Off by default.
 static int    opt_sync_probe = 0;
+// Heterogeneous decode attention prototype: fraction of each decode FLASH_ATTN_EXT's KV range the
+// GPU computes (0 = off). The HTP merge consumes the GPU's partials through a shared buffer
+// (src[7]) with a flag handshake relayed by a host thread; see docs heterogeneous-npu-gpu.md 4g-4h.
+static float  opt_hetero_frac = 0.0f;
+static int    opt_hetero_span = 512;   // KV keys per GPU work-group
+static int    opt_hetero_cpu  = 7;     // relay thread affinity (-1 = none)
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
@@ -295,6 +310,11 @@ static void ggml_hexagon_precompute_fused_ffn_params(
 struct ggml_hexagon_opbatch;
 struct ggml_hexagon_opqueue;
 struct htp_opnode;
+struct ggml_hexagon_hetero;
+struct ggml_hexagon_session;
+#ifdef GGML_HEXAGON_HETERO
+static void ggml_hexagon_hetero_free(ggml_hexagon_session * sess);
+#endif
 
 struct ggml_hexagon_session {
     std::string      name;
@@ -327,6 +347,8 @@ struct ggml_hexagon_session {
         uint64_t uid = 0;
         std::vector<htp_opnode> htp_nodes;
     } cached_graph;
+
+    ggml_hexagon_hetero * hetero = nullptr;
 
     ggml_hexagon_session(int dev_id, ggml_backend_dev_t dev) noexcept(false);
     ~ggml_hexagon_session() noexcept(true);
@@ -1908,6 +1930,10 @@ void ggml_hexagon_session::release() noexcept(true) {
     GGML_LOG_INFO("ggml-hex: releasing session: %s\n", this->name.c_str());
 
     int err;
+
+#ifdef GGML_HEXAGON_HETERO
+    ggml_hexagon_hetero_free(this);
+#endif
 
     if (this->valid_iface) {
         // Stop dspqueue/opbatch processing
@@ -3707,6 +3733,536 @@ static void ggml_backend_hexagon_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Heterogeneous decode attention (prototype). One shared 8 MB rpcmem buffer per session holds the
+// per-slot ready/done sequence words and the GPU's partials; it is attached to each tagged decode
+// FLASH_ATTN_EXT node as src[7]. A relay thread pre-enqueues one GPU kernel per tagged node for
+// every graph_compute (kernels spin on a fine-grain SVM word), then copies each slot's ready word,
+// raised by the HTP op, into SVM. The GPU never polls rpcmem (Adreno does not see mid-kernel
+// updates there), the HTP polls the GPU's done word with a cache invalidate per read.
+// ---------------------------------------------------------------------------------------------
+#ifdef GGML_HEXAGON_HETERO
+
+static const char * ggml_hexagon_hetero_cl_src = R"CL(
+#ifndef FA_D
+#define FA_D 128
+#endif
+#ifndef FA_G
+#define FA_G 2
+#endif
+#define HTP_M_INIT (-10000.0f)
+
+// One work-group per (KV head, KV split), FA_D lanes; the FA_G query heads of the KV head share
+// every K/V read. Q comes from and the partials go to fine-grain SVM: inside a long in-order
+// chain, writes through the ION alias only reach memory at command-buffer boundaries, SVM is
+// coherent immediately. Partial per (row, split): 128-byte header (M, S), then acc[FA_D] f32.
+__kernel void fa_dec_gqa(__global const float * q_svm,
+                         __global const uchar * kb, uint k_off, __global const uchar * vb, uint v_off,
+                         __global const uchar * mb, uint m_off, uint has_mask,
+                         __global float * parts_svm,
+                         uint nbk1, uint nbk2, uint nbv1, uint nbv2,
+                         uint n_kv, uint span, uint nsplit, float scale, uint part_stride_f,
+                         __global uint * ctl, uint want, uint max_spin, uint n_groups) {
+    const int t   = get_local_id(0);
+    const int kvh = get_group_id(1);
+    const int sp  = get_group_id(2);
+
+    __local float Q_l[FA_G][FA_D];
+    __local float S_l[FA_G][FA_D];
+    __local float sh_a[FA_G];
+    __local float sh_m[FA_G];
+    __local float sh_l[FA_G];
+
+    if (t == 0) {
+        uint it = 0;
+        while (atomic_load_explicit((volatile __global atomic_uint *) ctl, memory_order_acquire, memory_scope_all_svm_devices) != want && it < max_spin) { it++; }
+        if (kvh == 0 && sp == 0) {
+            atomic_store_explicit((volatile __global atomic_uint *)(ctl + 3), it, memory_order_relaxed, memory_scope_all_svm_devices);
+        }
+    }
+    barrier(CLK_GLOBAL_MEM_FENCE);
+
+    for (int g = 0; g < FA_G; ++g) {
+        Q_l[g][t] = q_svm[(kvh * FA_G + g) * FA_D + t] * scale;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int kv_begin = sp * span;
+    const int kv_end   = min((int) n_kv, kv_begin + (int) span);
+
+    float m_run = -INFINITY, l_run = 0.0f;
+    float o_acc[FA_G];
+    for (int g = 0; g < FA_G; ++g) o_acc[g] = 0.0f;
+
+    if (kv_begin < kv_end) {
+        for (int bs = kv_begin; bs < kv_end; bs += FA_D) {
+            const int blk_n = min(FA_D, kv_end - bs);
+            float s[FA_G];
+            for (int g = 0; g < FA_G; ++g) s[g] = -INFINITY;
+            if (t < blk_n) {
+                __global const half * krow = (__global const half *)(kb + k_off + (ulong)(bs + t) * nbk1 + kvh * nbk2);
+                float8 acc[FA_G];
+                for (int g = 0; g < FA_G; ++g) acc[g] = (float8)(0.0f);
+                #pragma unroll
+                for (int d8 = 0; d8 < FA_D / 8; ++d8) {
+                    const float8 k8 = convert_float8(vload8(d8, krow));
+                    for (int g = 0; g < FA_G; ++g) acc[g] += k8 * vload8(d8, Q_l[g]);
+                }
+                float mval = 0.0f;
+                if (has_mask) mval = (float)((__global const half *)(mb + m_off))[bs + t];
+                for (int g = 0; g < FA_G; ++g) {
+                    const float8 a = acc[g];
+                    s[g] = (a.s0 + a.s1 + a.s2 + a.s3 + a.s4 + a.s5 + a.s6 + a.s7) + mval;
+                }
+            }
+            for (int g = 0; g < FA_G; ++g) S_l[g][t] = s[g];
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            if (t < FA_G) {
+                float m_t = -INFINITY;
+                for (int c = 0; c < FA_D; ++c) m_t = fmax(m_t, S_l[t][c]);
+                const float m_new = fmax(m_run, m_t);
+                const float a = (m_run == -INFINITY) ? 0.0f : native_exp(m_run - m_new);
+                float l = 0.0f;
+                for (int c = 0; c < FA_D; ++c) {
+                    const float sc = S_l[t][c];
+                    const float p = (isinf(sc) || m_new == -INFINITY) ? 0.0f : native_exp(sc - m_new);
+                    S_l[t][c] = p;
+                    l += p;
+                }
+                l_run = a * l_run + l;
+                m_run = m_new;
+                sh_a[t] = a;
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            {
+                float pv[FA_G];
+                for (int g = 0; g < FA_G; ++g) pv[g] = 0.0f;
+                __global const half * vrow = (__global const half *)(vb + v_off + (ulong) bs * nbv1 + kvh * nbv2) + t;
+                const int vstep = nbv1 / 2;
+                #pragma unroll 8
+                for (int c = 0; c < blk_n; ++c) {
+                    const float vf = (float) vrow[(ulong) c * vstep];
+                    for (int g = 0; g < FA_G; ++g) pv[g] += S_l[g][c] * vf;
+                }
+                for (int g = 0; g < FA_G; ++g) o_acc[g] = o_acc[g] * sh_a[g] + pv[g];
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+    }
+
+    if (t < FA_G) { sh_m[t] = (kv_begin < kv_end) ? m_run : HTP_M_INIT; sh_l[t] = l_run; }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int g = 0; g < FA_G; ++g) {
+        const int row = kvh * FA_G + g;
+        __global float * part = parts_svm + ((ulong) row * nsplit + sp) * part_stride_f;
+        if (t == 0) { part[0] = sh_m[g]; part[1] = sh_l[g]; }
+        part[32 + t] = o_acc[g];
+    }
+    // last work-group of the kernel publishes done (SVM, host-visible immediately)
+    barrier(CLK_GLOBAL_MEM_FENCE);
+    if (t == 0) {
+        const uint old = atomic_fetch_add_explicit((volatile __global atomic_uint *)(ctl + 2), 1u, memory_order_acq_rel, memory_scope_all_svm_devices);
+        if (old == n_groups - 1) {
+            atomic_store_explicit((volatile __global atomic_uint *)(ctl + 1), want, memory_order_seq_cst, memory_scope_all_svm_devices);
+        }
+    }
+}
+)CL";
+
+struct ggml_hexagon_hetero_job {
+    const ggml_tensor * node = nullptr;
+    uint32_t slot = 0, want = 0;
+    cl_mem q = nullptr, k = nullptr, v = nullptr, m = nullptr;
+    uint32_t q_off = 0, k_off = 0, v_off = 0, m_off = 0, has_mask = 0, p_off = 0;
+    uint32_t nbq2 = 0, nbk1 = 0, nbk2 = 0, nbv1 = 0, nbv2 = 0;
+    uint32_t n_kv_gpu = 0, span = 0, nsplit = 0, part_stride = 0, done_off = 0;
+    uint32_t n_kv_heads = 0, D = 0, n_heads = 0;
+    const uint8_t * q_host = nullptr;   // Q rows in the compute buffer (host VA), copied into SVM per token
+    float    scale = 0.0f;
+};
+
+// SVM block layout (fine-grain, coherent): control words, then per-slot Q, then per-slot partials
+#define HETERO_SVM_CTL_BYTES   4096
+#define HETERO_SVM_Q_BYTES     16384
+#define HETERO_SVM_PARTS_BYTES HTP_FA_HETERO_PART_SLOT
+#define HETERO_SVM_BYTES       (HETERO_SVM_CTL_BYTES + HTP_FA_HETERO_MAX_SLOTS * (HETERO_SVM_Q_BYTES + HETERO_SVM_PARTS_BYTES))
+static inline uint32_t * hetero_svm_ctl(ggml_hexagon_hetero * h, uint32_t slot);
+static inline float *    hetero_svm_q(ggml_hexagon_hetero * h, uint32_t slot);
+static inline float *    hetero_svm_parts(ggml_hexagon_hetero * h, uint32_t slot);
+
+struct ggml_hexagon_hetero {
+    ggml_hexagon_session *  sess = nullptr;
+    ggml_backend_buffer_t   buf  = nullptr;   // control words + GPU partials, attached as src[7]
+    uint8_t *               base = nullptr;
+    int                     fd   = -1;
+    ggml_context *          tctx = nullptr;
+    ggml_tensor *           ctrl = nullptr;
+
+    cl_platform_id   plat = nullptr;
+    cl_device_id     dev  = nullptr;
+    cl_context       ctx  = nullptr;
+    cl_command_queue q    = nullptr;
+    cl_program       prog = nullptr;
+    cl_kernel        k_fa = nullptr;
+    uint8_t *        svm  = nullptr;          // HETERO_SVM_BYTES, see hetero_svm_*
+    int              G = 0, D = 0;            // shape the program was compiled for
+
+    std::unordered_map<int, cl_mem>                                  aliases;   // by rpcmem fd
+    std::unordered_map<const ggml_tensor *, ggml_hexagon_hetero_job> jobs;
+    std::vector<uint32_t>                                            seq;       // per slot
+
+    std::thread             relay;
+    std::mutex              mu;
+    std::condition_variable cv;
+    std::deque<std::vector<ggml_hexagon_hetero_job>> batches;
+    bool                    stop = false;
+    uint64_t                n_batches = 0, n_jobs = 0, n_ready_timeouts = 0, n_gpu_timeouts = 0;
+};
+
+static inline uint32_t * hetero_svm_ctl(ggml_hexagon_hetero * h, uint32_t slot)   { return (uint32_t *) (h->svm + slot * 16); }
+static inline float *    hetero_svm_q(ggml_hexagon_hetero * h, uint32_t slot)     { return (float *) (h->svm + HETERO_SVM_CTL_BYTES + (size_t) slot * HETERO_SVM_Q_BYTES); }
+static inline float *    hetero_svm_parts(ggml_hexagon_hetero * h, uint32_t slot) { return (float *) (h->svm + HETERO_SVM_CTL_BYTES + (size_t) HTP_FA_HETERO_MAX_SLOTS * HETERO_SVM_Q_BYTES + (size_t) slot * HETERO_SVM_PARTS_BYTES); }
+
+static inline void hetero_dc_civac(const void * p, size_t n) {
+#if defined(__aarch64__)
+    uintptr_t a = (uintptr_t) p & ~(uintptr_t) 63;
+    const uintptr_t e = (uintptr_t) p + n;
+    for (; a < e; a += 64) asm volatile("dc civac, %0" : : "r"(a) : "memory");
+    asm volatile("dsb sy" : : : "memory");
+#else
+    (void) p; (void) n;
+#endif
+}
+
+static bool hetero_cl_check(cl_int err, const char * what) {
+    if (err != CL_SUCCESS) {
+        GGML_LOG_ERROR("ggml-hex: hetero: %s failed (%d)\n", what, err);
+        return false;
+    }
+    return true;
+}
+
+static cl_mem ggml_hexagon_hetero_alias(ggml_hexagon_hetero * h, ggml_backend_buffer_t buffer) {
+    auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(buffer->context);
+    auto it = h->aliases.find(sbuf->fd);
+    if (it != h->aliases.end()) {
+        return it->second;
+    }
+    cl_mem_ion_host_ptr ion = {};
+    ion.ext_host_ptr.allocation_type  = CL_MEM_ION_HOST_PTR_QCOM;
+    ion.ext_host_ptr.host_cache_policy = CL_MEM_HOST_IOCOHERENT_QCOM;
+    ion.ion_filedesc = sbuf->fd;
+    ion.ion_hostptr  = sbuf->base;
+    const size_t size = sbuf->size & ~(size_t) 4095;   // never past the allocation
+    cl_int err;
+    cl_mem mem = clCreateBuffer(h->ctx, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR | CL_MEM_EXT_HOST_PTR_QCOM, size, &ion, &err);
+    if (err != CL_SUCCESS) {
+        GGML_LOG_ERROR("ggml-hex: hetero: ION alias of buffer fd %d size %zu failed (%d)\n", sbuf->fd, size, err);
+        return nullptr;
+    }
+    HEX_VERBOSE("ggml-hex: hetero: aliased buffer fd %d base %p size %zu into OpenCL\n", sbuf->fd, (void *) sbuf->base, size);
+    h->aliases[sbuf->fd] = mem;
+    return mem;
+}
+
+static void ggml_hexagon_hetero_relay_main(ggml_hexagon_hetero * h);
+
+static bool ggml_hexagon_hetero_init(ggml_hexagon_session * sess) {
+    auto h = new ggml_hexagon_hetero();
+    h->sess = sess;
+
+    h->buf = ggml_backend_buft_alloc_buffer(&sess->buffer_type, HTP_FA_HETERO_BUF_SIZE);
+    if (!h->buf) {
+        GGML_LOG_ERROR("ggml-hex: hetero: control buffer alloc failed\n");
+        delete h;
+        return false;
+    }
+    ggml_backend_buffer_set_usage(h->buf, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(h->buf->context);
+    h->base = sbuf->base;
+    h->fd   = sbuf->fd;
+    memset(h->base, 0, HTP_FA_HETERO_BUF_SIZE);
+    hetero_dc_civac(h->base, HTP_FA_HETERO_BUF_SIZE);
+
+    ggml_init_params ip = { ggml_tensor_overhead() * 4, nullptr, true };
+    h->tctx = ggml_init(ip);
+    h->ctrl = ggml_new_tensor_1d(h->tctx, GGML_TYPE_F32, HTP_FA_HETERO_BUF_SIZE / 4);
+    h->ctrl->buffer = h->buf;
+    h->ctrl->data   = h->base;
+    ggml_set_name(h->ctrl, "hexagon_hetero_ctrl");
+
+    cl_int err; cl_uint n = 0;
+    if (!hetero_cl_check(clGetPlatformIDs(1, &h->plat, &n), "clGetPlatformIDs") || !n) { delete h; return false; }
+    if (!hetero_cl_check(clGetDeviceIDs(h->plat, CL_DEVICE_TYPE_GPU, 1, &h->dev, &n), "clGetDeviceIDs") || !n) { delete h; return false; }
+    cl_device_svm_capabilities svm = 0;
+    clGetDeviceInfo(h->dev, CL_DEVICE_SVM_CAPABILITIES, sizeof(svm), &svm, nullptr);
+    if (!(svm & CL_DEVICE_SVM_FINE_GRAIN_BUFFER) || !(svm & CL_DEVICE_SVM_ATOMICS)) {
+        GGML_LOG_ERROR("ggml-hex: hetero: GPU lacks fine-grain SVM atomics\n");
+        delete h; return false;
+    }
+    h->ctx = clCreateContext(nullptr, 1, &h->dev, nullptr, nullptr, &err);
+    if (!hetero_cl_check(err, "clCreateContext")) { delete h; return false; }
+    cl_queue_properties qprops[] = { CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0 };
+    h->q = clCreateCommandQueueWithProperties(h->ctx, h->dev, qprops, &err);
+    if (!hetero_cl_check(err, "clCreateCommandQueueWithProperties")) { delete h; return false; }
+    h->svm = (uint8_t *) clSVMAlloc(h->ctx, CL_MEM_READ_WRITE | CL_MEM_SVM_FINE_GRAIN_BUFFER | CL_MEM_SVM_ATOMICS, HETERO_SVM_BYTES, 0);
+    if (!h->svm) { GGML_LOG_ERROR("ggml-hex: hetero: clSVMAlloc(%zu) failed\n", (size_t) HETERO_SVM_BYTES); delete h; return false; }
+    memset(h->svm, 0, HETERO_SVM_BYTES);
+    h->seq.assign(HTP_FA_HETERO_MAX_SLOTS, 0);
+
+    if (!ggml_hexagon_hetero_alias(h, h->buf)) { delete h; return false; }
+
+    h->relay = std::thread(ggml_hexagon_hetero_relay_main, h);
+    sess->hetero = h;
+    GGML_LOG_INFO("ggml-hex: %s hetero decode attention enabled: GPU share %.2f, span %d, relay cpu %d\n",
+                  sess->c_name(), opt_hetero_frac, opt_hetero_span, opt_hetero_cpu);
+    return true;
+}
+
+static bool ggml_hexagon_hetero_compile(ggml_hexagon_hetero * h, int D, int G) {
+    if (h->prog) {
+        return h->D == D && h->G == G;
+    }
+    cl_int err;
+    h->prog = clCreateProgramWithSource(h->ctx, 1, &ggml_hexagon_hetero_cl_src, nullptr, &err);
+    if (!hetero_cl_check(err, "clCreateProgramWithSource")) return false;
+    char opts[128];
+    snprintf(opts, sizeof(opts), "-cl-std=CL2.0 -DFA_D=%d -DFA_G=%d", D, G);
+    err = clBuildProgram(h->prog, 1, &h->dev, opts, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        size_t ln = 0;
+        clGetProgramBuildInfo(h->prog, h->dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &ln);
+        std::string log(ln, '\0');
+        clGetProgramBuildInfo(h->prog, h->dev, CL_PROGRAM_BUILD_LOG, ln, log.data(), nullptr);
+        GGML_LOG_ERROR("ggml-hex: hetero: kernel build failed (%d):\n%s\n", err, log.c_str());
+        clReleaseProgram(h->prog); h->prog = nullptr;
+        return false;
+    }
+    h->k_fa   = clCreateKernel(h->prog, "fa_dec_gqa", &err); if (!hetero_cl_check(err, "clCreateKernel fa_dec_gqa")) return false;
+    h->D = D; h->G = G;
+    return true;
+}
+
+// Tag a decode FLASH_ATTN_EXT node for the split and build its GPU job. Returns false (node left
+// untouched) when the shape or the resources do not fit the prototype.
+static bool ggml_hexagon_hetero_prepare(ggml_hexagon_session * sess, ggml_tensor * n, const struct htp_fa_kernel_params * kp, int slot) {
+    ggml_hexagon_hetero * h = sess->hetero;
+    const ggml_tensor * q = n->src[0], * k = n->src[1], * v = n->src[2], * m = n->src[3];
+    n->op_params[HTP_FA_HETERO_OPP_GPU_BLOCKS] = 0;
+
+    if (kp->kernel_type != HTP_FA_KERNEL_HVX || !kp->u.hvx.split_kv) return false;
+    if (q->ne[1] != 1 || q->ne[3] != 1 || slot >= HTP_FA_HETERO_MAX_SLOTS) return false;
+    const int DK = (int) q->ne[0], DV = (int) v->ne[0];
+    if (DK != DV || (DK != 128 && DK != 64)) return false;
+    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || (m && m->type != GGML_TYPE_F16)) return false;
+    if (n->src[4] || n->src[5] || n->src[6]) return false;   // sinks / sparse: not in the prototype
+    const int nek2 = (int) k->ne[2], neq2 = (int) q->ne[2];
+    if (nek2 == 0 || neq2 % nek2 != 0) return false;
+    const int G = neq2 / nek2;
+    const uint32_t n_blocks = kp->n_kv_blocks;
+    const uint32_t gpu_blocks = (uint32_t) (opt_hetero_frac * (float) n_blocks);
+    if (gpu_blocks < 2 || gpu_blocks >= n_blocks) return false;
+    const uint32_t gpu_kv = gpu_blocks * 64;
+    if (gpu_kv > (uint32_t) k->ne[1]) return false;
+    const uint32_t nsplit = (gpu_kv + opt_hetero_span - 1) / opt_hetero_span;
+    const uint32_t part_stride = 128 + hex_round_up(DV * 2, 128) * 2;
+    if ((size_t) neq2 * nsplit * part_stride > HTP_FA_HETERO_PART_SLOT) return false;
+    if ((size_t) neq2 * DK * sizeof(float) > HETERO_SVM_Q_BYTES) return false;
+    if (!ggml_backend_buffer_is_hexagon(q->buffer) || !ggml_backend_buffer_is_hexagon(k->buffer) ||
+        !ggml_backend_buffer_is_hexagon(v->buffer) || (m && !ggml_backend_buffer_is_hexagon(m->buffer))) return false;
+    if (!ggml_hexagon_hetero_compile(h, DK, G)) return false;
+
+    ggml_hexagon_hetero_job job;
+    job.node = n; job.slot = (uint32_t) slot;
+    job.q = ggml_hexagon_hetero_alias(h, q->buffer);
+    job.k = ggml_hexagon_hetero_alias(h, k->buffer);
+    job.v = ggml_hexagon_hetero_alias(h, v->buffer);
+    job.m = m ? ggml_hexagon_hetero_alias(h, m->buffer) : h->aliases[h->fd];
+    if (!job.q || !job.k || !job.v || !job.m) return false;
+    auto off = [](const ggml_tensor * t) { return (uint32_t) ((const uint8_t *) t->data - static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context)->base); };
+    job.q_off = off(q); job.k_off = off(k); job.v_off = off(v); job.m_off = m ? off(m) : 0; job.has_mask = m ? 1 : 0;
+    job.p_off = HTP_FA_HETERO_PARTS_OFF + (uint32_t) slot * HTP_FA_HETERO_PART_SLOT;
+    job.nbq2 = (uint32_t) q->nb[2]; job.nbk1 = (uint32_t) k->nb[1]; job.nbk2 = (uint32_t) k->nb[2];
+    job.nbv1 = (uint32_t) v->nb[1]; job.nbv2 = (uint32_t) v->nb[2];
+    job.n_kv_gpu = gpu_kv; job.span = (uint32_t) opt_hetero_span; job.nsplit = nsplit; job.part_stride = part_stride;
+    job.done_off = (uint32_t) slot * HTP_FA_HETERO_SLOT_STRIDE + 128;
+    job.n_kv_heads = (uint32_t) nek2; job.D = (uint32_t) DK; job.n_heads = (uint32_t) neq2;
+    job.q_host = (const uint8_t *) q->data;
+    memcpy(&job.scale, &n->op_params[0], sizeof(float));
+
+    n->op_params[HTP_FA_HETERO_OPP_GPU_BLOCKS] = (int32_t) gpu_blocks;
+    n->op_params[HTP_FA_HETERO_OPP_SLOT]       = slot;
+    n->op_params[HTP_FA_HETERO_OPP_GPU_NSPLIT] = (int32_t) nsplit;
+    n->src[7] = h->ctrl;
+    h->jobs[n] = job;
+    if (opt_verbose || slot == 0) {
+        GGML_LOG_INFO("ggml-hex: hetero: node %s slot %d: GPU blocks %u of %u (%u keys, %u splits), HTP blocks %u, D %d G %d\n",
+                      n->name, slot, gpu_blocks, n_blocks, gpu_kv, nsplit, n_blocks - gpu_blocks, DK, G);
+    }
+    return true;
+}
+
+// Called once per graph_compute with the nodes about to be queued, in execution order.
+static void ggml_hexagon_hetero_post(ggml_hexagon_session * sess, const std::vector<htp_opnode> & nodes) {
+    ggml_hexagon_hetero * h = sess->hetero;
+    std::vector<ggml_hexagon_hetero_job> batch;
+    for (const auto & node : nodes) {
+        if (node.opcode != HTP_OP_FLASH_ATTN_EXT || node.node->op_params[HTP_FA_HETERO_OPP_GPU_BLOCKS] <= 0) continue;
+        auto it = h->jobs.find(node.node);
+        if (it == h->jobs.end()) continue;
+        ggml_hexagon_hetero_job job = it->second;
+        job.want = ++h->seq[job.slot];
+        batch.push_back(job);
+    }
+    if (batch.empty()) return;
+    {
+        std::lock_guard<std::mutex> lk(h->mu);
+        h->batches.push_back(std::move(batch));
+    }
+    h->cv.notify_one();
+}
+
+static void ggml_hexagon_hetero_relay_main(ggml_hexagon_hetero * h) {
+#if defined(__linux__)
+    if (opt_hetero_cpu >= 0) {
+        cpu_set_t set; CPU_ZERO(&set); CPU_SET(opt_hetero_cpu, &set);
+        sched_setaffinity(0, sizeof(set), &set);
+    }
+#endif
+    for (;;) {
+        std::vector<ggml_hexagon_hetero_job> batch;
+        {
+            std::unique_lock<std::mutex> lk(h->mu);
+            h->cv.wait(lk, [&] { return h->stop || !h->batches.empty(); });
+            if (h->stop && h->batches.empty()) return;
+            batch = std::move(h->batches.front());
+            h->batches.pop_front();
+        }
+        // 1. the whole chain goes on the in-order queue up front; each kernel spins on its slot's SVM word
+        const auto t_batch0 = std::chrono::steady_clock::now();
+        for (const auto & j : batch) {
+            uint32_t * ctl = hetero_svm_ctl(h, j.slot);
+            __atomic_store_n(&ctl[2], 0u, __ATOMIC_SEQ_CST);   // work-group counter (kernel not yet released)
+            __atomic_store_n(&ctl[3], 0u, __ATOMIC_SEQ_CST);
+            cl_uint a_max = 300000u;   // ~85 ms of spin; then compute anyway (never trips the KGSL hang watchdog)
+            cl_uint part_stride_f = j.part_stride / 4;
+            cl_uint n_groups = j.n_kv_heads * j.nsplit;
+            int i = 0;
+            clSetKernelArgSVMPointer(h->k_fa, i++, hetero_svm_q(h, j.slot));
+            clSetKernelArg(h->k_fa, i++, sizeof(cl_mem), &j.k);  clSetKernelArg(h->k_fa, i++, sizeof(cl_uint), &j.k_off);
+            clSetKernelArg(h->k_fa, i++, sizeof(cl_mem), &j.v);  clSetKernelArg(h->k_fa, i++, sizeof(cl_uint), &j.v_off);
+            clSetKernelArg(h->k_fa, i++, sizeof(cl_mem), &j.m);  clSetKernelArg(h->k_fa, i++, sizeof(cl_uint), &j.m_off);
+            clSetKernelArg(h->k_fa, i++, sizeof(cl_uint), &j.has_mask);
+            clSetKernelArgSVMPointer(h->k_fa, i++, hetero_svm_parts(h, j.slot));
+            clSetKernelArg(h->k_fa, i++, sizeof(cl_uint), &j.nbk1); clSetKernelArg(h->k_fa, i++, sizeof(cl_uint), &j.nbk2);
+            clSetKernelArg(h->k_fa, i++, sizeof(cl_uint), &j.nbv1); clSetKernelArg(h->k_fa, i++, sizeof(cl_uint), &j.nbv2);
+            clSetKernelArg(h->k_fa, i++, sizeof(cl_uint), &j.n_kv_gpu); clSetKernelArg(h->k_fa, i++, sizeof(cl_uint), &j.span);
+            clSetKernelArg(h->k_fa, i++, sizeof(cl_uint), &j.nsplit);   clSetKernelArg(h->k_fa, i++, sizeof(cl_float), &j.scale);
+            clSetKernelArg(h->k_fa, i++, sizeof(cl_uint), &part_stride_f);
+            clSetKernelArgSVMPointer(h->k_fa, i++, ctl);
+            clSetKernelArg(h->k_fa, i++, sizeof(cl_uint), &j.want);
+            clSetKernelArg(h->k_fa, i++, sizeof(cl_uint), &a_max);
+            clSetKernelArg(h->k_fa, i++, sizeof(cl_uint), &n_groups);
+            size_t gsz[3] = { (size_t) j.D, (size_t) j.n_kv_heads, (size_t) j.nsplit }, lsz[3] = { (size_t) j.D, 1, 1 };
+            cl_int err = clEnqueueNDRangeKernel(h->q, h->k_fa, 3, nullptr, gsz, lsz, 0, nullptr, nullptr);
+            if (err != CL_SUCCESS) { GGML_LOG_ERROR("ggml-hex: hetero: enqueue fa failed (%d)\\n", err); }
+        }
+        clFlush(h->q);
+        const auto t_enq = std::chrono::steady_clock::now();
+
+        // 2. relay, in op order: HTP raises ready (rpcmem) -> copy Q into SVM, release the kernel ->
+        //    GPU sets done (SVM) -> copy partials into rpcmem, set the HTP's done word.
+        for (const auto & j : batch) {
+            uint32_t * ctl = hetero_svm_ctl(h, j.slot);
+            volatile uint32_t * ready = (volatile uint32_t *) (h->base + j.slot * HTP_FA_HETERO_SLOT_STRIDE);
+            volatile uint32_t * done  = (volatile uint32_t *) (h->base + j.done_off);
+            const auto t0 = std::chrono::steady_clock::now();
+            bool seen = false;
+            for (;;) {
+                hetero_dc_civac((const void *) ready, 4);
+                if (__atomic_load_n(ready, __ATOMIC_ACQUIRE) == j.want) { seen = true; break; }
+                if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(500)) break;
+            }
+            if (!seen) h->n_ready_timeouts++;
+            const auto t_ready = std::chrono::steady_clock::now();
+            // Q rows -> SVM (the HTP flushed them before raising ready; the CPU<->HTP path is IO-coherent)
+            float * qs = hetero_svm_q(h, j.slot);
+            for (uint32_t hh = 0; hh < j.n_heads; ++hh) {
+                memcpy(qs + (size_t) hh * j.D, j.q_host + (size_t) hh * j.nbq2, (size_t) j.D * sizeof(float));
+            }
+            __atomic_store_n(&ctl[0], j.want, __ATOMIC_SEQ_CST);   // release the kernel
+            // GPU done (SVM)
+            bool gdone = false;
+            for (;;) {
+                if (__atomic_load_n(&ctl[1], __ATOMIC_ACQUIRE) == j.want) { gdone = true; break; }
+                if (std::chrono::steady_clock::now() - t_ready > std::chrono::milliseconds(200)) break;
+            }
+            const auto t_gdone = std::chrono::steady_clock::now();
+            if (!gdone) h->n_gpu_timeouts++;
+            // partials SVM -> rpcmem, then the HTP's done word
+            uint8_t * dst = h->base + HTP_FA_HETERO_PARTS_OFF + (size_t) j.slot * HTP_FA_HETERO_PART_SLOT;
+            const size_t parts_bytes = (size_t) j.n_heads * j.nsplit * j.part_stride;
+            memcpy(dst, hetero_svm_parts(h, j.slot), parts_bytes);
+            hetero_dc_civac(dst, parts_bytes);
+            __atomic_store_n(done, j.want, __ATOMIC_SEQ_CST);
+            hetero_dc_civac((const void *) done, 4);
+            if (opt_verbose > 1 || (!seen || !gdone) ) {
+                const auto t_end = std::chrono::steady_clock::now();
+                GGML_LOG_DEBUG("ggml-hex: hetero relay: batch %llu slot %u want %u: ready %s after %.0f us; gpu %s %.0f us after release (spin %u); copy+publish %.0f us\n",
+                               (unsigned long long) h->n_batches, j.slot, j.want, seen ? "seen" : "TIMEOUT",
+                               std::chrono::duration<double, std::micro>(t_ready - t0).count(), gdone ? "done" : "TIMEOUT",
+                               std::chrono::duration<double, std::micro>(t_gdone - t_ready).count(), __atomic_load_n(&ctl[3], __ATOMIC_ACQUIRE),
+                               std::chrono::duration<double, std::micro>(t_end - t_gdone).count());
+            }
+        }
+        if (opt_verbose) {
+            hetero_dc_civac(h->base + HTP_FA_HETERO_STATUS_OFF, 64);
+            const uint32_t dsp_to = *(volatile uint32_t *) (h->base + HTP_FA_HETERO_STATUS_OFF);
+            GGML_LOG_DEBUG("ggml-hex: hetero relay: batch %llu: %zu jobs in %.0f us (enqueue %.0f us); ready timeouts %llu, GPU done timeouts %llu, DSP done timeouts %u so far\n",
+                           (unsigned long long) h->n_batches, batch.size(),
+                           std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t_batch0).count(),
+                           std::chrono::duration<double, std::micro>(t_enq - t_batch0).count(),
+                           (unsigned long long) h->n_ready_timeouts, (unsigned long long) h->n_gpu_timeouts, dsp_to);
+        }
+        h->n_batches++;
+        h->n_jobs += batch.size();
+    }
+}
+
+static void ggml_hexagon_hetero_free(ggml_hexagon_session * sess) {
+    ggml_hexagon_hetero * h = sess->hetero;
+    if (!h) return;
+    {
+        std::lock_guard<std::mutex> lk(h->mu);
+        h->stop = true;
+    }
+    h->cv.notify_one();
+    if (h->relay.joinable()) h->relay.join();
+    if (h->q) clFinish(h->q);
+    uint32_t dsp_timeouts = 0;
+    if (h->base) {
+        hetero_dc_civac(h->base + HTP_FA_HETERO_STATUS_OFF, 64);
+        dsp_timeouts = *(volatile uint32_t *) (h->base + HTP_FA_HETERO_STATUS_OFF);
+    }
+    GGML_LOG_INFO("ggml-hex: %s hetero: %llu graphs, %llu GPU jobs, ready timeouts %llu, GPU done timeouts %llu, DSP done timeouts %u\n",
+                  sess->c_name(), (unsigned long long) h->n_batches, (unsigned long long) h->n_jobs,
+                  (unsigned long long) h->n_ready_timeouts, (unsigned long long) h->n_gpu_timeouts, dsp_timeouts);
+    for (auto & kv : h->aliases) clReleaseMemObject(kv.second);
+    if (h->svm) clSVMFree(h->ctx, h->svm);
+    if (h->k_fa) clReleaseKernel(h->k_fa);
+    if (h->prog) clReleaseProgram(h->prog);
+    if (h->q) clReleaseCommandQueue(h->q);
+    if (h->ctx) clReleaseContext(h->ctx);
+    if (h->tctx) ggml_free(h->tctx);
+    if (h->buf) ggml_backend_buffer_free(h->buf);
+    delete h;
+    sess->hetero = nullptr;
+}
+
+#endif // GGML_HEXAGON_HETERO
+
 static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
     switch (t->op) {
         case GGML_OP_FLASH_ATTN_EXT:  return HTP_OP_FLASH_ATTN_EXT;
@@ -4075,6 +4631,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         nodes_ptr = &sess->cached_graph.htp_nodes;
     } else {
         computed_nodes.reserve(graph->n_nodes);
+        int hetero_slot = 0;
 
         // Fuse and finalize
         for (int i = 0; i < graph->n_nodes; ++i) {
@@ -4099,6 +4656,17 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                     node.node,
                     (struct htp_fa_kernel_params *)node.kernel_params
                 );
+#ifdef GGML_HEXAGON_HETERO
+                if (opt_hetero_frac > 0.0f) {
+                    if (!sess->hetero && !ggml_hexagon_hetero_init(sess)) {
+                        GGML_LOG_WARN("ggml-hex: hetero decode attention disabled (init failed)\n");
+                        opt_hetero_frac = 0.0f;
+                    }
+                    if (sess->hetero && ggml_hexagon_hetero_prepare(sess, n, (const struct htp_fa_kernel_params *) node.kernel_params, hetero_slot)) {
+                        hetero_slot++;
+                    }
+                }
+#endif
             } else if (htp_op_is_unary(node.opcode)) {
                 auto inputs = node.get_inputs();
                 const struct ggml_tensor * src0 = inputs[0];
@@ -4119,6 +4687,12 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
             nodes_ptr = &computed_nodes;
         }
     }
+
+#ifdef GGML_HEXAGON_HETERO
+    if (sess->hetero) {
+        ggml_hexagon_hetero_post(sess, *nodes_ptr);
+    }
+#endif
 
     // Queue and execute
     if (opt_opstage & HTP_OPSTAGE_QUEUE) {
@@ -4821,6 +5395,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_fa_decode = getenv("GGML_HEXAGON_FA_DECODE");
     const char * str_fa_sparse = getenv("GGML_HEXAGON_FA_SPARSE");
     const char * str_sync_probe = getenv("GGML_HEXAGON_SYNC_PROBE");
+    const char * str_hetero_frac = getenv("GGML_HEXAGON_HETERO_FRAC");
+    const char * str_hetero_span = getenv("GGML_HEXAGON_HETERO_SPAN");
+    const char * str_hetero_cpu  = getenv("GGML_HEXAGON_HETERO_CPU");
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
     const char * str_vmem     = getenv("GGML_HEXAGON_VMEM");
@@ -4878,6 +5455,15 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_lm_head   = str_lm_head   ? atoi(str_lm_head)                     : opt_lm_head;
     opt_fa_decode = str_fa_decode ? atoi(str_fa_decode)                   : opt_fa_decode;
     opt_sync_probe = str_sync_probe ? atoi(str_sync_probe)                  : opt_sync_probe;
+    opt_hetero_frac = str_hetero_frac ? strtof(str_hetero_frac, nullptr)     : opt_hetero_frac;
+    opt_hetero_span = str_hetero_span ? atoi(str_hetero_span)                : opt_hetero_span;
+    opt_hetero_cpu  = str_hetero_cpu  ? atoi(str_hetero_cpu)                 : opt_hetero_cpu;
+#ifndef GGML_HEXAGON_HETERO
+    if (opt_hetero_frac > 0.0f) {
+        GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_HETERO_FRAC set but the backend was built without OpenCL; ignored\n");
+        opt_hetero_frac = 0.0f;
+    }
+#endif
     opt_ndev      = str_ndev     ? strtoul(str_ndev, NULL, 0)             : opt_ndev;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf)                      : opt_hostbuf;
     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;

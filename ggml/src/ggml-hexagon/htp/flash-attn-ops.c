@@ -96,6 +96,9 @@ struct htp_fa_context {
     uint32_t  dec_n_mseg;      // mask segments per block: n_tokens (broadcast mask) or R
     size_t    dec_stride_part; // bytes per (row, split) partial: 128 (M, S) + size_vkq_acc
     uint8_t * dec_partials;    // shared VTCM: [rows_total][n_split] partials
+    uint32_t  dec_b_base;      // first KV block this op computes (hetero: the GPU owns [0, dec_b_base))
+    uint32_t  het_gpu_nsplit;  // hetero: GPU partials per row appended to the merge (0 = none)
+    const uint8_t * het_parts; // hetero: GPU partials in DDR, [row][gpu_split] x dec_stride_part
 
     uint64_t t_start;
 };
@@ -3099,7 +3102,7 @@ static void flash_attn_ext_f16_dec_thread(unsigned int nth, unsigned int ith, vo
         const uint32_t kvh = rem / n_split;
         const uint32_t sp  = rem - kvh * n_split;
 
-        const uint32_t b0 = sp * bps;
+        const uint32_t b0 = factx->dec_b_base + sp * bps;
         const uint32_t b1 = (b0 + bps < factx->n_blocks) ? b0 + bps : factx->n_blocks;
 
         // Row r = t*G + g of this unit is query row (iq1 = t, iq2 = kvh*G + g), i.e. global
@@ -3324,9 +3327,13 @@ static void flash_attn_ext_f16_merge_thread(unsigned int nth, unsigned int ith, 
 
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_O_PROC, row);
 
+        // Partials sp < n_split are the HVX units' (VTCM); the rest are the GPU's (DDR, hetero).
+        const uint32_t n_all = n_split + factx->het_gpu_nsplit;
+        #define HVX_FA_PART(sp) ((sp) < n_split ? (const uint8_t *) hvx_fa_dec_partial(factx, row, (sp)) \
+                                                : factx->het_parts + ((size_t) row * factx->het_gpu_nsplit + ((sp) - n_split)) * factx->dec_stride_part)
         float M = HTP_FA_M_INITIAL_VAL;
-        for (uint32_t sp = 0; sp < n_split; ++sp) {
-            const float m = ((const float *) hvx_fa_dec_partial(factx, row, sp))[0];
+        for (uint32_t sp = 0; sp < n_all; ++sp) {
+            const float m = ((const float *) HVX_FA_PART(sp))[0];
             M = (m > M) ? m : M;
         }
 
@@ -3336,8 +3343,8 @@ static void flash_attn_ext_f16_merge_thread(unsigned int nth, unsigned int ith, 
         const uint32_t nvec_acc = factx->size_vkq_acc / sizeof(HVX_Vector);
         float S = 0.0f;
         hvx_splat_f32_a(acc, 0.0f, factx->size_vkq_acc / sizeof(float));
-        for (uint32_t sp = 0; sp < n_split; ++sp) {
-            const uint8_t * part = hvx_fa_dec_partial(factx, row, sp);
+        for (uint32_t sp = 0; sp < n_all; ++sp) {
+            const uint8_t * part = HVX_FA_PART(sp);
             const float m_s = ((const float *) part)[0];
             const float s_s = ((const float *) part)[1];
             // An empty split carries M = HTP_FA_M_INITIAL_VAL; its weight must be exactly 0
@@ -3380,6 +3387,7 @@ static void flash_attn_ext_f16_merge_thread(unsigned int nth, unsigned int ith, 
             hvx_copy_f16_f32_ua(dst_ptr, (const uint8_t *) acc, DV);
         }
         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_O_PROC, row);
+        #undef HVX_FA_PART
     }
 }
 
@@ -3490,6 +3498,25 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     bool dec = kparams->u.hvx.split_kv != 0 && G > 0 && R >= 1 && R <= HVX_FA_DEC_R_MAX &&
                v->ne[2] == nek2 && factx.n_blocks > 0;
 
+    // Heterogeneous split: the host tagged this node and attached the control buffer as src[7].
+    // The GPU computes KV blocks [0, het_gpu_blocks) and writes its partials into the buffer.
+    uint32_t het_gpu_blocks = 0, het_slot = 0, het_nsplit = 0;
+    uint8_t * het_base = NULL;
+    if (dec && octx->src[7] && octx->src[7]->data && octx->op_params[HTP_FA_HETERO_OPP_GPU_BLOCKS] > 0 && neq1 == 1 && neq3 == 1) {
+        het_gpu_blocks = (uint32_t) octx->op_params[HTP_FA_HETERO_OPP_GPU_BLOCKS];
+        het_slot       = (uint32_t) octx->op_params[HTP_FA_HETERO_OPP_SLOT];
+        het_nsplit     = (uint32_t) octx->op_params[HTP_FA_HETERO_OPP_GPU_NSPLIT];
+        if (het_gpu_blocks < factx.n_blocks && het_nsplit > 0 && het_slot < HTP_FA_HETERO_MAX_SLOTS) {
+            het_base = (uint8_t *) (uintptr_t) octx->src[7]->data;
+        } else {
+            het_gpu_blocks = 0;
+        }
+    }
+    factx.dec_b_base     = het_gpu_blocks;
+    factx.het_gpu_nsplit = 0;
+    factx.het_parts      = NULL;
+    const uint32_t n_blocks_htp = factx.n_blocks - het_gpu_blocks;
+
     if (dec) {
         const uint32_t rows_total = neq1 * neq2 * neq3;
         // The dec thread accumulates P*V without shuffling V, so its accumulator is the
@@ -3500,9 +3527,9 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
         factx.dec_R      = R;
         factx.dec_n_mseg = (mask && mask->ne[2] != 1) ? R : neq1;
         factx.dec_stride_part = HVX_FA_DEC_PART_HDR + size_vkq_acc;
-        factx.dec_n_split = hvx_fa_dec_pick_split(neq3 * nek2, factx.n_blocks, octx->n_threads, 8);
+        factx.dec_n_split = hvx_fa_dec_pick_split(neq3 * nek2, n_blocks_htp, octx->n_threads, 8);
         for (;;) {
-            factx.dec_bps     = (factx.n_blocks + factx.dec_n_split - 1) / factx.dec_n_split;
+            factx.dec_bps     = (n_blocks_htp + factx.dec_n_split - 1) / factx.dec_n_split;
             factx.dec_n_units = neq3 * nek2 * factx.dec_n_split;
             vtcm_cur = octx->ctx->vtcm_base;
             factx.spad_q = vtcm_seq_alloc(&vtcm_cur, size_q_block * R * octx->n_threads);
@@ -3525,7 +3552,55 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
 
     if (dec) {
         if (!(octx->flags & HTP_OPFLAGS_SKIP_COMPUTE)) {
-            work_queue_run(octx->ctx->work_queue, flash_attn_ext_f16_dec_thread,   &factx, octx->n_threads);
+            uint32_t het_seq = 0;
+            if (het_base) {
+                // Q was flushed by the batch's per-op dirty-range flush; flush again explicitly so the
+                // GPU reads are never a stale-line question, then publish this op's sequence number.
+                const size_t q_row_bytes = q->ne[0] * ((q->type == HTP_TYPE_F32) ? 4 : 2);
+                for (uint32_t h = 0; h < neq2; ++h) {
+                    hex_l2flush((uint8_t *) (uintptr_t) q->data + h * q->nb[2], q_row_bytes);
+                }
+                volatile uint32_t * ready = (volatile uint32_t *) (het_base + het_slot * HTP_FA_HETERO_SLOT_STRIDE);
+                Q6_dcinva_A((void *) ready);
+                het_seq = *ready + 1;
+                *ready  = het_seq;
+                qurt_mem_cache_clean((qurt_addr_t) ready, sizeof(uint32_t), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+            }
+
+            work_queue_run(octx->ctx->work_queue, flash_attn_ext_f16_dec_thread, &factx, octx->n_threads);
+
+            if (het_base) {
+                volatile uint32_t * done = (volatile uint32_t *) (het_base + het_slot * HTP_FA_HETERO_SLOT_STRIDE + 128);
+                const uint64_t t0 = HAP_perf_get_qtimer_count();
+                const uint64_t timeout = (uint64_t) HTP_FA_HETERO_DONE_TIMEOUT_US * 192ull / 10ull;
+                bool ok = true;
+                for (;;) {
+                    Q6_dcinva_A((void *) done);
+                    if (*done == het_seq) break;
+                    if (HAP_perf_get_qtimer_count() - t0 > timeout) { ok = false; break; }
+                }
+                if (ok) {
+                    const uint8_t * parts = het_base + HTP_FA_HETERO_PARTS_OFF + (size_t) het_slot * HTP_FA_HETERO_PART_SLOT;
+                    const size_t parts_bytes = (size_t) neq1 * neq2 * neq3 * het_nsplit * factx.dec_stride_part;
+                    for (size_t off = 0; off < parts_bytes; off += HEX_L2_LINE_SIZE) {
+                        Q6_dcinva_A((void *) (parts + off));
+                    }
+                    factx.het_parts      = parts;
+                    factx.het_gpu_nsplit = het_nsplit;
+                } else {
+                    // Late GPU: merge the HTP partials only (wrong result, no hang) and count it.
+                    volatile uint32_t * st = (volatile uint32_t *) (het_base + HTP_FA_HETERO_STATUS_OFF);
+                    Q6_dcinva_A((void *) st);
+                    st[0] = st[0] + 1;
+                    Q6_dcinva_A((void *) done);
+                    st[1] = *done;      // what the DSP last saw at the done word
+                    st[2] = het_seq;    // what it wanted
+                    st[3] = het_slot;
+                    qurt_mem_cache_clean((qurt_addr_t) st, 16, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+                    FARF(ERROR, "hetero fa: slot %u seq %u: GPU done not seen within %u us", het_slot, het_seq, (unsigned) HTP_FA_HETERO_DONE_TIMEOUT_US);
+                }
+            }
+
             work_queue_run(octx->ctx->work_queue, flash_attn_ext_f16_merge_thread, &factx, octx->n_threads);
         }
         return HTP_STATUS_OK;
