@@ -705,6 +705,139 @@ owns a big core, but at the process level the scheduler's default spread wins. S
 constant is not something process-level pinning fixes; a gain would need thread-level affinity
 for the dispatch thread only, which is a separate change and not pursued here.
 
+## 4i. Built: the integration prototype (`GGML_HEXAGON_HETERO_FRAC`)
+
+The split of Sections 4g-4h wired into the real decode path, as a research prototype behind an
+environment variable. Numerically correct against a CPU reference and faster on the real model at
+every depth measured; several of the mechanisms it needed were not the ones the component
+measurements suggested, and they are the findings of this section.
+
+### What it is
+
+- **HTP side** (`flash-attn-ops.c`, split-KV dec path): a tagged decode `FLASH_ATTN_EXT` reads
+  `op_params[8..10]` (GPU blocks, control slot, GPU splits) and a control buffer attached as
+  `src[7]` (`HTP_OP_MAX_INPUTS` is 8 now). It flushes Q, bumps its slot's ready sequence,
+  computes KV blocks `[gpu_blocks, n)`, polls the slot's done sequence with `dcinva` (50 ms
+  timeout, then it merges what it has and counts the miss), invalidates the GPU partials and
+  merges them as extra splits of the existing merge.
+- **Host side** (`ggml-hexagon.cpp`, compiled in when OpenCL is available): one 8 MB rpcmem
+  control buffer per session; a fine-grain SVM block; ION aliases of the KV-cache and compute
+  buffers (by fd); the GQA decode kernel of Section 4h; a relay thread pinned to a big core. Per
+  `graph_compute` it tags eligible FA nodes (decode shape, D 64/128, HVX split-KV path, no sinks
+  or sparse selection), pre-enqueues one kernel per tagged node, and for each in order: waits for
+  the HTP's ready word, copies Q into SVM, releases the kernel through SVM, waits for the GPU's
+  done word in SVM, copies the partials into the control buffer, sets the HTP's done word.
+- **Share control** (`GGML_HEXAGON_HETERO_ADAPT`, default on): the HTP op records how long it
+  waited for `done`; the relay moves that layer's GPU share per token toward a few microseconds
+  of wait (see below).
+- Tools: `llama-hetero-decode-attn --integrated` drives this path on a synthetic FA op and checks
+  it against the CPU reference; `llama-completion`/`llama-bench` with `-dev HTP0` run it on the
+  model.
+
+### Findings that changed the design
+
+1. **Writes through the ION alias are not visible per kernel inside an in-order chain.** With 28
+   kernels pre-enqueued, a kernel's stores to the aliased rpcmem buffer (partials, done flag)
+   reached memory only at the driver's command-buffer boundaries -- every fourth layer in
+   practice -- while the kernels themselves executed promptly (the next kernel's spin count
+   showed it). The single-kernel probes of Section 4g could not see this. Fine-grain SVM writes
+   are visible immediately (the probe's mid-kernel `alive` store), so the GPU now writes Q-in,
+   partials and done through SVM and the host relay copies ~60 KB per layer into rpcmem for the
+   HTP: 4-13 us per layer.
+2. **A GPU kernel that spins longer than the KGSL hang watchdog kills the context.** The first
+   version spun unbounded; one missed release faulted the context (`gpu timeout ctx ... ts 1`),
+   after which nothing GPU-side completes and the process becomes unkillable in the driver. The
+   spin is now capped (~85 ms), so a missed release degrades one layer instead of the device.
+3. **`clSVMAlloc` with a 4096-byte alignment argument fails on this driver** (default alignment
+   works); the failure was silent apart from a WARN, and hetero simply never engaged in two runs.
+4. **llama's default device split puts layers on the OpenCL GPU.** With both `HTP0` and
+   `GPUOpenCL` registered, `-ngl 99` without `-dev HTP0` assigned layers 0-8 to the OpenCL backend
+   in the 4k runs. Every all-on-HTP number needs `-dev HTP0`; this morning's default
+   `llama-bench` runs (13.3 t/s at d4096) were mixed-device -- pinned to HTP0 the same
+   configuration gives 20.2 t/s. The big-core taskset A/B redone with `-dev HTP0` still loses
+   (12.1 vs 20.4 t/s), so the 4h correction stands.
+5. **The device throttles after ~30-60 min of sustained runs**: the standalone bench went from
+   847 to 1777 us (GPU alone) and 1079 to 3260 us (HTP) at 16k, and back after cooling. Perf
+   numbers from that window were discarded; the final table alternates arms back to back.
+6. **Common-tool logging hides the backend.** `llama-completion`, `llama-perplexity` and
+   `llama-bench` drop ggml INFO/DEBUG lines unless `-v`; and without an explicit `-ngl`,
+   `common_fit_params` offloads nothing to HTP0 ("did not report memory"), so a run can silently
+   be CPU-only. Both cost a debugging round each.
+
+### Correctness
+
+| check | result |
+|---|---|
+| `--integrated`, backend hetero path vs CPU reference, share 0.5, kv 1024 / 4096 / 8192 | max abs err 1.6e-5 / 9.6e-6 / 7.8e-6 (HTP-only: 1.7e-5) |
+| same, share 0.25, kv 4096 | 1.3e-5 |
+| `llama-perplexity -b 1` (every token through the decode path), docs corpus, c=1024, 2 chunks | CPU 15.720 / 12.542; HTP-only 15.703 / 12.548; split 0.25: 15.808 / 12.597; 0.5: 15.787 / 12.638; 0.75: 15.525 / 12.460 |
+| handshake counters over 47 tokens x 28 layers | 0 ready timeouts, 0 GPU timeouts, 0 DSP timeouts |
+
+The perplexity moves +-1% and non-monotonically with the share (the 0.75 arm is better than the
+CPU reference), which is the perturbation signature of a different but correct attention
+(f32 exp on the GPU part, f16 on the HTP part), not of a defect; the direct comparison settles
+it at the 1e-5 level. Greedy continuations diverge after ~10 identical tokens for the same
+reason.
+
+### Performance on the model (`llama-bench`, `-dev HTP0`, Qwen3-1.7B Q4_0)
+
+Cool device (45-70 C during the runs), arms alternated back to back, first run after an idle
+period discarded (it is a DVFS ramp for both arms: 8.5 and 13.4 t/s at d16384/d8192 with the
+split off):
+
+| depth | HTP only | split, fixed share 0.5 | gain |
+|--:|--:|--:|--:|
+| d4096  (tg64) | 20.2-20.3 t/s | 22.6-23.0 t/s | **1.12x** |
+| d8192  (tg64) | 15.38 t/s     | 18.90 t/s     | **1.23x** |
+| d16384 (tg32) | 10.52 t/s     | 13.50 t/s     | **1.28x** |
+
+These are the token-level numbers the component measurements projected (Section 4h: ~1.28x
+at 4k was an over-estimate because it used the pre-4f-bis HTP baseline; the per-layer wall
+halves, and attention's share of the token grows with depth, hence the trend). Hot device
+(70-80 C, GPU throttled, HTP not): d4096 1.11x, d8192 1.00x, d16384 0.98x with the same fixed
+share -- see below.
+
+### The fixed share is fragile; the HTP's wait time is the control signal
+
+A fixed 0.5 share balanced the two engines only in the thermal state it was chosen for. When the
+GPU throttles (70-80 C after ~30 min of runs; the HTP does not, its DCVS corners are pinned), the
+GPU side becomes the long pole and the HTP idles waiting for `done`: the 1.23x at d8192 measured
+cool dropped to 1.00x hot, and d16384 went slightly negative. The prototype therefore feeds back:
+the HTP op writes how long it waited for `done` into its slot (`+8`), and the relay moves that
+layer's GPU share one 64-key block per token -- shrink if the wait exceeded 40 us, grow if it was
+under 5 us (`GGML_HEXAGON_HETERO_ADAPT=1`, default). Each layer converges on its own to a few
+microseconds of wait, so a throttled GPU degrades toward HTP-only performance instead of below
+it, and a cool GPU takes what it can.
+
+Hot device (72-84 C, after ~10 min of back-to-back benchmarks; each arm twice, alternated):
+
+| depth | HTP only | fixed share 0.5 | adaptive share (start 0.5) |
+|--:|--:|--:|--:|
+| d8192  (tg64) | 15.37 t/s | 15.40 t/s (1.00x) | 18.16-18.40 t/s (**1.18-1.20x**) |
+| d16384 (tg32) | 10.59-10.67 t/s | 10.65 t/s (1.00x) | 11.52-12.78 t/s (**1.09-1.20x**, includes the convergence tokens) |
+
+Convergence trace at d16384, hot: GPU blocks 128 -> 105 -> 89 -> ~60 of 260 over batches 1-5,
+the HTP's average wait for the GPU 1206 -> 918 -> 510 -> 14 us, then 0-8 us for the rest of the
+run; the per-token attention span drops from 81 to 62 ms. Steps are proportional to the wait
+(`wait_us / 17` blocks, capped at 16, since an HTP block costs ~8.5 us) so a cold start from 0.5
+settles in ~5 tokens; growth is one block per token. When the GPU is cool the controller lands
+within ~2% of the best fixed share (d8192: 18.4 vs 18.8 t/s), so the cost of the feedback is
+small and the protection is worth it: the split is never slower than HTP-only by more than the
+convergence transient.
+
+### Status and what is left
+
+The prototype is complete as a research result: a correct, self-balancing HTP+GPU decode
+attention on the real model, 1.12x/1.23x/1.28x at 4k/8k/16k when the GPU is unthrottled and
+~1.2x at depth when it is. It is not mergeable as is: it links OpenCL into the hexagon backend,
+mutates the FA node's `op_params`/`src[7]` from the backend, and carries a per-layer spinning GPU
+kernel (~1 ms of GPU occupancy per layer, pure power). Left open: the GPU kernel under
+contention (26-31 GB/s) is now the long pole at every depth -- a faster decode kernel (half8 V
+loads, fewer lanes per row) would move the balance point and the gain; the Section 4f-bis DMA
+pattern on the HTP side would do the same from the other end; and the share controller could
+use the GPU's own done latency as a second signal instead of only the HTP's wait.
+
+
 ## 5. What would change the answer
 
 - **Events in both backends.** OpenCL already uses `cl_event` throughout (its `synchronize` is a

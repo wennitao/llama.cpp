@@ -3579,6 +3579,12 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
                     if (*done == het_seq) break;
                     if (HAP_perf_get_qtimer_count() - t0 > timeout) { ok = false; break; }
                 }
+                // Feedback for the host's share controller: how long this op idled waiting for the GPU.
+                {
+                    volatile uint32_t * wait_w = (volatile uint32_t *) (het_base + het_slot * HTP_FA_HETERO_SLOT_STRIDE + 8);
+                    *wait_w = (uint32_t) ((HAP_perf_get_qtimer_count() - t0) * 10ull / 192ull);
+                    qurt_mem_cache_clean((qurt_addr_t) wait_w, sizeof(uint32_t), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+                }
                 if (ok) {
                     const uint8_t * parts = het_base + HTP_FA_HETERO_PARTS_OFF + (size_t) het_slot * HTP_FA_HETERO_PART_SLOT;
                     const size_t parts_bytes = (size_t) neq1 * neq2 * neq3 * het_nsplit * factx.dec_stride_part;

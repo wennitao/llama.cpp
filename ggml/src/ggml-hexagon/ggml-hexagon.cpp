@@ -93,6 +93,10 @@ static int    opt_sync_probe = 0;
 static float  opt_hetero_frac = 0.0f;
 static int    opt_hetero_span = 512;   // KV keys per GPU work-group
 static int    opt_hetero_cpu  = 7;     // relay thread affinity (-1 = none)
+// Feedback control of each layer's GPU share (GGML_HEXAGON_HETERO_ADAPT=1, default on): the HTP
+// reports how long it idled waiting for the GPU; the relay moves the share one 64-key block per
+// token toward a few microseconds of wait. Keeps the split useful when the GPU throttles.
+static int    opt_hetero_adapt = 1;
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
@@ -3873,6 +3877,7 @@ __kernel void fa_dec_gqa(__global const float * q_svm,
 
 struct ggml_hexagon_hetero_job {
     const ggml_tensor * node = nullptr;
+    uint32_t n_blocks = 0, gpu_blocks = 0;   // KV blocks total / owned by the GPU (adapted per token)
     uint32_t slot = 0, want = 0;
     cl_mem q = nullptr, k = nullptr, v = nullptr, m = nullptr;
     uint32_t q_off = 0, k_off = 0, v_off = 0, m_off = 0, has_mask = 0, p_off = 0;
@@ -4087,6 +4092,7 @@ static bool ggml_hexagon_hetero_prepare(ggml_hexagon_session * sess, ggml_tensor
     job.nbq2 = (uint32_t) q->nb[2]; job.nbk1 = (uint32_t) k->nb[1]; job.nbk2 = (uint32_t) k->nb[2];
     job.nbv1 = (uint32_t) v->nb[1]; job.nbv2 = (uint32_t) v->nb[2];
     job.n_kv_gpu = gpu_kv; job.span = (uint32_t) opt_hetero_span; job.nsplit = nsplit; job.part_stride = part_stride;
+    job.n_blocks = n_blocks; job.gpu_blocks = gpu_blocks;
     job.done_off = (uint32_t) slot * HTP_FA_HETERO_SLOT_STRIDE + 128;
     job.n_kv_heads = (uint32_t) nek2; job.D = (uint32_t) DK; job.n_heads = (uint32_t) neq2;
     job.q_host = (const uint8_t *) q->data;
@@ -4108,17 +4114,17 @@ static bool ggml_hexagon_hetero_prepare(ggml_hexagon_session * sess, ggml_tensor
 static void ggml_hexagon_hetero_post(ggml_hexagon_session * sess, const std::vector<htp_opnode> & nodes) {
     ggml_hexagon_hetero * h = sess->hetero;
     std::vector<ggml_hexagon_hetero_job> batch;
-    for (const auto & node : nodes) {
-        if (node.opcode != HTP_OP_FLASH_ATTN_EXT || node.node->op_params[HTP_FA_HETERO_OPP_GPU_BLOCKS] <= 0) continue;
-        auto it = h->jobs.find(node.node);
-        if (it == h->jobs.end()) continue;
-        ggml_hexagon_hetero_job job = it->second;
-        job.want = ++h->seq[job.slot];
-        batch.push_back(job);
-    }
-    if (batch.empty()) return;
     {
         std::lock_guard<std::mutex> lk(h->mu);
+        for (const auto & node : nodes) {
+            if (node.opcode != HTP_OP_FLASH_ATTN_EXT || node.node->op_params[HTP_FA_HETERO_OPP_GPU_BLOCKS] <= 0) continue;
+            auto it = h->jobs.find(node.node);
+            if (it == h->jobs.end()) continue;
+            ggml_hexagon_hetero_job job = it->second;
+            job.want = ++h->seq[job.slot];
+            batch.push_back(job);
+        }
+        if (batch.empty()) return;
         h->batches.push_back(std::move(batch));
     }
     h->cv.notify_one();
@@ -4208,6 +4214,37 @@ static void ggml_hexagon_hetero_relay_main(ggml_hexagon_hetero * h) {
             hetero_dc_civac(dst, parts_bytes);
             __atomic_store_n(done, j.want, __ATOMIC_SEQ_CST);
             hetero_dc_civac((const void *) done, 4);
+            if (opt_hetero_adapt && seen && gdone) {
+                // The HTP wrote how long it waited for the previous token's done (this token's value
+                // is not there yet). Move the share one block toward a small positive wait.
+                volatile uint32_t * wait_w = (volatile uint32_t *) (h->base + j.slot * HTP_FA_HETERO_SLOT_STRIDE + 8);
+                hetero_dc_civac((const void *) wait_w, 4);
+                const uint32_t wait_us = __atomic_load_n(wait_w, __ATOMIC_ACQUIRE);
+                std::lock_guard<std::mutex> lk(h->mu);
+                auto it = h->jobs.find(j.node);
+                if (it != h->jobs.end()) {
+                    ggml_hexagon_hetero_job & jj = it->second;
+                    uint32_t gb = jj.gpu_blocks;
+                    if (wait_us > 40) {
+                        // GPU late by wait_us; an HTP block costs ~8.5 us, so moving wait/17 blocks
+                        // roughly halves the imbalance per token. Converges in a handful of tokens.
+                        uint32_t step = std::min<uint32_t>(std::max<uint32_t>(1, wait_us / 17), 16);
+                        gb = (gb > step + 2) ? gb - step : 2;
+                    } else if (wait_us < 5 && gb + 2 < jj.n_blocks) {
+                        gb += 1;                                                     // GPU early: grow slowly
+                    }
+                    if (gb != jj.gpu_blocks) {
+                        const uint32_t gpu_kv = gb * 64;
+                        const uint32_t nsplit = (gpu_kv + jj.span - 1) / jj.span;
+                        if ((size_t) jj.n_heads * nsplit * jj.part_stride <= HTP_FA_HETERO_PART_SLOT) {
+                            jj.gpu_blocks = gb; jj.n_kv_gpu = gpu_kv; jj.nsplit = nsplit;
+                            ggml_tensor * n = const_cast<ggml_tensor *>(jj.node);
+                            n->op_params[HTP_FA_HETERO_OPP_GPU_BLOCKS] = (int32_t) gb;
+                            n->op_params[HTP_FA_HETERO_OPP_GPU_NSPLIT] = (int32_t) nsplit;
+                        }
+                    }
+                }
+            }
             if (opt_verbose > 1 || (!seen || !gdone) ) {
                 const auto t_end = std::chrono::steady_clock::now();
                 GGML_LOG_DEBUG("ggml-hex: hetero relay: batch %llu slot %u want %u: ready %s after %.0f us; gpu %s %.0f us after release (spin %u); copy+publish %.0f us\n",
@@ -4220,10 +4257,22 @@ static void ggml_hexagon_hetero_relay_main(ggml_hexagon_hetero * h) {
         if (opt_verbose) {
             hetero_dc_civac(h->base + HTP_FA_HETERO_STATUS_OFF, 64);
             const uint32_t dsp_to = *(volatile uint32_t *) (h->base + HTP_FA_HETERO_STATUS_OFF);
-            GGML_LOG_DEBUG("ggml-hex: hetero relay: batch %llu: %zu jobs in %.0f us (enqueue %.0f us); ready timeouts %llu, GPU done timeouts %llu, DSP done timeouts %u so far\n",
+            uint32_t gb_min = ~0u, gb_max = 0, wait_sum = 0;
+            {
+                std::lock_guard<std::mutex> lk(h->mu);
+                for (const auto & j : batch) {
+                    auto it = h->jobs.find(j.node);
+                    if (it != h->jobs.end()) { gb_min = std::min(gb_min, it->second.gpu_blocks); gb_max = std::max(gb_max, it->second.gpu_blocks); }
+                    volatile uint32_t * wait_w = (volatile uint32_t *) (h->base + j.slot * HTP_FA_HETERO_SLOT_STRIDE + 8);
+                    hetero_dc_civac((const void *) wait_w, 4);
+                    wait_sum += __atomic_load_n(wait_w, __ATOMIC_ACQUIRE);
+                }
+            }
+            GGML_LOG_DEBUG("ggml-hex: hetero relay: batch %llu: %zu jobs in %.0f us (enqueue %.0f us); GPU blocks %u..%u of %u; HTP wait for GPU avg %u us; ready/GPU/DSP timeouts %llu/%llu/%u\n",
                            (unsigned long long) h->n_batches, batch.size(),
                            std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t_batch0).count(),
                            std::chrono::duration<double, std::micro>(t_enq - t_batch0).count(),
+                           gb_min, gb_max, batch.empty() ? 0u : batch[0].n_blocks, batch.empty() ? 0u : wait_sum / (uint32_t) batch.size(),
                            (unsigned long long) h->n_ready_timeouts, (unsigned long long) h->n_gpu_timeouts, dsp_to);
         }
         h->n_batches++;
@@ -5398,6 +5447,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_hetero_frac = getenv("GGML_HEXAGON_HETERO_FRAC");
     const char * str_hetero_span = getenv("GGML_HEXAGON_HETERO_SPAN");
     const char * str_hetero_cpu  = getenv("GGML_HEXAGON_HETERO_CPU");
+    const char * str_hetero_adapt = getenv("GGML_HEXAGON_HETERO_ADAPT");
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
     const char * str_vmem     = getenv("GGML_HEXAGON_VMEM");
@@ -5458,6 +5508,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_hetero_frac = str_hetero_frac ? strtof(str_hetero_frac, nullptr)     : opt_hetero_frac;
     opt_hetero_span = str_hetero_span ? atoi(str_hetero_span)                : opt_hetero_span;
     opt_hetero_cpu  = str_hetero_cpu  ? atoi(str_hetero_cpu)                 : opt_hetero_cpu;
+    opt_hetero_adapt = str_hetero_adapt ? atoi(str_hetero_adapt)             : opt_hetero_adapt;
 #ifndef GGML_HEXAGON_HETERO
     if (opt_hetero_frac > 0.0f) {
         GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_HETERO_FRAC set but the backend was built without OpenCL; ignored\n");
