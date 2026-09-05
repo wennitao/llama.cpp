@@ -864,3 +864,10 @@ use the GPU's own done latency as a second signal instead of only the HTP's wait
   documented fallback, but it means a split never runs the sparse kernel on the GPU side.
 - The QDC device reprovisions on reboot and clears `/data/local/tmp`; rebuild-and-push is the
   recovery, everything is reproducible from `build-sparse`.
+- `test-backend-ops -o MUL_MAT` on HTP0 scores 486/556 on this device with or without the hetero
+  changes (checked with a consistent pre-hetero host+HTP pair): the failures are quantized `o=1`
+  cases where the CPU reference itself is NaN. Pre-existing; not a regression signal.
+- Host library and HTP skeleton must be pushed as a pair: the op descriptor grew from 7 to 8
+  inputs, and a mismatched pair crashes the DSP (`dspqueue_read failed 0x2e`) on the first batch.
+- Pass `-dev HTP0` to every llama tool, `-ngl 99` to `llama-perplexity`, `-v` to see backend
+  logs, and discard the first `llama-bench` run after the device has idled (DVFS ramp).
