@@ -825,17 +825,100 @@ within ~2% of the best fixed share (d8192: 18.4 vs 18.8 t/s), so the cost of the
 small and the protection is worth it: the split is never slower than HTP-only by more than the
 convergence transient.
 
+### Short context (d512-d4096): neutral below ~2k -- and a side effect that is not the split
+
+Same procedure as above (cool device, arms alternated back to back, two rounds each, `-dev HTP0`,
+tg64), lm-head on the CPU as in every table so far:
+
+| depth | HTP only | fixed share 0.5 | adaptive (start 0.5) | adaptive gain |
+|--:|--:|--:|--:|--:|
+| d0    | 29.64 t/s | 29.70 | 29.94 | 1.01x |
+| d512  | 27.08 | 27.06 | 28.23 | 1.04x |
+| d1024 | 25.84 | 25.49 | 26.33 | 1.02x |
+| d2048 | 23.62 | 24.59 | 24.98 | 1.06x |
+| d4096 | 20.48 | 22.66 | 22.93 | 1.12x |
+
+No depth loses, and nothing below d2048 gains more than the run-to-run noise (about +-1 t/s at
+d512). The device profile (`GGML_HEXAGON_PROFILE=1`, tg16, per-token medians after the controller
+settles) says why:
+
+| depth (KV as padded) | FA/token, HTP only | FA/token, split | GPU blocks (of total) | HTP wait for GPU | FA share of token |
+|--:|--:|--:|--:|--:|--:|
+| d512  (768 keys, 12 blocks)  | 3.56 ms | 3.59 ms | 2-3 of 12   | 2 us  | 10% |
+| d1024 (1280 keys, 20 blocks) | 5.78 ms | 5.04 ms | 4-8 of 20   | 10 us | 15% |
+| d2048 (2304 keys, 36 blocks) | 9.27 ms | 6.70 ms | 15-16 of 36 | 19 us | 22% |
+| d4096 (4352 keys, 68 blocks) | 16.6 ms | 10.1 ms | 31-35 of 68 | 16 us | 34% |
+
+Two things cap the short-context gain. Attention is 10-22% of the token below d4096, so even
+halving it is worth 5-11% at most. And the split has per-layer costs that do not shrink with the
+KV: the HTP op pays ~25 us of its own (Q flush, `ready` publish, `done` poll, partial invalidate,
+extra merge slots: 129 us measured vs 105 us modelled at d512), the GPU kernel has a ~45 us floor
+however few keys it gets, and the relay adds ~10 us. An HTP block costs 8.4 us (FA/layer fits
+26 us + 8.4 us x blocks over the four HTP-only points), so the GPU has to take 3-4 blocks before
+the split breaks even, and it can only take blocks the HTP would otherwise still be working on
+after the GPU's floor. At d512 the controller settles on its floor of 2-3 blocks of 12, the op is
+unchanged (3.59 vs 3.56 ms) and so is the token; at d1024 the GPU gets 4-8 of 20 for 0.7 ms per
+token, at d2048 15-16 of 36 for 2.6 ms. The 2-block floor plus the wait-driven controller is what
+keeps the short arms from going negative -- a fixed 0.5 share is already 1% under HTP-only at d1024.
+
+**With the lm-head on the HTP** (`GGML_HEXAGON_LM_HEAD=1`, Section 4b: 29.6 -> 38.7 t/s at d0) the
+token is shorter and attention's share larger, and the same sweep reads 1.10x / 1.06x / 1.08x /
+1.15x / 1.24x at d0 / 512 / 1024 / 2048 / 4096 (38.7 -> 42.5, 36.6 -> 38.7, 33.1 -> 35.9,
+29.5 -> 33.9, 24.2 -> 30.1 t/s). The d0 row is the tell: attention is ~1 ms of a 26 ms token there,
+so a 10% gain cannot be attention. The profile shows the *non-attention* DSP time per token dropping
+from 22.6-23.5 to 20.9-21.9 ms (-1.7 ms, 7%) at every depth whenever the split is on. Two controls
+isolate the cause (each arm twice, alternated, lm-head on the HTP):
+
+| depth | HTP only | + busy loop pinned to CPU 7 | + pure-ALU GPU kernel, other process | split (adaptive) |
+|--:|--:|--:|--:|--:|
+| d0    | 39.5-39.8 t/s | 40.0-40.5 (1.01x) | **43.4-43.6 (1.10x)** | 42.2-42.7 (1.07x) |
+| d2048 | 29.4-29.7     | 29.9-30.0 (1.01x) | **31.6 (1.07x)**      | 33.8-33.9 (1.15x) |
+| d4096 | 24.2          | --                | **25.5 (1.05x)**      | 29.9-30.0 (1.24x) |
+
+A busy prime core does nothing. A GPU kernel that touches no memory (`llama-gpu-keepalive`,
+`examples/hetero-decode-attn/gpu-keepalive.c`: back-to-back 20 ms ALU loops, GPU busy 90-99%)
+speeds HTP-only decode up by 2.0-2.3 ms per token at every depth -- the whole d0 effect, and more
+than the split itself delivers there. Profiled at d0, the DSP batch per token shortens from 24.25
+to 22.15 ms with that kernel running while attention stays at 1.5 ms: the saving is in the GEMVs,
+on the device. The memory system is faster while the GPU is active. The HTP already votes
+`HAP_DCVS_VCORNER_MAX` for its bus and its core clock is pinned (`htp/main.c`), and the GPU clock
+reads 900 MHz in every arm, so what is left is the GPU's own DDR/NoC bandwidth vote or the
+fabric's idle states between the HTP's DMA bursts. The readable DDR node
+(`bus_dcvs/DDR/cur_freq`) cannot settle it: it shows only the CPU cluster's vote, which rises in
+the split arm from the relay thread's copies and not at all in the GPU-kernel arm.
+
+Net of that side effect the split's own contribution with the lm-head on the HTP is -2% / +7% /
++18% at d0 / d2048 / d4096 (split vs HTP-only-plus-GPU-kernel), which is exactly the attention
+saving the profile shows (0 / 2.6 / 6.4 ms out of 23-41 ms tokens). With the lm-head on the CPU
+the same GPU kernel moves the token by 1% or less (d0 30.0 -> 30.1, d4096 20.2 -> 20.4 t/s, with the
+split at 1.13x at d4096 in the same run), although the DSP batch still shortens by 0.9 ms (17.7 ->
+16.8 ms): the CPU's own lm-head GEMV keeps the memory system busy for half of every token and hides
+the effect. So every table in this document with the lm-head on the CPU is an attention-only
+result; the `GGML_HEXAGON_LM_HEAD=1` numbers are not, and any HTP+GPU claim in that configuration
+has to be made against an HTP-only-plus-`llama-gpu-keepalive` baseline, not against HTP-only.
+
+The answer for 512-4k, then: the split is never a loss, is worth 2-6% at 1k-2k and 12% at 4k with
+the lm-head on the CPU, and net of the GPU-activity effect the same 0% / 7% / 18% at 1k / 2k / 4k
+with the lm-head on the HTP. Below ~2k the token belongs to the GEMVs, and the way to make a second
+engine pay there is to stream weights on it, not attention.
+
 ### Status and what is left
 
 The prototype is complete as a research result: a correct, self-balancing HTP+GPU decode
 attention on the real model, 1.12x/1.23x/1.28x at 4k/8k/16k when the GPU is unthrottled and
-~1.2x at depth when it is. It is not mergeable as is: it links OpenCL into the hexagon backend,
+~1.2x at depth when it is; neutral (never negative) below 2k, where attention is 10-15% of the
+token and the per-layer fixed costs leave the GPU only its 2-block floor. It is not mergeable as is: it links OpenCL into the hexagon backend,
 mutates the FA node's `op_params`/`src[7]` from the backend, and carries a per-layer spinning GPU
 kernel (~1 ms of GPU occupancy per layer, pure power). Left open: the GPU kernel under
 contention (26-31 GB/s) is now the long pole at every depth -- a faster decode kernel (half8 V
 loads, fewer lanes per row) would move the balance point and the gain; the Section 4f-bis DMA
 pattern on the HTP side would do the same from the other end; and the share controller could
-use the GPU's own done latency as a second signal instead of only the HTP's wait.
+use the GPU's own done latency as a second signal instead of only the HTP's wait. Separately, the
+GPU-activity effect above is a lever of its own: with the lm-head on the HTP, HTP-only decode is
+5-10% faster whenever the GPU merely stays busy, so a bandwidth vote that achieves the same
+without a GPU kernel (the HTP's bus corner is already MAX, so the missing vote is elsewhere --
+GPU or CPU side) would bank that for free; until then every HTP+GPU number in that configuration
+is read net of it.
 
 
 ## 5. What would change the answer
@@ -870,4 +953,13 @@ use the GPU's own done latency as a second signal instead of only the HTP's wait
 - Host library and HTP skeleton must be pushed as a pair: the op descriptor grew from 7 to 8
   inputs, and a mismatched pair crashes the DSP (`dspqueue_read failed 0x2e`) on the first batch.
 - Pass `-dev HTP0` to every llama tool, `-ngl 99` to `llama-perplexity`, `-v` to see backend
-  logs, and discard the first `llama-bench` run after the device has idled (DVFS ramp).
+  logs, and discard the first `llama-bench` run after the device has idled (DVFS ramp: the off
+  arm reads 34.5-35.1 instead of 39.5 t/s at d0 when it goes first; run a warm-up first).
+- GPU activity alone speeds the HTP up. With the lm-head on the HTP (CPU idle) a GPU kernel that
+  touches no memory makes HTP-only decode 5-10% faster (DSP batch 24.3 -> 22.2 ms/token at d0).
+  Every HTP+GPU comparison in that configuration needs an HTP-only + `llama-gpu-keepalive` arm;
+  with the lm-head on the CPU the token-level effect is ~1%. A busy CPU core does not do it.
+- `/sys/devices/system/cpu/bus_dcvs/DDR/cur_freq` is the CPU cluster's DDR vote, not the DDR
+  clock (no readable aggregate without root), and `kgsl-3d0/gpuclk` reads 900 MHz even with the
+  GPU idle on this unit. The KV the decode op sees is the padded cache (768 keys at d512, 4352
+  at d4096), not the prompt length.

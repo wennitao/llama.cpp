@@ -6,3 +6,9 @@ target_link_libraries(${TARGET} PRIVATE ggml OpenCL::OpenCL ${CMAKE_THREAD_LIBS_
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/src/ggml-hexagon/htp)
 target_compile_definitions(${TARGET} PRIVATE CL_TARGET_OPENCL_VERSION=300)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+# Control tool: GPU busy with no memory traffic (see gpu-keepalive.c).
+add_executable(llama-gpu-keepalive gpu-keepalive.c)
+install(TARGETS llama-gpu-keepalive RUNTIME)
+target_link_libraries(llama-gpu-keepalive PRIVATE OpenCL::OpenCL)
+target_compile_definitions(llama-gpu-keepalive PRIVATE CL_TARGET_OPENCL_VERSION=300)
