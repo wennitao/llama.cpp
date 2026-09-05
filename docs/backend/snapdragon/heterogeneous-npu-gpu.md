@@ -902,6 +902,39 @@ the lm-head on the CPU, and net of the GPU-activity effect the same 0% / 7% / 18
 with the lm-head on the HTP. Below ~2k the token belongs to the GEMVs, and the way to make a second
 engine pay there is to stream weights on it, not attention.
 
+### Is there DRAM bandwidth left for a second engine? Measured with the weights streaming
+
+The short-context token is GEMVs, so the heterogeneous question there is whether two masters get
+more out of the DRAM than the HTP alone. Measured at d0 with the lm-head on the HTP (the HTP
+streams 1124 MB of weights per token; the PMU counts 1084 MB of AXI reads at 191 B/request, so the
+GEMV bandwidth below is hardware-counted) while a GPU streamer (`llama-gpu-stream`: float4 reads
+over a 256 MB buffer, duty-cycled) runs in another process. The GPU rate is its per-second plateau
+during the decode phase; solo, the same streamer reads 54 / 25 / 13 GB/s at duty 1 / 0.5 / 0.25.
+
+| GPU traffic during decode | HTP GEMV bandwidth (AXI-counted) | GPU | aggregate | token (HTP-only decode) |
+|---|--:|--:|--:|--:|
+| none, GPU idle                     | 50.6 GB/s | --   | 50.6 GB/s | 39.5 t/s |
+| none, GPU busy on ALU (keep-alive) | 55.7      | --   | 55.7      | 43.5 |
+| streamer, duty 0.25                | ~50 (from the token rate) | 5.8  | ~56 | 39.5 |
+| streamer, duty 0.5                 | 48.1      | 13.6 | 61.7      | 37.8 |
+| streamer, duty 1                   | 39.2      | 27.5 | 66.7      | 32.0 |
+
+Three things follow. The DRAM does have more than the HTP takes: two masters reach 67 GB/s (87%
+of the 77 GB/s theoretical) against 56 for the HTP alone with the fabric awake, so a weight split's
+raw ceiling on GEMV time is ~1.2x -- about 3 ms of a 23 ms token, ~1.15x, before any per-op cost;
+with 113 fused GEMV ops per token, 25 us of split/merge per op would consume all of it. The HTP's
+own stream is latency-sensitive rather than bandwidth-limited: it runs at a fixed DMA depth, so
+co-streaming raises its latency and it loses bandwidth nearly one-for-one at light GPU traffic
+(duty 0.25: the GPU takes 5.8 GB/s and the aggregate does not move) and 30% at full GPU traffic;
+the extra 11 GB/s appears only once the GPU takes ~40% of the bytes. And the keep-alive effect
+(50.6 -> 55.7 GB/s, 11%) is the same latency story from the other side: a faster fabric lets the
+same DMA depth carry more, which is a larger and cheaper gain than a weight split would net.
+
+So the short-context answer holds at the operator level too: attention below 2k is
+fixed-cost-bound, and the GEMVs that own the token have ~1.15x of bandwidth to gain from a second
+engine at a per-op crossing cost of the same size. On this SoC the second engine pays for decode
+only where the work is large per crossing: attention at depth.
+
 ### Status and what is left
 
 The prototype is complete as a research result: a correct, self-balancing HTP+GPU decode
@@ -935,6 +968,10 @@ is read net of it.
   backend is not that.
 - **Something that is not attention or GEMM.** After the lm-head moves to the HTP (§4b) the
   non-device share of a decode token is ~5%; there is no host-side cost left for a GPU to absorb.
+- **A weight split for the GEMVs** has a measured raw ceiling of ~1.15x on the token (two masters
+  reach 67 GB/s vs 56 for the HTP alone, §4i) and the HTP's DMA stream loses bandwidth one-for-one
+  to light co-traffic; it would pay only with a per-op crossing far under 25 us, which §4g's
+  7-9 us relay is, but only for ops big enough to amortize the GPU's ~45 us kernel floor.
 
 ## 6. Operational notes (they cost runs)
 

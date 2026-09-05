@@ -12,3 +12,9 @@ add_executable(llama-gpu-keepalive gpu-keepalive.c)
 install(TARGETS llama-gpu-keepalive RUNTIME)
 target_link_libraries(llama-gpu-keepalive PRIVATE OpenCL::OpenCL)
 target_compile_definitions(llama-gpu-keepalive PRIVATE CL_TARGET_OPENCL_VERSION=300)
+
+# Control tool: GPU DRAM streamer at a duty cycle (see gpu-stream.c).
+add_executable(llama-gpu-stream gpu-stream.c)
+install(TARGETS llama-gpu-stream RUNTIME)
+target_link_libraries(llama-gpu-stream PRIVATE OpenCL::OpenCL)
+target_compile_definitions(llama-gpu-stream PRIVATE CL_TARGET_OPENCL_VERSION=300)
