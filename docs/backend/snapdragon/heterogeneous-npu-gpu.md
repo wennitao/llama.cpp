@@ -935,6 +935,49 @@ fixed-cost-bound, and the GEMVs that own the token have ~1.15x of bandwidth to g
 engine at a per-op crossing cost of the same size. On this SoC the second engine pays for decode
 only where the work is large per crossing: attention at depth.
 
+### The decode token phase by phase, hardware-counted (d0 and d4096)
+
+The question "is the memory busy during the whole token" can be answered with the PMU rather than
+inferred: `GGML_HEXAGON_PROFILE=0x3,0x41,0xce,0x43,0xcf,0x7d,0x8c,0x40` counts the cDSP's AXI read
+requests on every op (Section 4b). The request size depends on the access pattern, so it has to be
+calibrated per class against known bytes: weight rows come out at 191 B/request (1084 MB counted vs
+1124 MB of weights), while the attention op's 256-byte K/V rows come out at ~256 B/request (385 MB
+x 256/191 = 516 MB vs 503 MB of padded KV + mask at d4096). With that, tg32 with the lm-head on
+the HTP (unit 55b03820, PMU logging on, so the token is ~15% slower than the plain runs):
+
+| op class (per token) | ops | d0: ms | d0: GB/s | d4096: ms | d4096: MB read | d4096: GB/s |
+|---|--:|--:|--:|--:|--:|--:|
+| gate/up GEMV (`MUL_MAT+MUL_MAT`)        | 28  | 7.60 | 52.2 | 7.71  | 397 | 51.5 |
+| lm-head GEMV                            | 1   | 5.86 | 49.5 | 5.80  | 290 | 50.0 |
+| down / o-proj GEMV (`MUL_MAT+ADD`)      | 55  | 5.27 | 49.8 | 5.46  | 263 | 48.2 |
+| QKV GEMV (`MUL_MAT+MUL_MAT+MUL_MAT`)    | 28  | 2.65 | 49.9 | 2.68  | 133 | 49.5 |
+| attention (`FLASH_ATTN_EXT`, 256 B/req) | 28  | 1.53 | ~20  | 16.66 | 516 | 31.0 |
+| norms, RoPE, SwiGLU, KV writes          | 253 | ~1.3 | 2-3  | 1.52  | 4   | 2-3 |
+| gaps inside the DSP batch               |     | --   | 0    | 0.28  | 0   | 0 |
+| host tail (plain run, wall minus batch) |     | ~1.0 | 0    | ~1.1  | 0   | 0 |
+
+So during decode the DRAM is drawn on for the whole token except ~2.9 ms of small ops, dispatch
+gaps and host tail (7% at d4096): the GEMVs pull ~50 GB/s for 21.5 ms, attention ~31 GB/s for
+16.7 ms at d4096. Two more things the counters settle:
+
+- **The attention op is not bound by DRAM latency or bandwidth.** With the GPU keep-alive kernel
+  running, every GEMV class speeds up 8-12% (48-52 -> 54-58 GB/s) while attention does not move
+  (16.66 -> 16.61 ms, 23.1 -> 23.2 GB/s at 191 B/req); under a full GPU stream the GEMVs lose 25%
+  and attention 3%. Its limiter is the DMA engine's handling of its own descriptors (two 64-row
+  x 256 B transfers in flight per thread, ~4.6 GB/s per thread), not the fabric -- the GEMV path
+  drives the same engines 2.5x harder with 16 descriptors queued. Bigger descriptors (all 8 heads
+  of a block, or several blocks per head) and deeper queues are the fix, and only that.
+- **In the split, the HTP reads 54% of the KV** (208 MB vs 385 MB at 191 B/req) in 11.09 ms
+  instead of 16.66: proportional would be 9.0 ms, the extra 2.1 ms is the wait for `done`, the
+  per-layer hetero overhead and the merge. The GEMVs in the split arm run at the keep-alive rate
+  (52-57 GB/s), because the spinning kernel keeps the GPU busy -- so the split's token-level gain
+  with the lm-head on the HTP includes that effect, as Section "Short context" accounts for.
+
+Writes are not counted (none of the eight events tracks AXI writes; the KV writes are 112 KB/token
+and the outputs are small, <1% of traffic), the counter sees only the cDSP's own port (the GPU's
+traffic is read from its own tool), and per-op numbers are op averages -- sub-op phases (DMA vs
+QK vs softmax inside attention) need `GGML_HEXAGON_PROFILE=3` trace events, which the kernel emits.
+
 ### Status and what is left
 
 The prototype is complete as a research result: a correct, self-balancing HTP+GPU decode
