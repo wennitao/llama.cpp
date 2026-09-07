@@ -249,7 +249,9 @@ time and remove the lag.
 | positional pages (Quest-style baseline), 50% | 15.09 +/- 0.94 |
 | positional pages, 25% | 25.84 +/- 1.91 |
 
-**This is a negative result on the selection policy, and the important one.** The plumbing is
+**This looked like a negative result on the selection policy; it was the missing sink page**
+(see "Sink pages" below, 2026-09-07: with page 0 always selected every arm here returns to dense
+perplexity). The analysis that follows is kept as written on 2026-09-06. The plumbing is
 exact (100% equals dense), and the kernel and sidecar deliver the speed, but choosing pages by the
 dot product of the query with the page's *mean key*, under a fixed per-head budget, loses far too
 much: 1.7x the perplexity at 50%, 3.5x at 25%. And the k-means pages are no better than plain
@@ -320,16 +322,63 @@ the descriptor (min/max bounds) and the sink pages remain the levers for accurac
 budget. The best point measured so far is 16-key positional pages at 50%: PPL 10.8 (dense 9.1)
 at about the speed of dense attention.
 
+### Sink pages (2026-09-07, unit 87b3a4aa): the quality loss was the missing sink page
+
+`GGML_HEXAGON_CLUSTER_SINK=4`: the sidecar sorts positions 0..3 of chunk 0 ahead of every cluster,
+so they start page 0 of the layer (positional pages hold them in page 0 anyway), and the select pass
+scores page 0 at +inf so it is always taken, inside the budget (`HTP_FA_CLUSTER_FLAG_FORCE`, bits
+16-23 of op_params[15]; one page per head, no measurable cost). Decode-mode perplexity as above
+(ctx 4096, 2 chunks, dense 9.13 +/- 0.46). "Attended" is the average fraction of the context the
+scored tokens actually read, counting the dense tail: the tail snaps to the clustering chunk
+boundary, so with W 256 / chunk 1024 it averages 768 keys and the "25%" budget attends 45% of the
+keys; with W 64 / chunk 256 it averages 192 keys and the 25% budget attends 30%.
+
+| arm (16-key pages unless noted) | window / chunk | attended | PPL without sink | PPL with sink page |
+|---|---|--:|--:|--:|
+| cluster 25%                 | 256 / 1024 | 45% | 21.11 (control re-run: 20.99) | **9.13** |
+| positional 25%              | 256 / 1024 | 45% | 15.04 | **9.07** |
+| cluster 25%                 | 64 / 256   | 30% | -- | **9.02** |
+| positional 25%              | 64 / 256   | 30% | -- | **9.05** |
+| cluster 25%, 64-key pages   | 256 / 1024 | 45% | 31.51 | **9.09** |
+| positional 50%              | 256 / 1024 | 63% | 10.81 | **9.03** |
+| cluster 50%                 | 256 / 1024 | 63% | 12.41 | **9.09** |
+
+Every arm is at dense perplexity (9.02-9.13 against 9.13 +/- 0.46), including the 64-key k-means
+pages at 25% that lost 3.5x without the sink, and the arms that read 30% of the context. So the
+losses in the two tables above were never the mean descriptor, the fixed budget or the page size:
+they were the first four tokens missing. Qwen3 puts a large share of every row's softmax mass on
+them (the StreamingLLM observation), and when they are absent that mass spreads over whatever was
+selected, whether the selection was otherwise right or not. K-means scattered position 0 into
+whichever cluster its key fell in; positional pages kept it in page 0 but selected that page only
+when its diluted mean scored, which is why positional pages looked better.
+
+Consequences for the plan:
+
+- **Page size and descriptor are no longer quality levers at these budgets.** 64-key pages, the
+  fast ones, are at dense perplexity at 25%; the min/max descriptor and the threshold budget stay
+  on the list only for pushing the budget lower (runs below).
+- **K-means versus positional is now a bandwidth question, not a quality one**, and positional
+  pages need no shadow: a page is 16 or 64 consecutive rows of llama's cache (the dense path's
+  2D descriptor already fetches exactly that), and the only extra data is one mean per page
+  (256 B per 16 keys, 1/32 of the KV). That removes the shadow copy and with it the 16k memory
+  problem (Stage 3, lesson 2), the CPU gather and the readiness lag. The cluster order's remaining
+  argument is the 16-20% streaming gain from contiguous pages (Stage 1) plus one descriptor per
+  cluster when whole clusters are selected.
+- **The window can become the 64 keys asked for.** Today the tail between the last clustered chunk
+  and n - W is dense because it has no pages; with positional tail pages (means computed as rows
+  arrive) only W keys need to stay dense, and the clustering lag stops costing bandwidth.
+
 ### Status
 
 Built and measured end to end: page-list HVX decode kernel (Stage 1), GPU chunk-local k-means
 (Stage 2), the clustering sidecar with the cDSP memory budget respected (Stage 3), on-device
 selection (Stage 4), page sizes 16/32/64. Exact at full density; 1.25x / 1.4x decode at 4k / 8k
 at a 25% budget with 64-key pages; the sidecar costs prefill nothing; the shadow-copy design
-cannot fit a 16k context on this SoC (Stage 3, lesson 2). Selection accuracy is the open problem:
-page-mean selection with a fixed budget loses 1.7x PPL at 50% with 64-key pages, 16-key pages
-bring positional selection to 1.18x at 50% but at half the bandwidth, and k-means pages never beat
-positional pages. Next, in order: min/max page descriptors and forced sink pages in the select
-pass (accuracy at a given budget), a kernel that packs several 16-key pages per 64-lane softmax
-(so fine granularity stops costing 2x), GPU gather in the sidecar (readiness lag), and for long
-contexts the in-place layout or Q8 pages the memory budget demands.
+cannot fit a 16k context on this SoC (Stage 3, lesson 2). Selection accuracy is solved at a 25%
+budget by one rule: always select the page holding the sink tokens (`GGML_HEXAGON_CLUSTER_SINK=4`).
+With it, k-means and positional pages of 16 or 64 keys are all at dense perplexity at 25%, also
+with the window cut to 64..319 keys (30% of the context read); without it the same arms lost
+1.7-3.5x. Next, in order: how low the budget can go with the sinks in place (12.5%, 6%), positional
+pages without a shadow (in-place pages of llama's cache + one mean per page: removes the memory
+problem, the gather and the lag), positional tail pages so the dense window is really 64 keys, and
+the fixed per-page cost (K|V in one descriptor, several 16-key pages per 64-lane softmax).

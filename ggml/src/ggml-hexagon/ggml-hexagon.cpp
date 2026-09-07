@@ -111,6 +111,7 @@ static int      opt_cluster_chunk   = 1024; // keys per clustering chunk (multip
 static int      opt_cluster_positional = 0; // 1 = baseline: pages are 64 consecutive positions (no k-means), descriptor = mean
 static int      opt_cluster_mem_mb   = 0;    // shadow memory budget in MB; 0 = what is left of the cDSP vmem budget after weights + KV
 static int      opt_cluster_page     = 64;   // keys per shadow page: 16, 32 or 64 (GGML_HEXAGON_CLUSTER_PAGE)
+static int      opt_cluster_sink     = 0;    // sink keys (positions [0, n)): packed into page 0 by the sidecar, which the kernel always selects (GGML_HEXAGON_CLUSTER_SINK)
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
@@ -4598,7 +4599,11 @@ static bool cluster_run_chunk(ggml_hexagon_cluster_sidecar * s, uint32_t il, uin
         const float *   ds = s->dist.data() + (size_t) h * N;
         s->perm.resize(N);
         for (uint32_t i = 0; i < N; ++i) s->perm[i] = (int) i;
-        std::stable_sort(s->perm.begin(), s->perm.end(), [&](int x, int y) { return as[x] != as[y] ? as[x] < as[y] : ds[x] < ds[y]; });
+        // sink keys (positions < opt_cluster_sink, chunk 0 only) sort before every cluster: they land at the
+        // start of page 0 of the layer, which the kernel force-selects (HTP_FA_CLUSTER_FLAG_FORCE)
+        const uint32_t n_sink = (pos0 == 0 && opt_cluster_sink > 0) ? std::min((uint32_t) opt_cluster_sink, N) : 0;
+        auto ckey = [&](int x) { return (uint32_t) x < n_sink ? -1 : (int) as[x]; };
+        std::stable_sort(s->perm.begin(), s->perm.end(), [&](int x, int y) { const int kx = ckey(x), ky = ckey(y); return kx != ky ? kx < ky : ds[x] < ds[y]; });
         uint8_t *  kp = lb + hdr.off_k_pages + (size_t) h * head_stride + (size_t) page_first * hdr.page_bytes;
         uint8_t *  vp = lb + hdr.off_v_pages + (size_t) h * head_stride + (size_t) page_first * hdr.page_bytes;
         uint32_t * pm = (uint32_t *) (lb + hdr.off_pos_map) + ((size_t) h * hdr.n_pages_max + page_first) * PK;
@@ -4948,9 +4953,9 @@ static bool ggml_hexagon_cluster_init(ggml_hexagon_session * sess, uint32_t n_la
 #else
     GGML_LOG_WARN("ggml-hex: cluster: built without OpenCL; no clustering sidecar, decode runs dense\n");
 #endif
-    GGML_LOG_INFO("ggml-hex: %s cluster attention: shadow %zu MB (%u layers x %u heads x %u pages of %u keys), density %d permille, window %d, flags 0x%x\n",
+    GGML_LOG_INFO("ggml-hex: %s cluster attention: shadow %zu MB (%u layers x %u heads x %u pages of %u keys), density %d permille, window %d, flags 0x%x, sink %d\n",
                   sess->c_name(), c->size >> 20, n_layers, n_kv_heads, c->hdr.n_pages_max, c->hdr.page_keys,
-                  opt_cluster_density, opt_cluster_window, opt_cluster_flags);
+                  opt_cluster_density, opt_cluster_window, opt_cluster_flags, opt_cluster_sink);
     return true;
 }
 
@@ -4987,7 +4992,7 @@ static bool ggml_hexagon_cluster_prepare(ggml_hexagon_session * sess, ggml_tenso
     n->op_params[HTP_FA_CLUSTER_OPP_LAYER]   = il;
     n->op_params[HTP_FA_CLUSTER_OPP_DENSITY] = opt_cluster_density;
     n->op_params[HTP_FA_CLUSTER_OPP_WINDOW]  = opt_cluster_window;
-    n->op_params[HTP_FA_CLUSTER_OPP_FLAGS]   = (int32_t) opt_cluster_flags;
+    n->op_params[HTP_FA_CLUSTER_OPP_FLAGS]   = (int32_t) (opt_cluster_flags | (opt_cluster_sink > 0 ? (1u << 16) : 0u));   // HTP_FA_CLUSTER_FLAG_FORCE = 1 page
     n->src[7] = c->ctrl;
     c->n_tagged++;
     if (opt_verbose || c->n_tagged == 1) {
@@ -6182,6 +6187,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_cluster_pos   = getenv("GGML_HEXAGON_CLUSTER_POSITIONAL");
     const char * str_cluster_mem   = getenv("GGML_HEXAGON_CLUSTER_MEM_MB");
     const char * str_cluster_page  = getenv("GGML_HEXAGON_CLUSTER_PAGE");
+    const char * str_cluster_sink  = getenv("GGML_HEXAGON_CLUSTER_SINK");
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
     const char * str_vmem     = getenv("GGML_HEXAGON_VMEM");
@@ -6269,6 +6275,11 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     if (opt_cluster_page != 16 && opt_cluster_page != 32 && opt_cluster_page != 64) {
         GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_CLUSTER_PAGE=%d not 16/32/64; using 64\n", opt_cluster_page);
         opt_cluster_page = 64;
+    }
+    opt_cluster_sink = str_cluster_sink ? atoi(str_cluster_sink) : opt_cluster_sink;
+    if (opt_cluster_sink < 0 || opt_cluster_sink > opt_cluster_page) {
+        GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_CLUSTER_SINK=%d out of range (0..page keys %d); using %d\n", opt_cluster_sink, opt_cluster_page, opt_cluster_page);
+        opt_cluster_sink = opt_cluster_page;
     }
     if (opt_cluster_chunk < 128 || opt_cluster_chunk > 1024 || (opt_cluster_chunk % 64)) {
         GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_CLUSTER_CHUNK=%d out of range (128..1024, multiple of 64); using 1024\n", opt_cluster_chunk);

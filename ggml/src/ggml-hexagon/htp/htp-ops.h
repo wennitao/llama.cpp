@@ -184,6 +184,7 @@ enum htp_sync_probe_rec {
 #define HTP_FA_CLUSTER_FLAG_COALESCE    (1u << 5)              // merge consecutive pages into one descriptor (reserved)
 #define HTP_FA_CLUSTER_FLAG_FOLD_SUM    (1u << 6)              // GQA score fold: sum over the group (else max)
 #define HTP_FA_CLUSTER_FLAG_MINPAGES(f) (((f) >> 8) & 0xffu)   // minimum pages per head when a budget is used
+#define HTP_FA_CLUSTER_FLAG_FORCE(f)    (((f) >> 16) & 0xffu)  // always select the first F candidate pages of the layer (sink pages)
 #define HTP_FA_CLUSTER_PAGE_KEYS    64     // default and maximum page size; 16 and 32 are also valid (header.page_keys)
 #define HTP_FA_CLUSTER_MAX_CHUNKS   256
 #define HTP_FA_CLUSTER_MAX_HEADS    64

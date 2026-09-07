@@ -3750,6 +3750,15 @@ static void flash_attn_ext_f16_select_thread(unsigned int nth, unsigned int ith,
             scores[i] = s;
         }
 
+        // forced pages: the first F candidate pages of the layer (the sink tokens live in page 0)
+        // score +inf so the arg-max takes them first; they count against the budget
+        {
+            uint32_t F = HTP_FA_CLUSTER_FLAG_FORCE(factx->cl_flags);
+            if (F > B) F = B;
+            float * sf = (float *) scores;
+            for (uint32_t f = 0; f < F; ++f) sf[f] = INFINITY;
+        }
+
         // top-B by repeated masked arg-max
         uint16_t * out = factx->cl_sel_pages + (size_t) kvh * factx->cl_n_pages_max;
         for (uint32_t b = 0; b < B; ++b) {
