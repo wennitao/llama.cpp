@@ -84,7 +84,39 @@ Attention-op speedup at 25% density: **3.2x at 4k, 4.1x at 16k**, at 28-34 GB/s 
 the token model of Section 4i (attention 34% / 62% of the token at 4k / 16k) that is ~1.3x / ~1.8x
 on the token before the selection cost of Stage 4 (~35 us per layer estimated).
 
-## Stage 2 -- GPU chunk-local k-means (next)
+## Stage 2 -- GPU chunk-local k-means (built, measured 2026-09-06)
+
+`examples/cluster-kmeans-bench` (`llama-cluster-kmeans-bench`): OpenCL Lloyd iteration in two kernels
+(`km_assign`: one work-item per key, centroids tiled through local memory, `|mu|^2 - 2 k.mu`,
+change counter for early stop; `km_update`: one work-group per (centroid, head), lane = dim, empty
+clusters re-seeded from the farthest key), CPU k-means++ init on a 256-key subsample, CPU counting
+sort by (cluster, distance), then `km_gather` (one work-item per 256 B row into the page) and
+`km_page_mean` (f16 page descriptors). Keys in the real cache layout ([pos][head][D]).
+
+| problem per layer (8 KV heads) | assign | update | CPU sort | gather | page mean | total | per 28-layer chunk |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| chunk-local N=1024, C=16, blobs, k-means++ (5 iters to converge) | 2.2 ms | 1.4 ms | 0.3 ms | 0.6 ms | 0.03 ms | **4.5 ms** | **126 ms** |
+| chunk-local, stride init | 2.1 | 1.5 | 0.1 | 0.6 | 0.03 | 4.5 | 125 |
+| chunk-local, uniform random keys (8 iters, no convergence) | 3.4 | 2.5 | 0.5 | 0.6 | 0.03 | 7.1 | 199 |
+| whole layer N=4096, C=64 | 21.6 | 22.5 | 2.5 | 3.3 | 0.14 | 50 | 1402 |
+| whole layer N=16384, C=256 | 402 | 2350 | 1.8 | 15.9 | 0.5 | 2771 | 77 581 |
+
+The hide budget is the HTP's prefill time per ub=1024 ubatch, ~20 ms per layer, ~560 ms per chunk
+of 28 layers: chunk-local clustering fits 4.4x over (2.8x on the worst-case data), so the sidecar
+running one ubatch behind is comfortably hidden. Whole-layer clustering does not fit at any depth
+that matters (the update kernel scans every key per centroid group: 2.3 s per layer at 16k), which
+is the measured justification for chunk-local clusters. Assignment quality: the GPU inertia equals a
+double-precision CPU Lloyd run from the same init (ratio 1.000 at N=1024 and 4096; 0.92 at 16k, the
+GPU's re-seeding finding a better optimum). The gather check confirms every page row is the permuted
+key. The assignment kernel runs at 77 GFLOP/s at N=1024 (launch-bound) and 170 GFLOP/s at 16k.
+
+Interference, both directions (unit eb49fb9d): HTP prefill `-p 4096 -ub 1024` alone 1798 t/s, with
+the chunk-local bench looping on the GPU 1810 t/s (unchanged; the GPU-activity effect of
+heterogeneous-npu-gpu.md 4i if anything); the bench alone 4.5 ms per layer, while the HTP prefills
+5.6 ms (+24%, the gather and assignment kernels pay for the shared DRAM), i.e. 157 ms per chunk,
+still 3.6x inside the budget. The sidecar can run under prefill without touching it.
+
+
 
 ## Stage 3 -- clustering sidecar (later)
 
