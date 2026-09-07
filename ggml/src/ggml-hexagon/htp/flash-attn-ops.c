@@ -3091,7 +3091,10 @@ static inline void hvx_fa_dec_blk_src(const struct htp_fa_context * factx, const
     if (factx->cl_on) {
         const uint32_t nsel = factx->cl_sel_n[kvh];
         if (j < nsel) {
-            const uint32_t page = factx->cl_sel_pages[(size_t) kvh * factx->cl_n_pages_max + j];
+            uint32_t page = factx->cl_sel_pages[(size_t) kvh * factx->cl_n_pages_max + j];
+            if (page >= factx->cl_n_cand) {
+                page = factx->cl_n_cand - 1;   // clamp: a bad index must never form a wild address
+            }
             const size_t   off  = (size_t) kvh * factx->cl_head_stride + (size_t) page * factx->cl_page_bytes;
             b->k      = factx->cl_k_pages + off;
             b->v      = factx->cl_v_pages + off;

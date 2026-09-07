@@ -109,6 +109,7 @@ static int      opt_cluster_cpu     = -1;   // sidecar thread affinity (-1 = non
 static int      opt_cluster_verify  = 0;    // CPU-check every published chunk against the cache
 static int      opt_cluster_chunk   = 1024; // keys per clustering chunk (multiple of 64)
 static int      opt_cluster_positional = 0; // 1 = baseline: pages are 64 consecutive positions (no k-means), descriptor = mean
+static int      opt_cluster_mem_mb   = 0;    // shadow memory budget in MB; 0 = what is left of the cDSP vmem budget after weights + KV
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
@@ -333,6 +334,7 @@ struct ggml_hexagon_session;
 static void ggml_hexagon_hetero_free(ggml_hexagon_session * sess);
 #endif
 static void ggml_hexagon_cluster_free(ggml_hexagon_session * sess);
+static void ggml_hexagon_cluster_buffer_freed(ggml_hexagon_session * sess, ggml_backend_buffer_t buffer);
 
 struct ggml_hexagon_session {
     std::string      name;
@@ -491,6 +493,10 @@ static ggml_hexagon_session * ggml_backend_hexagon_buffer_get_sess(ggml_backend_
 }
 
 static void ggml_backend_hexagon_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    {
+        auto sbuf_ = static_cast<ggml_hexagon_shared_buffer *>(buffer->context);
+        ggml_hexagon_cluster_buffer_freed(sbuf_->sess, buffer);
+    }
     auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(buffer->context);
     // In async mode a batch that reads this buffer can still be in flight, and the dtor
     // unmaps it from the DSP. Join first. Nothing is ever in flight in the default
@@ -4361,6 +4367,7 @@ struct ggml_hexagon_cluster {
     ggml_context *               tctx = nullptr;
     ggml_tensor *                ctrl = nullptr;   // hand-wired tensor over the buffer, attached as src[7]
     struct htp_fa_cluster_header hdr  = {};
+    uint32_t                     kv_cache_size = 0;     // positions in llama's cache (the shadow may cover fewer)
     uint32_t                     n_tagged = 0;
 
     // SET_ROWS tracking (which rows the last computed graph wrote)
@@ -4475,6 +4482,8 @@ struct ggml_hexagon_cluster_sidecar {
     std::condition_variable cv;
     std::deque<ggml_hexagon_cluster_job> jobs;
     bool stop = false;
+    bool busy = false;                 // a job is being processed (reads llama's cache rows)
+    std::condition_variable cv_idle;   // signalled when busy drops
     // scratch
     std::vector<float> mu0, mu2;
     std::vector<uint8_t> assign;
@@ -4684,6 +4693,7 @@ static void ggml_hexagon_cluster_sidecar_main(ggml_hexagon_cluster_sidecar * s) 
             if (s->stop && s->jobs.empty()) return;
             job = s->jobs.front();
             s->jobs.pop_front();
+            s->busy = true;
         }
         s->n_jobs++;
         const bool prefill = job.n_tokens > 1;
@@ -4709,17 +4719,22 @@ static void ggml_hexagon_cluster_sidecar_main(ggml_hexagon_cluster_sidecar * s) 
             if ((uint64_t) job.pos_min > L.written_end) { L.stale = true; continue; }   // a gap: no clustering across it
             L.written_end = std::max<uint32_t>(L.written_end, (uint32_t) job.pos_max + 1);
             const uint32_t chunk = (uint32_t) opt_cluster_chunk;
-            while (L.written_end - L.covered_end >= chunk) {
+            // the shadow may cover fewer positions than the cache (memory budget): stop at its capacity
+            while (L.written_end - L.covered_end >= chunk && (c->hdr.n_pages_max - L.n_pages) * HTP_FA_CLUSTER_PAGE_KEYS >= chunk) {
                 if (!cluster_run_chunk(s, il, L.covered_end, L.covered_end + chunk)) { L.stale = true; break; }
             }
             if (end_of_prefill && !L.stale) {
-                // the prompt ended: cluster the remaining tail down to a page boundary
-                const uint32_t tail = (L.written_end - L.covered_end) & ~(HTP_FA_CLUSTER_PAGE_KEYS - 1);
+                // the prompt ended: cluster the remaining tail down to a page boundary, within the shadow capacity
+                uint32_t tail = (L.written_end - L.covered_end) & ~(HTP_FA_CLUSTER_PAGE_KEYS - 1);
+                const uint32_t cap = (c->hdr.n_pages_max - L.n_pages) * HTP_FA_CLUSTER_PAGE_KEYS;
+                if (tail > cap) tail = cap;
                 if (tail >= 2 * HTP_FA_CLUSTER_PAGE_KEYS) {
                     if (!cluster_run_chunk(s, il, L.covered_end, L.covered_end + tail)) L.stale = true;
                 }
             }
         }
+        { std::lock_guard<std::mutex> lk(s->mu); s->busy = false; }
+        s->cv_idle.notify_all();
         const double lag = (std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now().time_since_epoch()).count() - (double) job.t_post_ns) * 1e-6;
         s->lag_max_ms = std::max(s->lag_max_ms, lag);
         if (opt_verbose) {
@@ -4768,7 +4783,7 @@ static bool ggml_hexagon_cluster_sidecar_start(ggml_hexagon_cluster * c) {
 static void ggml_hexagon_cluster_sidecar_stop(ggml_hexagon_cluster * c) {
     ggml_hexagon_cluster_sidecar * s = c->side;
     if (!s) return;
-    { std::lock_guard<std::mutex> lk(s->mu); s->stop = true; }
+    { std::lock_guard<std::mutex> lk(s->mu); s->stop = true; s->jobs.clear(); }
     s->cv.notify_one();
     if (s->th.joinable()) s->th.join();
     GGML_LOG_INFO("ggml-hex: cluster sidecar: %llu jobs, %llu chunks, %llu resets, gpu %.1f ms, cpu %.1f ms, max lag %.1f ms, verify failures %llu\n",
@@ -4785,6 +4800,36 @@ static void ggml_hexagon_cluster_sidecar_stop(ggml_hexagon_cluster * c) {
     c->side = nullptr;
 }
 #endif // GGML_HEXAGON_HETERO
+
+// A hexagon buffer is being freed. If the sidecar reads it (llama's KV cache: llama_free runs before
+// the backend session is released), drop the queued jobs, let a chunk in flight finish its reads,
+// and forget the roots so nothing touches the freed memory.
+static void ggml_hexagon_cluster_buffer_freed(ggml_hexagon_session * sess, ggml_backend_buffer_t buffer) {
+    if (!sess || !sess->cluster) return;
+    ggml_hexagon_cluster * c = sess->cluster;
+#ifdef GGML_HEXAGON_HETERO
+    ggml_hexagon_cluster_sidecar * s = c->side;
+    if (s) {
+        std::unique_lock<std::mutex> lk(s->mu);
+        bool refs = false;
+        for (auto & L : c->layers) {
+            refs |= (L.k_root && L.k_root->buffer == buffer) || (L.v_root && L.v_root->buffer == buffer);
+        }
+        if (!refs) return;
+        s->jobs.clear();
+        s->cv_idle.wait(lk, [&] { return !s->busy; });
+        for (auto & L : c->layers) {
+            if (L.k_root && L.k_root->buffer == buffer) L.k_root = nullptr;
+            if (L.v_root && L.v_root->buffer == buffer) L.v_root = nullptr;
+        }
+        return;
+    }
+#endif
+    for (auto & L : c->layers) {
+        if (L.k_root && L.k_root->buffer == buffer) L.k_root = nullptr;
+        if (L.v_root && L.v_root->buffer == buffer) L.v_root = nullptr;
+    }
+}
 
 // Record which KV rows the graph is about to write. Called at the TOP of graph_compute, after
 // llama's set_inputs and BEFORE the ops run: the SET_ROWS index leaf (src[1]) is a transient whose
@@ -4813,7 +4858,7 @@ static void ggml_hexagon_cluster_track_graph(ggml_hexagon_session * sess, const 
     int64_t mn = INT64_MAX, mx = -1; bool bad = false;
     for (int64_t i = 0; i < n; ++i) {
         const int64_t v = idx->type == GGML_TYPE_I64 ? ((const int64_t *) idx->data)[i] : (int64_t) ((const int32_t *) idx->data)[i];
-        if (v < 0 || v >= (int64_t) c->hdr.kv_size) { bad = true; break; }
+        if (v < 0 || v >= (int64_t) c->kv_cache_size) { bad = true; break; }
         mn = std::min(mn, v); mx = std::max(mx, v);
     }
     if (bad || mx < 0) return;   // out-of-range (rewind, multi-stream, recycled buffer): skip this batch
@@ -4839,10 +4884,40 @@ static void ggml_hexagon_cluster_after_compute(ggml_hexagon_session * sess) {
 }
 
 static bool ggml_hexagon_cluster_init(ggml_hexagon_session * sess, uint32_t n_layers, uint32_t kv_size, uint32_t n_kv_heads, uint32_t D) {
+    // Memory budget. The shadow is a second copy of the KV cache, and the cDSP maps weights, cache and
+    // shadow into one virtual space of opt_vmem bytes (~3.35 GB): a 16k context on Qwen3-1.7B is already
+    // 1.9 GB of cache + 1.3 GB of weights, so a full shadow cannot be mapped and the DSP faults on first
+    // touch (the fastrpc mapping is delayed). Cluster only as many leading positions as fit; the rest of
+    // the context stays in the dense tail. Weight buffers are not accounted here: a fixed margin stands in
+    // (GGML_HEXAGON_CLUSTER_MEM_MB overrides the budget).
+    const uint64_t vmem     = sess->max_vmem ? (uint64_t) sess->max_vmem : (uint64_t) opt_vmem;
+    const uint64_t kv_bytes = (uint64_t) n_layers * 2 * kv_size * n_kv_heads * D * 2;
+    const uint64_t weights_margin = 1536ull << 20;
+    const uint64_t budget = opt_cluster_mem_mb > 0 ? ((uint64_t) opt_cluster_mem_mb << 20)
+                          : (vmem > kv_bytes + weights_margin ? vmem - kv_bytes - weights_margin : 0);
+    struct htp_fa_cluster_header hdr;
+    uint32_t kv_shadow = kv_size;
+    uint64_t size = htp_fa_cluster_layout(&hdr, n_layers, kv_shadow, n_kv_heads, D);
+    if (size > budget) {
+        kv_shadow = ((uint32_t) ((double) kv_size * (double) budget / (double) size)) & ~63u;
+        while (kv_shadow >= 1024 && (size = htp_fa_cluster_layout(&hdr, n_layers, kv_shadow, n_kv_heads, D)) > budget) {
+            kv_shadow -= 1024;
+        }
+        if (kv_shadow < 1024 || size > budget) {
+            GGML_LOG_WARN("ggml-hex: cluster attention disabled: no room for a shadow (KV cache %llu MB + weights margin %llu MB of the %llu MB cDSP vmem budget); decode runs dense\n",
+                          (unsigned long long) (kv_bytes >> 20), (unsigned long long) (weights_margin >> 20), (unsigned long long) (vmem >> 20));
+            opt_cluster_density = -1;
+            return false;
+        }
+        GGML_LOG_WARN("ggml-hex: cluster attention: shadow capped to the first %u of %u positions (%llu MB fit the %llu MB left of the cDSP vmem budget after %llu MB of KV cache); the rest stays dense\n",
+                      kv_shadow, kv_size, (unsigned long long) (size >> 20), (unsigned long long) (budget >> 20), (unsigned long long) (kv_bytes >> 20));
+    }
     auto c = new ggml_hexagon_cluster();
     c->sess = sess;
     c->layers.resize(n_layers);
-    c->size = (size_t) htp_fa_cluster_layout(&c->hdr, n_layers, kv_size, n_kv_heads, D);
+    c->kv_cache_size = kv_size;
+    c->hdr  = hdr;
+    c->size = (size_t) size;
     c->buf  = ggml_backend_buft_alloc_buffer(&sess->buffer_type, c->size);
     if (!c->buf) {
         GGML_LOG_ERROR("ggml-hex: cluster: shadow buffer alloc (%zu MB) failed\n", c->size >> 20);
@@ -6104,6 +6179,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_cluster_verify = getenv("GGML_HEXAGON_CLUSTER_VERIFY");
     const char * str_cluster_chunk = getenv("GGML_HEXAGON_CLUSTER_CHUNK");
     const char * str_cluster_pos   = getenv("GGML_HEXAGON_CLUSTER_POSITIONAL");
+    const char * str_cluster_mem   = getenv("GGML_HEXAGON_CLUSTER_MEM_MB");
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
     const char * str_vmem     = getenv("GGML_HEXAGON_VMEM");
@@ -6186,6 +6262,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_cluster_verify = str_cluster_verify ? atoi(str_cluster_verify) : opt_cluster_verify;
     opt_cluster_chunk  = str_cluster_chunk  ? atoi(str_cluster_chunk)  : opt_cluster_chunk;
     opt_cluster_positional = str_cluster_pos ? atoi(str_cluster_pos)  : opt_cluster_positional;
+    opt_cluster_mem_mb     = str_cluster_mem ? atoi(str_cluster_mem)  : opt_cluster_mem_mb;
     if (opt_cluster_chunk < 128 || opt_cluster_chunk > 1024 || (opt_cluster_chunk % 64)) {
         GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_CLUSTER_CHUNK=%d out of range (128..1024, multiple of 64); using 1024\n", opt_cluster_chunk);
         opt_cluster_chunk = 1024;
