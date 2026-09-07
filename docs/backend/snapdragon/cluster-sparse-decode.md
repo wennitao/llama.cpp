@@ -217,6 +217,25 @@ the cache stays in the dense tail). The first repetition of each cluster arm run
 is still catching up, hence the wider error bars; steady state is the upper number. Every run
 exits cleanly at every depth.
 
+### Prefill: does the sidecar cost the HTP anything? (2026-09-07, `llama-bench -p N -n 0 -r 2`, arms alternated)
+
+| prompt | sidecar off | sidecar on (clustering during the prompt) | HTP-only + GPU keep-alive (control) |
+|--:|--:|--:|--:|
+| pp4096 | 1767 t/s | 1780-1792 t/s | 1829 t/s |
+| pp8192 | 1341-1347 t/s | 1337-1363 t/s | 1342 t/s |
+
+No overhead within noise (+-1-2%; the small positive drift is the GPU-activity fabric effect of
+heterogeneous-npu-gpu.md 4i, at most +3.5% on a compute-bound prefill). Three reasons: prefill
+attention nodes are never tagged, so the DSP's prefill graphs are unchanged; the GPU's k-means
+traffic does not touch a compute-bound HTP (Stage 2 interference test); and the sidecar's CPU work
+runs on another core. What the sidecar does cost is readiness: at the end of a 4k prompt the last
+layer publishes ~4.1 s after its batch (35 ms of CPU gather per layer per chunk x 28 layers x 4
+chunks), so the first ~4 s of decode (~80-100 tokens) run with a partly covered shadow -- correct,
+just less sparse, which is the wider error bar on the first repetition of every cluster arm above.
+Time-to-first-token is unaffected (the sidecar is asynchronous). Moving the gather and page means
+to the GPU (0.6 ms per layer in the Stage 2 bench) would bring the whole chunk under the prefill
+time and remove the lag.
+
 ### Quality (`llama-perplexity -c 4096 --chunks 2 -b 1 -ub 1`: decode mode, since only decode-shaped attention nodes are tagged)
 
 | arm | PPL |
