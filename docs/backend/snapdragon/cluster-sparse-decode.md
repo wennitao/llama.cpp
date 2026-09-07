@@ -368,17 +368,81 @@ Consequences for the plan:
   and n - W is dense because it has no pages; with positional tail pages (means computed as rows
   arrive) only W keys need to stay dense, and the clustering lag stops costing bandwidth.
 
+#### Speed with the sink page, and how low the budget can go (2026-09-07, unit 87b3a4aa)
+
+`llama-bench -fa 1 -d 4096 -p 0`, arms alternated, 25% budget, sink page on; tg64 (`-r 2`) in two
+rounds, then one tg256 round (`-r 1`) for the steady state once the sidecar has caught up with the
+prompt (the shadow is rebuilt on every repetition because llama-bench clears the cache):
+
+| arm | tg64 round 1 | tg64 round 2 | tg256 |
+|---|--:|--:|--:|
+| dense | 20.0 | 20.3 | 20.2 |
+| k-means 64-key, W 256 / chunk 1024 | 25.3 | 23.8 | 24.7 |
+| k-means 64-key, W 64 / chunk 256 | 24.9 | 23.0 | 24.4 |
+| positional 64-key, W 64 / chunk 256 | **26.4** | **26.3** | **26.0** |
+| k-means 16-key, W 64 / chunk 256 | 20.6 | 20.6 | 21.6 |
+| positional 16-key, W 64 / chunk 256 | 23.3 | 23.1 | 22.3 |
+
+The sink page costs nothing (25.3 vs 25.2-25.7 without it). Positional pages are faster than k-means
+pages at every page size, by 1.3-3.3 t/s, and 16-key k-means pages give no speedup at all in tg64.
+The shadow layout is the same in both modes, so the difference is most likely the sidecar itself:
+the k-means backlog (16 chunks x 28 layers after a 4k prompt) runs inside the decode window, delaying
+coverage and competing with the HTP's dispatch thread, while positional mode only gathers. At tg512
+the gap shrinks but does not close (k-means 64-key 25%: 24.9 / 24.5; positional: 25.8 / 26.1;
+dense 20.1), which fits a ~4 s backlog covering the first 15-20% of the window plus a burst of
+28 k-means runs every 256 tokens, but is not proof; the remedy is the same either way (a cheaper
+sidecar, or no sidecar: positional pages need none).
+
+Lower budgets, decode-mode PPL, W 64 / chunk 256, sink page on (dense 9.13 +/- 0.46). "Read" is the
+average fraction of the context the scored tokens attend, dense tail included:
+
+| budget | read | k-means 16-key | positional 16-key | k-means 64-key | positional 64-key |
+|--:|--:|--:|--:|--:|--:|
+| 25%   | 30% | 9.02 | 9.05 | 9.08 | 9.14 |
+| 12.5% | 18% | 9.05 | 9.11 | 9.25 | 9.36 |
+| 6.2%  | 12% | 9.26 | 9.18 | 9.58 | -- |
+| 3.1%  |  9% | 9.50 | -- | -- | -- |
+
+With the sinks in place, 16-key pages stay at dense level down to a 12.5% budget (9.05-9.11,
+reading 18% of the context) and hold to within 1-1.4% at 6.2% (reading 12%); at 3.1% (reading 9%)
+k-means 16-key pages lose 4%. 64-key pages are at dense level at 25% and lose 1.3-2.4% at 12.5% and
+5% at 6.2%. So fine pages help exactly where the budget gets small, as expected, and page order
+(k-means vs positional) makes no consistent quality difference at any budget: the descriptor and
+the budget rule were never the problem, the sink page was.
+
+Speed at those budgets (d4096 tg64 `-r 2`, W 64 / chunk 256, sink page; round 2 shown, round 1
+agreed except for its first two arms, a DVFS outlier after idle), with the perplexity from the
+table above:
+
+| point | t/s | speedup | PPL | context read |
+|---|--:|--:|--:|--:|
+| dense | 20.3 | 1.00x | 9.13 | 100% |
+| positional 64-key, 25% | 26.4 | 1.30x | 9.14 | 30% |
+| positional 64-key, 12.5% | 27.3 | 1.34x | 9.36 | 18% |
+| positional 16-key, 12.5% | 24.6 | 1.21x | 9.11 | 18% |
+| positional 16-key, 6.2% | 26.8 | 1.32x | 9.18 | 12% |
+| k-means 16-key, 6.2% | 22.0 | 1.09x | 9.26 | 12% |
+| k-means 64-key, 25% (tg512) | 24.5-24.9 | 1.22x | 9.08 | 30% |
+
+Two points define the frontier at 4k: positional 64-key pages at 25% (1.30x at dense perplexity)
+and positional 16-key pages at 6.2% (1.32x at +0.5%). Beyond that the token is no longer limited by
+attention bytes: at 6.2% the attention op is mostly its fixed costs (26 us floor, select pass, one
+descriptor pair per page) and the rest of the token is the weight stream, which sparse attention
+cannot touch.
+
 ### Status
 
 Built and measured end to end: page-list HVX decode kernel (Stage 1), GPU chunk-local k-means
 (Stage 2), the clustering sidecar with the cDSP memory budget respected (Stage 3), on-device
 selection (Stage 4), page sizes 16/32/64. Exact at full density; 1.25x / 1.4x decode at 4k / 8k
 at a 25% budget with 64-key pages; the sidecar costs prefill nothing; the shadow-copy design
-cannot fit a 16k context on this SoC (Stage 3, lesson 2). Selection accuracy is solved at a 25%
-budget by one rule: always select the page holding the sink tokens (`GGML_HEXAGON_CLUSTER_SINK=4`).
-With it, k-means and positional pages of 16 or 64 keys are all at dense perplexity at 25%, also
-with the window cut to 64..319 keys (30% of the context read); without it the same arms lost
-1.7-3.5x. Next, in order: how low the budget can go with the sinks in place (12.5%, 6%), positional
+cannot fit a 16k context on this SoC (Stage 3, lesson 2). Selection accuracy is solved by one
+rule: always select the page holding the sink tokens (`GGML_HEXAGON_CLUSTER_SINK=4`). With it,
+16-key pages are at dense perplexity down to a 12.5% budget and within 1.4% at 6.2%, 64-key pages
+at dense perplexity at 25%; without it the same arms lost 1.7-3.5x. Frontier at 4k: positional
+64-key pages at 25% = 1.30x at dense PPL; positional 16-key pages at 6.2% = 1.32x at +0.5%, reading
+12% of the context. K-means pages are no better in quality and slower on the token (sidecar
+backlog). Next, in order: positional
 pages without a shadow (in-place pages of llama's cache + one mean per page: removes the memory
 problem, the gather and the lag), positional tail pages so the dense window is really 64 keys, and
 the fixed per-page cost (K|V in one descriptor, several 16-key pages per 64-lane softmax).
