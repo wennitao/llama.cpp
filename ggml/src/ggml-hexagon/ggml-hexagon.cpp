@@ -19,6 +19,7 @@
 #include <regex>
 #include <queue>
 #include <algorithm>
+#include <random>
 
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
@@ -104,6 +105,10 @@ static int    opt_hetero_adapt = 1;
 static int      opt_cluster_density = -1;
 static int      opt_cluster_window  = 256;
 static uint32_t opt_cluster_flags   = 0;
+static int      opt_cluster_cpu     = -1;   // sidecar thread affinity (-1 = none)
+static int      opt_cluster_verify  = 0;    // CPU-check every published chunk against the cache
+static int      opt_cluster_chunk   = 1024; // keys per clustering chunk (multiple of 64)
+static int      opt_cluster_positional = 0; // 1 = baseline: pages are 64 consecutive positions (no k-means), descriptor = mean
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
@@ -4330,6 +4335,24 @@ static void ggml_hexagon_hetero_free(ggml_hexagon_session * sess) {
 // selected on the DSP. The clustering sidecar that fills the shadow comes with a later stage.
 // ---------------------------------------------------------------------------------------
 
+struct ggml_hexagon_cluster_layer {
+    const ggml_tensor * k_root = nullptr, * v_root = nullptr;   // llama's cache tensors (cache_k_l%d / cache_v_l%d)
+    uint32_t written_end = 0;    // positions [0, written_end) hold rows written so far (contiguous prefix)
+    uint32_t covered_end = 0;    // positions [0, covered_end) are clustered and published
+    uint32_t n_chunks = 0, n_pages = 0;
+    bool     stale = false;      // non-contiguous writes: this layer stays dense until a reset
+};
+
+struct ggml_hexagon_cluster_job {
+    uint64_t seq = 0;
+    int32_t  n_tokens = 0;
+    int64_t  pos_min = 0, pos_max = -1;
+    bool     contiguous = true;
+    int64_t  t_post_ns = 0;
+};
+
+struct ggml_hexagon_cluster_sidecar;   // GPU k-means + packing thread (needs OpenCL)
+
 struct ggml_hexagon_cluster {
     ggml_hexagon_session *       sess = nullptr;
     ggml_backend_buffer_t        buf  = nullptr;
@@ -4339,7 +4362,19 @@ struct ggml_hexagon_cluster {
     ggml_tensor *                ctrl = nullptr;   // hand-wired tensor over the buffer, attached as src[7]
     struct htp_fa_cluster_header hdr  = {};
     uint32_t                     n_tagged = 0;
+
+    // SET_ROWS tracking (which rows the last computed graph wrote)
+    std::vector<ggml_hexagon_cluster_layer> layers;
+    const ggml_tensor *          idx_tensor = nullptr;   // the graph's KV row-index input (shared by all layers)
+    bool                         pending = false;       // a graph with SET_ROWS was submitted and not yet harvested
+    ggml_hexagon_cluster_job     pending_job;           // positions captured before compute recycled the index buffer
+    int32_t                      last_n_tokens = 0;
+    uint64_t                     seq = 0;
+    ggml_hexagon_cluster_sidecar * side = nullptr;
 };
+
+static void ggml_hexagon_cluster_after_compute(ggml_hexagon_session * sess);
+static void ggml_hexagon_cluster_track_graph(ggml_hexagon_session * sess, const ggml_cgraph * graph);
 
 static inline void cluster_dc_civac(const void * p, size_t n) {
 #if defined(__aarch64__)
@@ -4352,9 +4387,461 @@ static inline void cluster_dc_civac(const void * p, size_t n) {
 #endif
 }
 
+// ---- the clustering sidecar -------------------------------------------------------------------
+// A host thread with its own OpenCL queue. For every layer whose positional cache has a chunk of
+// unclustered rows it: copies the chunk's K rows to the GPU, runs k-means (C = keys/64 centroids,
+// k-means++ init on a subsample, Lloyd iterations with an early stop), reads the assignment back,
+// sorts the keys by (cluster, distance) on the CPU, gathers K and V rows into the shadow pages in
+// that order, computes the page descriptors (f16 means), and publishes the chunk (chunk entry and
+// page count first, covered_end last, every write followed by a cache clean). Pages already
+// published are never rewritten except after a reset (positions written from 0 again).
+
+#ifdef GGML_HEXAGON_HETERO
+static const char * ggml_hexagon_cluster_cl_src = R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#ifndef KM_D
+#define KM_D 128
+#endif
+#ifndef KM_TILE
+#define KM_TILE 16
+#endif
+#ifndef KM_NMAX
+#define KM_NMAX 1024
+#endif
+inline __global const half * km_row(__global const uchar * K, uint n, uint h, uint nbk_row, uint nbk_head) {
+    return (__global const half *) (K + (ulong) n * nbk_row + (ulong) h * nbk_head);
+}
+__kernel void km_assign(__global const uchar * K, uint nbk_row, uint nbk_head,
+                        __global const float * mu, __global const float * mu2,
+                        __global uchar * assign, __global float * dist, __global uint * n_changed, uint N, uint C) {
+    const uint n = get_global_id(0), h = get_global_id(1), lid = get_local_id(0), lsz = get_local_size(0);
+    __local float lmu[KM_TILE * KM_D];
+    __local float lmu2[KM_TILE];
+    float8 k[KM_D / 8];
+    if (n < N) { __global const half * kr = km_row(K, n, h, nbk_row, nbk_head); for (uint i = 0; i < KM_D / 8; ++i) k[i] = convert_float8(vload8(i, kr)); }
+    float best = INFINITY; uint besti = 0;
+    for (uint c0 = 0; c0 < C; c0 += KM_TILE) {
+        const uint tc = min((uint) KM_TILE, C - c0);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (uint i = lid; i < tc * KM_D; i += lsz) lmu[i] = mu[((ulong) h * C + c0) * KM_D + i];
+        for (uint i = lid; i < tc; i += lsz) lmu2[i] = mu2[h * C + c0 + i];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (n < N) {
+            for (uint c = 0; c < tc; ++c) {
+                float8 acc = (float8)(0.0f);
+                for (uint i = 0; i < KM_D / 8; ++i) acc += k[i] * vload8(i, lmu + c * KM_D);
+                const float dt = acc.s0 + acc.s1 + acc.s2 + acc.s3 + acc.s4 + acc.s5 + acc.s6 + acc.s7;
+                const float dd = lmu2[c] - 2.0f * dt;
+                if (dd < best) { best = dd; besti = c0 + c; }
+            }
+        }
+    }
+    if (n < N) { const uint idx = h * N + n; if (assign[idx] != (uchar) besti) atomic_inc(n_changed); assign[idx] = (uchar) besti; dist[idx] = best; }
+}
+__kernel void km_update(__global const uchar * K, uint nbk_row, uint nbk_head,
+                        __global const uchar * assign, __global const float * dist,
+                        __global float * mu, __global float * mu2, __global uint * counts, uint N, uint C) {
+    const uint d = get_local_id(0), c = get_group_id(1), h = get_group_id(2);
+    __local uchar la[KM_NMAX];
+    __local float red[KM_D];
+    __local uint  lfar;
+    for (uint i = d; i < N; i += KM_D) la[i] = assign[h * N + i];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    float sum = 0.0f; uint cnt = 0;
+    for (uint n = 0; n < N; ++n) { if (la[n] == (uchar) c) { sum += vload_half(d, km_row(K, n, h, nbk_row, nbk_head)); cnt++; } }
+    float m;
+    if (cnt > 0) { m = sum / (float) cnt; }
+    else {
+        if (d == 0) { float bd = -INFINITY; uint bi = 0; for (uint n = 0; n < N; ++n) { const float v = dist[h * N + n]; if (v > bd) { bd = v; bi = n; } } lfar = bi; }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        m = vload_half(d, km_row(K, lfar, h, nbk_row, nbk_head));
+    }
+    mu[((ulong) h * C + c) * KM_D + d] = m;
+    red[d] = m * m;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint s = KM_D / 2; s > 0; s >>= 1) { if (d < s) red[d] += red[d + s]; barrier(CLK_LOCAL_MEM_FENCE); }
+    if (d == 0) { mu2[h * C + c] = red[0]; counts[h * C + c] = cnt; }
+}
+)CL";
+
+struct ggml_hexagon_cluster_sidecar {
+    ggml_hexagon_cluster * c = nullptr;
+    cl_platform_id plat = nullptr; cl_device_id dev = nullptr; cl_context ctx = nullptr; cl_command_queue q = nullptr;
+    cl_program prog = nullptr; cl_kernel k_assign = nullptr, k_update = nullptr;
+    cl_mem bK = nullptr, bMu = nullptr, bMu2 = nullptr, bCnt = nullptr, bAs = nullptr, bDist = nullptr, bChg = nullptr;
+    uint32_t N = 0, H = 0, D = 0, C = 0;    // chunk rows, heads, dims, centroids (N/64)
+    std::thread th;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<ggml_hexagon_cluster_job> jobs;
+    bool stop = false;
+    // scratch
+    std::vector<float> mu0, mu2;
+    std::vector<uint8_t> assign;
+    std::vector<float> dist;
+    std::vector<int> perm;
+    std::vector<float> acc;
+    // stats
+    uint64_t n_jobs = 0, n_chunks = 0, n_resets = 0, n_verify_fail = 0;
+    double   t_gpu_ms = 0, t_cpu_ms = 0, lag_max_ms = 0;
+};
+
+static bool cluster_cl_ok(cl_int e, const char * w) { if (e != CL_SUCCESS) { GGML_LOG_ERROR("ggml-hex: cluster: %s failed (%d)\n", w, e); return false; } return true; }
+
+static inline float cluster_f16_to_f32(uint16_t h) { return ggml_fp16_to_fp32(h); }
+
+// k-means++ init on a 256-row subsample of the chunk, per head (CPU, reads the cache rows directly)
+static void cluster_init_centroids(ggml_hexagon_cluster_sidecar * s, const uint8_t * krows, uint32_t nbk_row, uint32_t N, std::mt19937 & rng) {
+    const uint32_t H = s->H, D = s->D, C = s->C;
+    auto key = [&](uint32_t h, uint32_t n, uint32_t d) { return cluster_f16_to_f32(((const uint16_t *) (krows + (size_t) n * nbk_row + (size_t) h * D * 2))[d]); };
+    const uint32_t ns = std::min<uint32_t>(N, 256);
+    std::vector<uint32_t> sub(ns);
+    for (uint32_t i = 0; i < ns; ++i) sub[i] = (uint32_t) (((uint64_t) i * N) / ns);
+    std::vector<double> dmin(ns);
+    for (uint32_t h = 0; h < H; ++h) {
+        std::vector<uint32_t> chosen;
+        std::uniform_int_distribution<uint32_t> first(0, ns - 1);
+        chosen.push_back(sub[first(rng)]);
+        std::fill(dmin.begin(), dmin.end(), 1e30);
+        while (chosen.size() < C) {
+            const uint32_t last = chosen.back(); double tot = 0;
+            for (uint32_t i = 0; i < ns; ++i) { double sd = 0; for (uint32_t d = 0; d < D; ++d) { const double t = key(h, sub[i], d) - key(h, last, d); sd += t * t; } dmin[i] = std::min(dmin[i], sd); tot += dmin[i]; }
+            std::uniform_real_distribution<double> u(0.0, tot > 0 ? tot : 1.0); double r = u(rng); uint32_t pick = ns - 1;
+            for (uint32_t i = 0; i < ns; ++i) { r -= dmin[i]; if (r <= 0) { pick = i; break; } }
+            chosen.push_back(sub[pick]);
+        }
+        for (uint32_t c = 0; c < C; ++c) {
+            double sq = 0;
+            for (uint32_t d = 0; d < D; ++d) { const float v = key(h, chosen[c], d); s->mu0[((size_t) h * C + c) * D + d] = v; sq += (double) v * v; }
+            s->mu2[(size_t) h * C + c] = (float) sq;
+        }
+    }
+}
+
+// Cluster positions [pos0, pos1) of layer il into pages page_first.. and publish. Returns false on error.
+static bool cluster_run_chunk(ggml_hexagon_cluster_sidecar * s, uint32_t il, uint32_t pos0, uint32_t pos1) {
+    ggml_hexagon_cluster * c = s->c;
+    ggml_hexagon_cluster_layer & L = c->layers[il];
+    const htp_fa_cluster_header & hdr = c->hdr;
+    const uint32_t N = pos1 - pos0, H = s->H, D = s->D;
+    const uint32_t C = N / HTP_FA_CLUSTER_PAGE_KEYS, n_pages = C;
+    if (N == 0 || N > s->N || (N % HTP_FA_CLUSTER_PAGE_KEYS) || !L.k_root || !L.v_root) return false;
+    if (L.n_chunks >= hdr.max_chunks || L.n_pages + n_pages > hdr.n_pages_max) return false;
+    const uint32_t nbk_row = (uint32_t) L.k_root->nb[1];
+    const uint32_t nbk_head = D * 2;
+    const uint8_t * krows = (const uint8_t *) L.k_root->data + (size_t) pos0 * nbk_row;
+    const uint8_t * vrows = (const uint8_t *) L.v_root->data + (size_t) pos0 * L.v_root->nb[1];
+    const auto t0 = std::chrono::steady_clock::now();
+    // the DSP wrote these rows; make sure this core reads them from memory
+    cluster_dc_civac(krows, (size_t) N * nbk_row);
+    cluster_dc_civac(vrows, (size_t) N * L.v_root->nb[1]);
+
+    std::mt19937 rng(1234u + il * 7919u + pos0);
+    auto t1 = std::chrono::steady_clock::now();
+    if (opt_cluster_positional) {
+        // baseline: positional pages; every key is its own "cluster" in position order
+        for (uint32_t h = 0; h < H; ++h) for (uint32_t i = 0; i < N; ++i) { s->assign[(size_t) h * N + i] = (uint8_t) (i / HTP_FA_CLUSTER_PAGE_KEYS); s->dist[(size_t) h * N + i] = (float) (i % HTP_FA_CLUSTER_PAGE_KEYS); }
+    } else {
+    cluster_init_centroids(s, krows, nbk_row, N, rng);
+    t1 = std::chrono::steady_clock::now();
+
+    // GPU: chunk rows in, Lloyd iterations, assignment out
+    cl_int err = clEnqueueWriteBuffer(s->q, s->bK, CL_FALSE, 0, (size_t) N * nbk_row, krows, 0, nullptr, nullptr);
+    if (!cluster_cl_ok(err, "write K chunk")) return false;
+    clEnqueueWriteBuffer(s->q, s->bMu, CL_FALSE, 0, (size_t) H * C * D * 4, s->mu0.data(), 0, nullptr, nullptr);
+    clEnqueueWriteBuffer(s->q, s->bMu2, CL_FALSE, 0, (size_t) H * C * 4, s->mu2.data(), 0, nullptr, nullptr);
+    std::fill(s->assign.begin(), s->assign.end(), 0xff);
+    clEnqueueWriteBuffer(s->q, s->bAs, CL_FALSE, 0, (size_t) H * N, s->assign.data(), 0, nullptr, nullptr);
+    const cl_uint uN = N, uC = C, uNb = nbk_row, uNh = D * 2;
+    for (int it = 0; it < 8; ++it) {
+        const cl_uint zero = 0;
+        clEnqueueWriteBuffer(s->q, s->bChg, CL_FALSE, 0, 4, &zero, 0, nullptr, nullptr);
+        int a = 0;
+        clSetKernelArg(s->k_assign, a++, sizeof(cl_mem), &s->bK); clSetKernelArg(s->k_assign, a++, 4, &uNb); clSetKernelArg(s->k_assign, a++, 4, &uNh);
+        clSetKernelArg(s->k_assign, a++, sizeof(cl_mem), &s->bMu); clSetKernelArg(s->k_assign, a++, sizeof(cl_mem), &s->bMu2);
+        clSetKernelArg(s->k_assign, a++, sizeof(cl_mem), &s->bAs); clSetKernelArg(s->k_assign, a++, sizeof(cl_mem), &s->bDist); clSetKernelArg(s->k_assign, a++, sizeof(cl_mem), &s->bChg);
+        clSetKernelArg(s->k_assign, a++, 4, &uN); clSetKernelArg(s->k_assign, a++, 4, &uC);
+        size_t g1[2] = { (size_t) N, (size_t) H }, l1[2] = { 64, 1 };
+        if (!cluster_cl_ok(clEnqueueNDRangeKernel(s->q, s->k_assign, 2, nullptr, g1, l1, 0, nullptr, nullptr), "km_assign")) return false;
+        a = 0;
+        clSetKernelArg(s->k_update, a++, sizeof(cl_mem), &s->bK); clSetKernelArg(s->k_update, a++, 4, &uNb); clSetKernelArg(s->k_update, a++, 4, &uNh);
+        clSetKernelArg(s->k_update, a++, sizeof(cl_mem), &s->bAs); clSetKernelArg(s->k_update, a++, sizeof(cl_mem), &s->bDist);
+        clSetKernelArg(s->k_update, a++, sizeof(cl_mem), &s->bMu); clSetKernelArg(s->k_update, a++, sizeof(cl_mem), &s->bMu2); clSetKernelArg(s->k_update, a++, sizeof(cl_mem), &s->bCnt);
+        clSetKernelArg(s->k_update, a++, 4, &uN); clSetKernelArg(s->k_update, a++, 4, &uC);
+        size_t g2[3] = { (size_t) D, (size_t) C, (size_t) H }, l2[3] = { (size_t) D, 1, 1 };
+        if (!cluster_cl_ok(clEnqueueNDRangeKernel(s->q, s->k_update, 3, nullptr, g2, l2, 0, nullptr, nullptr), "km_update")) return false;
+        cl_uint changed = 0;
+        clEnqueueReadBuffer(s->q, s->bChg, CL_TRUE, 0, 4, &changed, 0, nullptr, nullptr);
+        if (changed == 0) break;
+    }
+    clEnqueueReadBuffer(s->q, s->bAs, CL_FALSE, 0, (size_t) H * N, s->assign.data(), 0, nullptr, nullptr);
+    clEnqueueReadBuffer(s->q, s->bDist, CL_TRUE, 0, (size_t) H * N * 4, s->dist.data(), 0, nullptr, nullptr);
+    }
+    const auto t2 = std::chrono::steady_clock::now();
+
+    // CPU: per head, sort by (cluster, distance), gather rows into the shadow, page means
+    uint8_t * lb = c->base + hdr.layer0_off + (size_t) il * hdr.layer_stride;
+    const size_t head_stride = (size_t) hdr.n_pages_max * hdr.page_bytes;
+    const uint32_t page_first = L.n_pages;
+    for (uint32_t h = 0; h < H; ++h) {
+        const uint8_t * as = s->assign.data() + (size_t) h * N;
+        const float *   ds = s->dist.data() + (size_t) h * N;
+        s->perm.resize(N);
+        for (uint32_t i = 0; i < N; ++i) s->perm[i] = (int) i;
+        std::stable_sort(s->perm.begin(), s->perm.end(), [&](int x, int y) { return as[x] != as[y] ? as[x] < as[y] : ds[x] < ds[y]; });
+        uint8_t *  kp = lb + hdr.off_k_pages + (size_t) h * head_stride + (size_t) page_first * hdr.page_bytes;
+        uint8_t *  vp = lb + hdr.off_v_pages + (size_t) h * head_stride + (size_t) page_first * hdr.page_bytes;
+        uint32_t * pm = (uint32_t *) (lb + hdr.off_pos_map) + ((size_t) h * hdr.n_pages_max + page_first) * HTP_FA_CLUSTER_PAGE_KEYS;
+        for (uint32_t i = 0; i < N; ++i) {
+            const uint32_t n = (uint32_t) s->perm[i];
+            memcpy(kp + (size_t) i * D * 2, krows + (size_t) n * nbk_row + (size_t) h * nbk_head, (size_t) D * 2);
+            memcpy(vp + (size_t) i * D * 2, vrows + (size_t) n * L.v_root->nb[1] + (size_t) h * nbk_head, (size_t) D * 2);
+            pm[i] = pos0 + n;
+        }
+        // descriptors: f16 mean of each page's keys
+        uint16_t * cent = (uint16_t *) (lb + hdr.off_centroids + ((size_t) h * hdr.n_pages_max + page_first) * hdr.centroid_bytes);
+        for (uint32_t p = 0; p < n_pages; ++p) {
+            std::fill(s->acc.begin(), s->acc.end(), 0.0f);
+            const uint16_t * rows = (const uint16_t *) (kp + (size_t) p * hdr.page_bytes);
+            for (uint32_t i = 0; i < HTP_FA_CLUSTER_PAGE_KEYS; ++i) for (uint32_t d = 0; d < D; ++d) s->acc[d] += cluster_f16_to_f32(rows[i * D + d]);
+            uint16_t * cp = (uint16_t *) ((uint8_t *) cent + (size_t) p * hdr.centroid_bytes);
+            for (uint32_t d = 0; d < D; ++d) cp[d] = ggml_fp32_to_fp16(s->acc[d] * (1.0f / HTP_FA_CLUSTER_PAGE_KEYS));
+        }
+        cluster_dc_civac(kp, (size_t) n_pages * hdr.page_bytes);
+        cluster_dc_civac(vp, (size_t) n_pages * hdr.page_bytes);
+        cluster_dc_civac(pm, (size_t) N * 4);
+        cluster_dc_civac(cent, (size_t) n_pages * hdr.centroid_bytes);
+    }
+    // chunk entry, then the directory (page count, then covered_end last)
+    auto * chunk = (htp_fa_cluster_chunk *) (lb + hdr.off_chunks) + L.n_chunks;
+    *chunk = { pos0, pos1, page_first, n_pages };
+    cluster_dc_civac(chunk, sizeof(*chunk));
+    auto * dir = (htp_fa_cluster_dir *) (c->base + HTP_FA_CLUSTER_DIR_OFF + (size_t) il * HTP_FA_CLUSTER_DIR_STRIDE);
+    L.n_chunks += 1; L.n_pages += n_pages;
+    dir->n_chunks = L.n_chunks; dir->n_pages_pub = L.n_pages;
+    cluster_dc_civac(dir, sizeof(*dir));
+    dir->covered_end = pos1;
+    cluster_dc_civac(dir, sizeof(*dir));
+    L.covered_end = pos1;
+    const auto t3 = std::chrono::steady_clock::now();
+    s->t_gpu_ms += std::chrono::duration<double, std::milli>(t2 - t1).count();
+    s->t_cpu_ms += std::chrono::duration<double, std::milli>(t1 - t0).count() + std::chrono::duration<double, std::milli>(t3 - t2).count();
+    s->n_chunks++;
+
+    if (opt_cluster_verify) {
+        // pos_map is a permutation of [pos0, pos1); every page row equals the cache row it names;
+        // every descriptor is the mean of its page within 1e-2
+        int bad = 0;
+        for (uint32_t h = 0; h < H && bad == 0; ++h) {
+            const uint32_t * pm = (const uint32_t *) (lb + hdr.off_pos_map) + ((size_t) h * hdr.n_pages_max + page_first) * HTP_FA_CLUSTER_PAGE_KEYS;
+            std::vector<uint8_t> seen(N, 0);
+            const uint8_t * kp = lb + hdr.off_k_pages + (size_t) h * head_stride + (size_t) page_first * hdr.page_bytes;
+            for (uint32_t i = 0; i < N; ++i) {
+                const uint32_t pos = pm[i];
+                if (pos < pos0 || pos >= pos1 || seen[pos - pos0]++) { bad = 1; break; }
+                if (memcmp(kp + (size_t) i * D * 2, krows + (size_t) (pos - pos0) * nbk_row + (size_t) h * nbk_head, (size_t) D * 2)) { bad = 2; break; }
+            }
+            const uint16_t * cent = (const uint16_t *) (lb + hdr.off_centroids + ((size_t) h * hdr.n_pages_max + page_first) * hdr.centroid_bytes);
+            for (uint32_t p = 0; p < n_pages && !bad; ++p) {
+                for (uint32_t d = 0; d < D; d += 37) {
+                    double m = 0; for (uint32_t i = 0; i < HTP_FA_CLUSTER_PAGE_KEYS; ++i) m += cluster_f16_to_f32(((const uint16_t *) (kp + (size_t) p * hdr.page_bytes))[i * D + d]);
+                    m /= HTP_FA_CLUSTER_PAGE_KEYS;
+                    if (fabs(m - cluster_f16_to_f32(((const uint16_t *) ((const uint8_t *) cent + (size_t) p * hdr.centroid_bytes))[d])) > 1e-2 + 1e-2 * fabs(m)) { bad = 3; break; }
+                }
+            }
+        }
+        if (bad) s->n_verify_fail++;
+        if (bad || opt_verbose) {
+            GGML_LOG_INFO("ggml-hex: cluster: layer %u chunk [%u,%u) -> pages %u..%u: %s (gpu %.2f ms, cpu %.2f ms)\n", il, pos0, pos1, page_first, page_first + n_pages - 1,
+                          bad == 0 ? "verified" : bad == 1 ? "POS_MAP NOT A PERMUTATION" : bad == 2 ? "PAGE ROW MISMATCH" : "DESCRIPTOR MISMATCH",
+                          std::chrono::duration<double, std::milli>(t2 - t1).count(), std::chrono::duration<double, std::milli>(t3 - t2 + t1 - t0).count());
+        }
+    }
+    return true;
+}
+
+static void cluster_reset_layer(ggml_hexagon_cluster * c, uint32_t il) {
+    ggml_hexagon_cluster_layer & L = c->layers[il];
+    auto * dir = (htp_fa_cluster_dir *) (c->base + HTP_FA_CLUSTER_DIR_OFF + (size_t) il * HTP_FA_CLUSTER_DIR_STRIDE);
+    dir->covered_end = 0;
+    cluster_dc_civac(dir, sizeof(*dir));
+    dir->n_pages_pub = 0; dir->n_chunks = 0; dir->stale = 0;
+    cluster_dc_civac(dir, sizeof(*dir));
+    L.covered_end = 0; L.n_chunks = 0; L.n_pages = 0; L.written_end = 0; L.stale = false;
+}
+
+static void ggml_hexagon_cluster_sidecar_main(ggml_hexagon_cluster_sidecar * s) {
+    if (opt_cluster_cpu >= 0) {
+        cpu_set_t set; CPU_ZERO(&set); CPU_SET(opt_cluster_cpu, &set);
+        sched_setaffinity(0, sizeof(set), &set);
+    }
+    ggml_hexagon_cluster * c = s->c;
+    for (;;) {
+        ggml_hexagon_cluster_job job;
+        {
+            std::unique_lock<std::mutex> lk(s->mu);
+            s->cv.wait(lk, [&] { return s->stop || !s->jobs.empty(); });
+            if (s->stop && s->jobs.empty()) return;
+            job = s->jobs.front();
+            s->jobs.pop_front();
+        }
+        s->n_jobs++;
+        const bool prefill = job.n_tokens > 1;
+        const bool end_of_prefill = !prefill && c->last_n_tokens > 1;
+        c->last_n_tokens = job.n_tokens;
+        for (uint32_t il = 0; il < c->layers.size(); ++il) {
+            ggml_hexagon_cluster_layer & L = c->layers[il];
+            if (!L.k_root || !L.v_root) continue;
+            if (job.pos_min == 0 && (L.written_end > 0 || L.covered_end > 0)) {
+                cluster_reset_layer(c, il);   // the cache is being filled from position 0 again
+                s->n_resets++;
+            }
+            if (!job.contiguous || (uint64_t) job.pos_min < L.covered_end) {
+                if (!L.stale) {
+                    L.stale = true;
+                    auto * dir = (htp_fa_cluster_dir *) (c->base + HTP_FA_CLUSTER_DIR_OFF + (size_t) il * HTP_FA_CLUSTER_DIR_STRIDE);
+                    dir->stale = 1; cluster_dc_civac(dir, sizeof(*dir));
+                    GGML_LOG_WARN("ggml-hex: cluster: layer %u: rows written below covered_end or non-contiguous; layer runs dense until a reset\n", il);
+                }
+                continue;
+            }
+            if (L.stale) continue;
+            if ((uint64_t) job.pos_min > L.written_end) { L.stale = true; continue; }   // a gap: no clustering across it
+            L.written_end = std::max<uint32_t>(L.written_end, (uint32_t) job.pos_max + 1);
+            const uint32_t chunk = (uint32_t) opt_cluster_chunk;
+            while (L.written_end - L.covered_end >= chunk) {
+                if (!cluster_run_chunk(s, il, L.covered_end, L.covered_end + chunk)) { L.stale = true; break; }
+            }
+            if (end_of_prefill && !L.stale) {
+                // the prompt ended: cluster the remaining tail down to a page boundary
+                const uint32_t tail = (L.written_end - L.covered_end) & ~(HTP_FA_CLUSTER_PAGE_KEYS - 1);
+                if (tail >= 2 * HTP_FA_CLUSTER_PAGE_KEYS) {
+                    if (!cluster_run_chunk(s, il, L.covered_end, L.covered_end + tail)) L.stale = true;
+                }
+            }
+        }
+        const double lag = (std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now().time_since_epoch()).count() - (double) job.t_post_ns) * 1e-6;
+        s->lag_max_ms = std::max(s->lag_max_ms, lag);
+        if (opt_verbose) {
+            GGML_LOG_DEBUG("ggml-hex: cluster: job %llu (%d tokens, pos %lld..%lld) done: chunks so far %llu, gpu %.1f ms, cpu %.1f ms, lag %.1f ms\n",
+                           (unsigned long long) job.seq, job.n_tokens, (long long) job.pos_min, (long long) job.pos_max, (unsigned long long) s->n_chunks, s->t_gpu_ms, s->t_cpu_ms, lag);
+        }
+    }
+}
+
+static bool ggml_hexagon_cluster_sidecar_start(ggml_hexagon_cluster * c) {
+    auto s = new ggml_hexagon_cluster_sidecar();
+    s->c = c; s->N = (uint32_t) opt_cluster_chunk; s->H = c->hdr.n_kv_heads; s->D = c->hdr.D; s->C = s->N / HTP_FA_CLUSTER_PAGE_KEYS;
+    cl_int err; cl_uint n = 0;
+    if (!cluster_cl_ok(clGetPlatformIDs(1, &s->plat, &n), "clGetPlatformIDs") || !n) { delete s; return false; }
+    if (!cluster_cl_ok(clGetDeviceIDs(s->plat, CL_DEVICE_TYPE_GPU, 1, &s->dev, &n), "clGetDeviceIDs") || !n) { delete s; return false; }
+    s->ctx = clCreateContext(nullptr, 1, &s->dev, nullptr, nullptr, &err);
+    if (!cluster_cl_ok(err, "clCreateContext")) { delete s; return false; }
+    s->q = clCreateCommandQueueWithProperties(s->ctx, s->dev, nullptr, &err);
+    if (!cluster_cl_ok(err, "clCreateCommandQueue")) { delete s; return false; }
+    char opts[128]; snprintf(opts, sizeof(opts), "-cl-std=CL2.0 -DKM_D=%u -DKM_TILE=16 -DKM_NMAX=%u", s->D, s->N);
+    s->prog = clCreateProgramWithSource(s->ctx, 1, &ggml_hexagon_cluster_cl_src, nullptr, &err);
+    if (clBuildProgram(s->prog, 1, &s->dev, opts, nullptr, nullptr) != CL_SUCCESS) {
+        size_t ln = 0; clGetProgramBuildInfo(s->prog, s->dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &ln); std::string log(ln, 0);
+        clGetProgramBuildInfo(s->prog, s->dev, CL_PROGRAM_BUILD_LOG, ln, log.data(), nullptr);
+        GGML_LOG_ERROR("ggml-hex: cluster: k-means program build failed:\n%s\n", log.c_str()); delete s; return false;
+    }
+    s->k_assign = clCreateKernel(s->prog, "km_assign", &err); s->k_update = clCreateKernel(s->prog, "km_update", &err);
+    const uint32_t nbk_row = s->H * s->D * 2;
+    s->bK   = clCreateBuffer(s->ctx, CL_MEM_READ_ONLY,  (size_t) s->N * nbk_row, nullptr, &err);
+    s->bMu  = clCreateBuffer(s->ctx, CL_MEM_READ_WRITE, (size_t) s->H * s->C * s->D * 4, nullptr, &err);
+    s->bMu2 = clCreateBuffer(s->ctx, CL_MEM_READ_WRITE, (size_t) s->H * s->C * 4, nullptr, &err);
+    s->bCnt = clCreateBuffer(s->ctx, CL_MEM_READ_WRITE, (size_t) s->H * s->C * 4, nullptr, &err);
+    s->bAs  = clCreateBuffer(s->ctx, CL_MEM_READ_WRITE, (size_t) s->H * s->N, nullptr, &err);
+    s->bDist = clCreateBuffer(s->ctx, CL_MEM_READ_WRITE, (size_t) s->H * s->N * 4, nullptr, &err);
+    s->bChg = clCreateBuffer(s->ctx, CL_MEM_READ_WRITE, 4, nullptr, &err);
+    if (!s->k_assign || !s->k_update || !s->bK || !s->bMu || !s->bMu2 || !s->bCnt || !s->bAs || !s->bDist || !s->bChg) {
+        GGML_LOG_ERROR("ggml-hex: cluster: OpenCL objects failed\n"); delete s; return false;
+    }
+    s->mu0.resize((size_t) s->H * s->C * s->D); s->mu2.resize((size_t) s->H * s->C);
+    s->assign.resize((size_t) s->H * s->N); s->dist.resize((size_t) s->H * s->N); s->acc.resize(s->D);
+    c->side = s;
+    s->th = std::thread(ggml_hexagon_cluster_sidecar_main, s);
+    return true;
+}
+
+static void ggml_hexagon_cluster_sidecar_stop(ggml_hexagon_cluster * c) {
+    ggml_hexagon_cluster_sidecar * s = c->side;
+    if (!s) return;
+    { std::lock_guard<std::mutex> lk(s->mu); s->stop = true; }
+    s->cv.notify_one();
+    if (s->th.joinable()) s->th.join();
+    GGML_LOG_INFO("ggml-hex: cluster sidecar: %llu jobs, %llu chunks, %llu resets, gpu %.1f ms, cpu %.1f ms, max lag %.1f ms, verify failures %llu\n",
+                  (unsigned long long) s->n_jobs, (unsigned long long) s->n_chunks, (unsigned long long) s->n_resets, s->t_gpu_ms, s->t_cpu_ms, s->lag_max_ms,
+                  (unsigned long long) s->n_verify_fail);
+    if (s->q) clFinish(s->q);
+    for (cl_mem m : { s->bK, s->bMu, s->bMu2, s->bCnt, s->bAs, s->bDist, s->bChg }) if (m) clReleaseMemObject(m);
+    if (s->k_assign) clReleaseKernel(s->k_assign);
+    if (s->k_update) clReleaseKernel(s->k_update);
+    if (s->prog) clReleaseProgram(s->prog);
+    if (s->q) clReleaseCommandQueue(s->q);
+    if (s->ctx) clReleaseContext(s->ctx);
+    delete s;
+    c->side = nullptr;
+}
+#endif // GGML_HEXAGON_HETERO
+
+// Record which KV rows the graph is about to write. Called at the TOP of graph_compute, after
+// llama's set_inputs and BEFORE the ops run: the SET_ROWS index leaf (src[1]) is a transient whose
+// buffer the scheduler recycles for activations during compute, so its positions must be read now,
+// not afterwards. The k/v cache roots (src[2]) are stable. All layers of a batch share one index.
+static void ggml_hexagon_cluster_track_graph(ggml_hexagon_session * sess, const ggml_cgraph * graph) {
+    ggml_hexagon_cluster * c = sess->cluster;
+    if (!c) return;
+    const ggml_tensor * idx = nullptr;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * n = graph->nodes[i];
+        if (n->op != GGML_OP_SET_ROWS || !n->src[2] || !n->src[1]) continue;
+        int il = -1; bool is_v = false;
+        if (sscanf(n->src[2]->name, "cache_k_l%d", &il) == 1) { is_v = false; }
+        else if (sscanf(n->src[2]->name, "cache_v_l%d", &il) == 1) { is_v = true; }
+        else continue;
+        if (il < 0 || (size_t) il >= c->layers.size()) continue;
+        if (is_v) c->layers[il].v_root = n->src[2]; else c->layers[il].k_root = n->src[2];
+        idx = n->src[1];
+    }
+    c->idx_tensor = idx;
+    c->pending = false;
+    if (!idx || !idx->data || idx->ne[0] <= 0) return;
+    if (idx->type != GGML_TYPE_I64 && idx->type != GGML_TYPE_I32) return;
+    const int64_t n = idx->ne[0];
+    int64_t mn = INT64_MAX, mx = -1; bool bad = false;
+    for (int64_t i = 0; i < n; ++i) {
+        const int64_t v = idx->type == GGML_TYPE_I64 ? ((const int64_t *) idx->data)[i] : (int64_t) ((const int32_t *) idx->data)[i];
+        if (v < 0 || v >= (int64_t) c->hdr.kv_size) { bad = true; break; }
+        mn = std::min(mn, v); mx = std::max(mx, v);
+    }
+    if (bad || mx < 0) return;   // out-of-range (rewind, multi-stream, recycled buffer): skip this batch
+    ggml_hexagon_cluster_job & j = c->pending_job;
+    j.seq = ++c->seq; j.n_tokens = (int32_t) n; j.pos_min = mn; j.pos_max = mx;
+    j.contiguous = (mx - mn + 1 == n);
+    c->pending = true;
+}
+
+// The graph completed (the DSP has written the KV rows): hand the batch captured before compute to
+// the sidecar, which can now read those cache rows.
+static void ggml_hexagon_cluster_after_compute(ggml_hexagon_session * sess) {
+    ggml_hexagon_cluster * c = sess->cluster;
+    if (!c || !c->pending) return;
+    c->pending = false;
+#ifdef GGML_HEXAGON_HETERO
+    if (!c->side) return;
+    ggml_hexagon_cluster_job job = c->pending_job;
+    job.t_post_ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    { std::lock_guard<std::mutex> lk(c->side->mu); c->side->jobs.push_back(job); }
+    c->side->cv.notify_one();
+#endif
+}
+
 static bool ggml_hexagon_cluster_init(ggml_hexagon_session * sess, uint32_t n_layers, uint32_t kv_size, uint32_t n_kv_heads, uint32_t D) {
     auto c = new ggml_hexagon_cluster();
     c->sess = sess;
+    c->layers.resize(n_layers);
     c->size = (size_t) htp_fa_cluster_layout(&c->hdr, n_layers, kv_size, n_kv_heads, D);
     c->buf  = ggml_backend_buft_alloc_buffer(&sess->buffer_type, c->size);
     if (!c->buf) {
@@ -4378,6 +4865,13 @@ static bool ggml_hexagon_cluster_init(ggml_hexagon_session * sess, uint32_t n_la
     c->ctrl->data   = c->base;
     ggml_set_name(c->ctrl, "hexagon_cluster_shadow");
     sess->cluster = c;
+#ifdef GGML_HEXAGON_HETERO
+    if (!ggml_hexagon_cluster_sidecar_start(c)) {
+        GGML_LOG_WARN("ggml-hex: cluster: sidecar unavailable (OpenCL); the shadow stays empty and decode runs dense\n");
+    }
+#else
+    GGML_LOG_WARN("ggml-hex: cluster: built without OpenCL; no clustering sidecar, decode runs dense\n");
+#endif
     GGML_LOG_INFO("ggml-hex: %s cluster attention: shadow %zu MB (%u layers x %u heads x %u pages of %u keys), density %d permille, window %d, flags 0x%x\n",
                   sess->c_name(), c->size >> 20, n_layers, n_kv_heads, c->hdr.n_pages_max, c->hdr.page_keys,
                   opt_cluster_density, opt_cluster_window, opt_cluster_flags);
@@ -4431,6 +4925,9 @@ static void ggml_hexagon_cluster_free(ggml_hexagon_session * sess) {
     ggml_hexagon_cluster * c = sess->cluster;
     if (!c) return;
     GGML_LOG_INFO("ggml-hex: %s cluster: %u nodes tagged\n", sess->c_name(), c->n_tagged);
+#ifdef GGML_HEXAGON_HETERO
+    ggml_hexagon_cluster_sidecar_stop(c);
+#endif
     if (c->tctx) ggml_free(c->tctx);
     if (c->buf) ggml_backend_buffer_free(c->buf);
     delete c;
@@ -4858,7 +5355,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                             opt_cluster_density = -1;
                         }
                     }
-                    if (sess->cluster) {
+                    if (sess->cluster && n->src[0]->ne[1] == 1) {
                         ggml_hexagon_cluster_prepare(sess, n, (const struct htp_fa_kernel_params *) node.kernel_params, cluster_fa_ordinal);
                     }
                     cluster_fa_ordinal++;
@@ -4883,6 +5380,11 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
             nodes_ptr = &computed_nodes;
         }
     }
+    // Read the KV write positions now, before the ops recycle the index leaf's buffer (runs on
+    // cache hit and miss; the k/v roots are refreshed here too when the graph was rebuilt).
+    if (sess->cluster) {
+        ggml_hexagon_cluster_track_graph(sess, graph);
+    }
 
 #ifdef GGML_HEXAGON_HETERO
     if (sess->hetero) {
@@ -4904,6 +5406,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     } else {
         // Wait until all pending ops complete
         sess->flush();
+        ggml_hexagon_cluster_after_compute(sess);
     }
 
     return GGML_STATUS_SUCCESS;
@@ -4916,6 +5419,7 @@ static void ggml_backend_hexagon_synchronize(ggml_backend_t backend) {
 
     // Wait until all pending ops complete
     sess->flush();
+    ggml_hexagon_cluster_after_compute(sess);
 }
 
 static std::vector<int> ggml_hexagon_graph_optimize_reorder(const std::vector<htp_opnode> & nodes) {
@@ -5596,6 +6100,10 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_hetero_cpu  = getenv("GGML_HEXAGON_HETERO_CPU");
     const char * str_hetero_adapt = getenv("GGML_HEXAGON_HETERO_ADAPT");
     const char * str_cluster  = getenv("GGML_HEXAGON_CLUSTER_ATTN");
+    const char * str_cluster_cpu = getenv("GGML_HEXAGON_CLUSTER_CPU");
+    const char * str_cluster_verify = getenv("GGML_HEXAGON_CLUSTER_VERIFY");
+    const char * str_cluster_chunk = getenv("GGML_HEXAGON_CLUSTER_CHUNK");
+    const char * str_cluster_pos   = getenv("GGML_HEXAGON_CLUSTER_POSITIONAL");
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
     const char * str_vmem     = getenv("GGML_HEXAGON_VMEM");
@@ -5673,6 +6181,14 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
         } else {
             GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_CLUSTER_ATTN='%s' not understood (want <density_permille>,<window>[,flags]); ignored\n", str_cluster);
         }
+    }
+    opt_cluster_cpu    = str_cluster_cpu    ? atoi(str_cluster_cpu)    : opt_cluster_cpu;
+    opt_cluster_verify = str_cluster_verify ? atoi(str_cluster_verify) : opt_cluster_verify;
+    opt_cluster_chunk  = str_cluster_chunk  ? atoi(str_cluster_chunk)  : opt_cluster_chunk;
+    opt_cluster_positional = str_cluster_pos ? atoi(str_cluster_pos)  : opt_cluster_positional;
+    if (opt_cluster_chunk < 128 || opt_cluster_chunk > 1024 || (opt_cluster_chunk % 64)) {
+        GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_CLUSTER_CHUNK=%d out of range (128..1024, multiple of 64); using 1024\n", opt_cluster_chunk);
+        opt_cluster_chunk = 1024;
     }
     opt_ndev      = str_ndev     ? strtoul(str_ndev, NULL, 0)             : opt_ndev;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf)                      : opt_hostbuf;

@@ -203,7 +203,7 @@ struct htp_fa_cluster_header {
     uint64_t off_host_sel;    // [n_kv_heads] x host_sel_stride: { uint32_t n; uint32_t pad[31]; uint16_t pages[]; }
     uint64_t off_echo_sel;    // same shape, written by the kernel under HTP_FA_CLUSTER_FLAG_ECHO
     uint64_t off_centroids;   // [n_kv_heads][n_pages_max] x f16[D] (centroid_bytes rows)
-    uint64_t off_pos_map;     // [n_pages_max] x uint32_t[page_keys]: positional row of each key
+    uint64_t off_pos_map;     // [n_kv_heads][n_pages_max] x uint32_t[page_keys]: positional row of each key
     uint64_t off_n_valid;     // [n_pages_max] x uint16_t (reserved: pages are full in v1)
     uint64_t off_k_pages;     // [n_kv_heads][n_pages_max] x [page_keys][D] f16
     uint64_t off_v_pages;     // same
@@ -250,7 +250,7 @@ static inline uint64_t htp_fa_cluster_layout(struct htp_fa_cluster_header * h, u
     h->off_host_sel  = htp_fa_cluster_align(off, 128); off  = h->off_host_sel  + (uint64_t) n_kv_heads * h->host_sel_stride;
     h->off_echo_sel  = htp_fa_cluster_align(off, 128); off  = h->off_echo_sel  + (uint64_t) n_kv_heads * h->host_sel_stride;
     h->off_centroids = htp_fa_cluster_align(off, 128); off  = h->off_centroids + (uint64_t) n_kv_heads * h->n_pages_max * h->centroid_bytes;
-    h->off_pos_map   = htp_fa_cluster_align(off, 128); off  = h->off_pos_map   + (uint64_t) h->n_pages_max * HTP_FA_CLUSTER_PAGE_KEYS * 4;
+    h->off_pos_map   = htp_fa_cluster_align(off, 128); off  = h->off_pos_map   + (uint64_t) n_kv_heads * h->n_pages_max * HTP_FA_CLUSTER_PAGE_KEYS * 4;
     h->off_n_valid   = htp_fa_cluster_align(off, 128); off  = h->off_n_valid   + htp_fa_cluster_align((uint64_t) h->n_pages_max * 2, 128);
     h->off_k_pages   = htp_fa_cluster_align(off, 16384); off = h->off_k_pages  + (uint64_t) n_kv_heads * h->n_pages_max * h->page_bytes;
     h->off_v_pages   = htp_fa_cluster_align(off, 16384); off = h->off_v_pages  + (uint64_t) n_kv_heads * h->n_pages_max * h->page_bytes;

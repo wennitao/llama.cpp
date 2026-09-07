@@ -489,12 +489,12 @@ static int run_cluster(const options & o, ggml_backend_t be, ggml_backend_buffer
     std::vector<int> perm(covered_end);
     for (int i = 0; i < covered_end; ++i) perm[i] = i;
     if (!o.perm_identity) std::shuffle(perm.begin(), perm.end(), rng);
-    auto * pos_map = (uint32_t *) (lb + hdr.off_pos_map);
+    auto * pos_map = (uint32_t *) (lb + hdr.off_pos_map);   // per head; one permutation shared here
     const size_t head_stride = (size_t) hdr.n_pages_max * hdr.page_bytes;
     for (int p = 0; p < n_cand; ++p) {
         for (int i = 0; i < 64; ++i) {
             const int pos = perm[p * 64 + i];
-            pos_map[p * 64 + i] = (uint32_t) pos;
+            for (int h = 0; h < o.nkvh; ++h) pos_map[(size_t) h * hdr.n_pages_max * 64 + p * 64 + i] = (uint32_t) pos;
             for (int h = 0; h < o.nkvh; ++h) {
                 const size_t poff = (size_t) h * head_stride + (size_t) p * hdr.page_bytes + (size_t) i * o.d * 2;
                 memcpy(lb + hdr.off_k_pages + poff, base + L.k + (size_t) pos * L.nbk1 + (size_t) h * L.nbk2, (size_t) o.d * 2);
