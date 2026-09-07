@@ -110,6 +110,7 @@ static int      opt_cluster_verify  = 0;    // CPU-check every published chunk a
 static int      opt_cluster_chunk   = 1024; // keys per clustering chunk (multiple of 64)
 static int      opt_cluster_positional = 0; // 1 = baseline: pages are 64 consecutive positions (no k-means), descriptor = mean
 static int      opt_cluster_mem_mb   = 0;    // shadow memory budget in MB; 0 = what is left of the cDSP vmem budget after weights + KV
+static int      opt_cluster_page     = 64;   // keys per shadow page: 16, 32 or 64 (GGML_HEXAGON_CLUSTER_PAGE)
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
@@ -4532,9 +4533,9 @@ static bool cluster_run_chunk(ggml_hexagon_cluster_sidecar * s, uint32_t il, uin
     ggml_hexagon_cluster * c = s->c;
     ggml_hexagon_cluster_layer & L = c->layers[il];
     const htp_fa_cluster_header & hdr = c->hdr;
-    const uint32_t N = pos1 - pos0, H = s->H, D = s->D;
-    const uint32_t C = N / HTP_FA_CLUSTER_PAGE_KEYS, n_pages = C;
-    if (N == 0 || N > s->N || (N % HTP_FA_CLUSTER_PAGE_KEYS) || !L.k_root || !L.v_root) return false;
+    const uint32_t N = pos1 - pos0, H = s->H, D = s->D, PK = hdr.page_keys;
+    const uint32_t C = N / PK, n_pages = C;
+    if (N == 0 || N > s->N || (N % PK) || C > 255 || !L.k_root || !L.v_root) return false;   // assignments are uchar
     if (L.n_chunks >= hdr.max_chunks || L.n_pages + n_pages > hdr.n_pages_max) return false;
     const uint32_t nbk_row = (uint32_t) L.k_root->nb[1];
     const uint32_t nbk_head = D * 2;
@@ -4549,7 +4550,7 @@ static bool cluster_run_chunk(ggml_hexagon_cluster_sidecar * s, uint32_t il, uin
     auto t1 = std::chrono::steady_clock::now();
     if (opt_cluster_positional) {
         // baseline: positional pages; every key is its own "cluster" in position order
-        for (uint32_t h = 0; h < H; ++h) for (uint32_t i = 0; i < N; ++i) { s->assign[(size_t) h * N + i] = (uint8_t) (i / HTP_FA_CLUSTER_PAGE_KEYS); s->dist[(size_t) h * N + i] = (float) (i % HTP_FA_CLUSTER_PAGE_KEYS); }
+        for (uint32_t h = 0; h < H; ++h) for (uint32_t i = 0; i < N; ++i) { s->assign[(size_t) h * N + i] = (uint8_t) (i / PK); s->dist[(size_t) h * N + i] = (float) (i % PK); }
     } else {
     cluster_init_centroids(s, krows, nbk_row, N, rng);
     t1 = std::chrono::steady_clock::now();
@@ -4600,7 +4601,7 @@ static bool cluster_run_chunk(ggml_hexagon_cluster_sidecar * s, uint32_t il, uin
         std::stable_sort(s->perm.begin(), s->perm.end(), [&](int x, int y) { return as[x] != as[y] ? as[x] < as[y] : ds[x] < ds[y]; });
         uint8_t *  kp = lb + hdr.off_k_pages + (size_t) h * head_stride + (size_t) page_first * hdr.page_bytes;
         uint8_t *  vp = lb + hdr.off_v_pages + (size_t) h * head_stride + (size_t) page_first * hdr.page_bytes;
-        uint32_t * pm = (uint32_t *) (lb + hdr.off_pos_map) + ((size_t) h * hdr.n_pages_max + page_first) * HTP_FA_CLUSTER_PAGE_KEYS;
+        uint32_t * pm = (uint32_t *) (lb + hdr.off_pos_map) + ((size_t) h * hdr.n_pages_max + page_first) * PK;
         for (uint32_t i = 0; i < N; ++i) {
             const uint32_t n = (uint32_t) s->perm[i];
             memcpy(kp + (size_t) i * D * 2, krows + (size_t) n * nbk_row + (size_t) h * nbk_head, (size_t) D * 2);
@@ -4612,9 +4613,9 @@ static bool cluster_run_chunk(ggml_hexagon_cluster_sidecar * s, uint32_t il, uin
         for (uint32_t p = 0; p < n_pages; ++p) {
             std::fill(s->acc.begin(), s->acc.end(), 0.0f);
             const uint16_t * rows = (const uint16_t *) (kp + (size_t) p * hdr.page_bytes);
-            for (uint32_t i = 0; i < HTP_FA_CLUSTER_PAGE_KEYS; ++i) for (uint32_t d = 0; d < D; ++d) s->acc[d] += cluster_f16_to_f32(rows[i * D + d]);
+            for (uint32_t i = 0; i < PK; ++i) for (uint32_t d = 0; d < D; ++d) s->acc[d] += cluster_f16_to_f32(rows[i * D + d]);
             uint16_t * cp = (uint16_t *) ((uint8_t *) cent + (size_t) p * hdr.centroid_bytes);
-            for (uint32_t d = 0; d < D; ++d) cp[d] = ggml_fp32_to_fp16(s->acc[d] * (1.0f / HTP_FA_CLUSTER_PAGE_KEYS));
+            for (uint32_t d = 0; d < D; ++d) cp[d] = ggml_fp32_to_fp16(s->acc[d] * (1.0f / (float) PK));
         }
         cluster_dc_civac(kp, (size_t) n_pages * hdr.page_bytes);
         cluster_dc_civac(vp, (size_t) n_pages * hdr.page_bytes);
@@ -4642,7 +4643,7 @@ static bool cluster_run_chunk(ggml_hexagon_cluster_sidecar * s, uint32_t il, uin
         // every descriptor is the mean of its page within 1e-2
         int bad = 0;
         for (uint32_t h = 0; h < H && bad == 0; ++h) {
-            const uint32_t * pm = (const uint32_t *) (lb + hdr.off_pos_map) + ((size_t) h * hdr.n_pages_max + page_first) * HTP_FA_CLUSTER_PAGE_KEYS;
+            const uint32_t * pm = (const uint32_t *) (lb + hdr.off_pos_map) + ((size_t) h * hdr.n_pages_max + page_first) * PK;
             std::vector<uint8_t> seen(N, 0);
             const uint8_t * kp = lb + hdr.off_k_pages + (size_t) h * head_stride + (size_t) page_first * hdr.page_bytes;
             for (uint32_t i = 0; i < N; ++i) {
@@ -4653,8 +4654,8 @@ static bool cluster_run_chunk(ggml_hexagon_cluster_sidecar * s, uint32_t il, uin
             const uint16_t * cent = (const uint16_t *) (lb + hdr.off_centroids + ((size_t) h * hdr.n_pages_max + page_first) * hdr.centroid_bytes);
             for (uint32_t p = 0; p < n_pages && !bad; ++p) {
                 for (uint32_t d = 0; d < D; d += 37) {
-                    double m = 0; for (uint32_t i = 0; i < HTP_FA_CLUSTER_PAGE_KEYS; ++i) m += cluster_f16_to_f32(((const uint16_t *) (kp + (size_t) p * hdr.page_bytes))[i * D + d]);
-                    m /= HTP_FA_CLUSTER_PAGE_KEYS;
+                    double m = 0; for (uint32_t i = 0; i < PK; ++i) m += cluster_f16_to_f32(((const uint16_t *) (kp + (size_t) p * hdr.page_bytes))[i * D + d]);
+                    m /= PK;
                     if (fabs(m - cluster_f16_to_f32(((const uint16_t *) ((const uint8_t *) cent + (size_t) p * hdr.centroid_bytes))[d])) > 1e-2 + 1e-2 * fabs(m)) { bad = 3; break; }
                 }
             }
@@ -4720,13 +4721,13 @@ static void ggml_hexagon_cluster_sidecar_main(ggml_hexagon_cluster_sidecar * s) 
             L.written_end = std::max<uint32_t>(L.written_end, (uint32_t) job.pos_max + 1);
             const uint32_t chunk = (uint32_t) opt_cluster_chunk;
             // the shadow may cover fewer positions than the cache (memory budget): stop at its capacity
-            while (L.written_end - L.covered_end >= chunk && (c->hdr.n_pages_max - L.n_pages) * HTP_FA_CLUSTER_PAGE_KEYS >= chunk) {
+            while (L.written_end - L.covered_end >= chunk && (c->hdr.n_pages_max - L.n_pages) * c->hdr.page_keys >= chunk) {
                 if (!cluster_run_chunk(s, il, L.covered_end, L.covered_end + chunk)) { L.stale = true; break; }
             }
             if (end_of_prefill && !L.stale) {
                 // the prompt ended: cluster the remaining tail down to a page boundary, within the shadow capacity
                 uint32_t tail = (L.written_end - L.covered_end) & ~(HTP_FA_CLUSTER_PAGE_KEYS - 1);
-                const uint32_t cap = (c->hdr.n_pages_max - L.n_pages) * HTP_FA_CLUSTER_PAGE_KEYS;
+                const uint32_t cap = (c->hdr.n_pages_max - L.n_pages) * c->hdr.page_keys;
                 if (tail > cap) tail = cap;
                 if (tail >= 2 * HTP_FA_CLUSTER_PAGE_KEYS) {
                     if (!cluster_run_chunk(s, il, L.covered_end, L.covered_end + tail)) L.stale = true;
@@ -4746,7 +4747,7 @@ static void ggml_hexagon_cluster_sidecar_main(ggml_hexagon_cluster_sidecar * s) 
 
 static bool ggml_hexagon_cluster_sidecar_start(ggml_hexagon_cluster * c) {
     auto s = new ggml_hexagon_cluster_sidecar();
-    s->c = c; s->N = (uint32_t) opt_cluster_chunk; s->H = c->hdr.n_kv_heads; s->D = c->hdr.D; s->C = s->N / HTP_FA_CLUSTER_PAGE_KEYS;
+    s->c = c; s->N = (uint32_t) opt_cluster_chunk; s->H = c->hdr.n_kv_heads; s->D = c->hdr.D; s->C = s->N / c->hdr.page_keys;
     cl_int err; cl_uint n = 0;
     if (!cluster_cl_ok(clGetPlatformIDs(1, &s->plat, &n), "clGetPlatformIDs") || !n) { delete s; return false; }
     if (!cluster_cl_ok(clGetDeviceIDs(s->plat, CL_DEVICE_TYPE_GPU, 1, &s->dev, &n), "clGetDeviceIDs") || !n) { delete s; return false; }
@@ -4897,10 +4898,10 @@ static bool ggml_hexagon_cluster_init(ggml_hexagon_session * sess, uint32_t n_la
                           : (vmem > kv_bytes + weights_margin ? vmem - kv_bytes - weights_margin : 0);
     struct htp_fa_cluster_header hdr;
     uint32_t kv_shadow = kv_size;
-    uint64_t size = htp_fa_cluster_layout(&hdr, n_layers, kv_shadow, n_kv_heads, D);
+    uint64_t size = htp_fa_cluster_layout(&hdr, n_layers, kv_shadow, n_kv_heads, D, (uint32_t) opt_cluster_page);
     if (size > budget) {
         kv_shadow = ((uint32_t) ((double) kv_size * (double) budget / (double) size)) & ~63u;
-        while (kv_shadow >= 1024 && (size = htp_fa_cluster_layout(&hdr, n_layers, kv_shadow, n_kv_heads, D)) > budget) {
+        while (kv_shadow >= 1024 && (size = htp_fa_cluster_layout(&hdr, n_layers, kv_shadow, n_kv_heads, D, (uint32_t) opt_cluster_page)) > budget) {
             kv_shadow -= 1024;
         }
         if (kv_shadow < 1024 || size > budget) {
@@ -6180,6 +6181,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_cluster_chunk = getenv("GGML_HEXAGON_CLUSTER_CHUNK");
     const char * str_cluster_pos   = getenv("GGML_HEXAGON_CLUSTER_POSITIONAL");
     const char * str_cluster_mem   = getenv("GGML_HEXAGON_CLUSTER_MEM_MB");
+    const char * str_cluster_page  = getenv("GGML_HEXAGON_CLUSTER_PAGE");
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
     const char * str_vmem     = getenv("GGML_HEXAGON_VMEM");
@@ -6263,6 +6265,11 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_cluster_chunk  = str_cluster_chunk  ? atoi(str_cluster_chunk)  : opt_cluster_chunk;
     opt_cluster_positional = str_cluster_pos ? atoi(str_cluster_pos)  : opt_cluster_positional;
     opt_cluster_mem_mb     = str_cluster_mem ? atoi(str_cluster_mem)  : opt_cluster_mem_mb;
+    opt_cluster_page       = str_cluster_page ? atoi(str_cluster_page) : opt_cluster_page;
+    if (opt_cluster_page != 16 && opt_cluster_page != 32 && opt_cluster_page != 64) {
+        GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_CLUSTER_PAGE=%d not 16/32/64; using 64\n", opt_cluster_page);
+        opt_cluster_page = 64;
+    }
     if (opt_cluster_chunk < 128 || opt_cluster_chunk > 1024 || (opt_cluster_chunk % 64)) {
         GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_CLUSTER_CHUNK=%d out of range (128..1024, multiple of 64); using 1024\n", opt_cluster_chunk);
         opt_cluster_chunk = 1024;

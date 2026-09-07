@@ -274,6 +274,29 @@ is the third lever, since the fixed budget spends the same pages on every head r
 peaked its attention is. None of these changes the shadow, the kernel's list path or the sidecar;
 they change what the select pass scores and what it must always include.
 
+### Page size: 64 vs 32 vs 16 keys (2026-09-07, `--page-keys`, host lists, scattered pages, equal bytes)
+
+The page size is now a shadow parameter (`GGML_HEXAGON_CLUSTER_PAGE=16|32|64`, header field
+`page_keys`); the sidecar clusters into N/page_keys centroids per chunk and the dense tail keeps
+its 64-key blocks. At the same number of bytes fetched:
+
+| kv | bytes | page 64 | page 32 | page 16 |
+|--:|--:|--:|--:|--:|
+| 4096  | 100% (16 MB)    | 492 us, 34.1 GB/s | 597 us, 28.1 | 962 us, 17.4 GB/s |
+| 4096  | 50% (8.5 MB)    | 283 us | 339 us | 527 us |
+| 4096  | 25% (4.75 MB)   | 177 us | 210 us | 306 us |
+| 16384 | 100% (64 MB)    | 1823 us, 36.8 GB/s | 2221 us, 30.2 | 3739 us, 17.9 GB/s |
+| 16384 | 25% (16.75 MB)  | 513 us | 623 us | 1005 us |
+
+Per page the cost is ~2.3 us fixed (the 32-row dot, the 64-lane softmax vector work, the DMA pop
+and bookkeeping) plus ~60 ns per key: a 16-key page costs half a 64-key page while carrying a
+quarter of the keys, so 16-key pages halve the op's effective bandwidth (17 vs 34 GB/s) and a
+16-key list at 50% density costs as much as a 64-key list at 100%. This is the compute-bound
+crossover predicted earlier (~40 keys per block) measured directly. Finer pages therefore have to
+buy more than 2x in selection quality per byte to pay off on this kernel; a kernel that packed
+several small pages into one 64-lane softmax would remove most of the fixed part. Device
+selection stays exact at 16 keys (lists equal the host top-B; 2 near-tie pages differ at 16k).
+
 ### Status
 
 Built and measured end to end: page-list HVX decode kernel (Stage 1), GPU chunk-local k-means

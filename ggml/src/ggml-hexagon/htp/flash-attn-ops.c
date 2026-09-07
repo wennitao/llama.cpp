@@ -109,6 +109,7 @@ struct htp_fa_context {
     const uint8_t * cl_k_pages;        // shadow K pages of this layer: [kvh][page] x page_bytes
     const uint8_t * cl_v_pages;
     size_t          cl_page_bytes;
+    uint32_t        cl_page_keys;      // rows per shadow page: 16, 32 or 64 (dense-tail blocks stay 64)
     size_t          cl_head_stride;    // n_pages_max * page_bytes
     uint32_t        cl_n_pages_max;
     uint32_t        cl_n_cand;         // candidate pages (per head) this op may select from
@@ -3098,7 +3099,7 @@ static inline void hvx_fa_dec_blk_src(const struct htp_fa_context * factx, const
             const size_t   off  = (size_t) kvh * factx->cl_head_stride + (size_t) page * factx->cl_page_bytes;
             b->k      = factx->cl_k_pages + off;
             b->v      = factx->cl_v_pages + off;
-            b->bsz    = FLASH_ATTN_BLOCK_SIZE;
+            b->bsz    = factx->cl_page_keys;
             b->pos    = UINT32_MAX;
             b->contig = true;
             return;
@@ -3547,8 +3548,9 @@ static bool hvx_fa_cl_setup(struct htp_fa_context * factx, const struct htp_ops_
     if (hdr->magic != HTP_FA_CLUSTER_MAGIC || hdr->version != HTP_FA_CLUSTER_VERSION) {
         return false;
     }
-    if (hdr->n_kv_heads != nek2 || hdr->D != DK || DK != DV || hdr->page_keys != FLASH_ATTN_BLOCK_SIZE ||
-        nek2 > HTP_FA_CLUSTER_MAX_HEADS || hdr->page_bytes != (uint32_t) FLASH_ATTN_BLOCK_SIZE * DK * 2) {
+    if (hdr->n_kv_heads != nek2 || hdr->D != DK || DK != DV || nek2 > HTP_FA_CLUSTER_MAX_HEADS ||
+        (hdr->page_keys != 16 && hdr->page_keys != 32 && hdr->page_keys != 64) ||
+        hdr->page_bytes != hdr->page_keys * DK * 2) {
         return false;
     }
     const uint32_t il = (uint32_t) octx->op_params[HTP_FA_CLUSTER_OPP_LAYER];
@@ -3588,6 +3590,7 @@ static bool hvx_fa_cl_setup(struct htp_fa_context * factx, const struct htp_ops_
     factx->cl_k_pages        = layer_base + hdr->off_k_pages;
     factx->cl_v_pages        = layer_base + hdr->off_v_pages;
     factx->cl_page_bytes     = hdr->page_bytes;
+    factx->cl_page_keys      = hdr->page_keys;
     factx->cl_head_stride    = (size_t) hdr->n_pages_max * hdr->page_bytes;
     factx->cl_n_pages_max    = hdr->n_pages_max;
     factx->cl_n_cand         = n_cand;

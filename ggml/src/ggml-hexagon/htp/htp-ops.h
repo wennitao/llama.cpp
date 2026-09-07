@@ -184,7 +184,7 @@ enum htp_sync_probe_rec {
 #define HTP_FA_CLUSTER_FLAG_COALESCE    (1u << 5)              // merge consecutive pages into one descriptor (reserved)
 #define HTP_FA_CLUSTER_FLAG_FOLD_SUM    (1u << 6)              // GQA score fold: sum over the group (else max)
 #define HTP_FA_CLUSTER_FLAG_MINPAGES(f) (((f) >> 8) & 0xffu)   // minimum pages per head when a budget is used
-#define HTP_FA_CLUSTER_PAGE_KEYS    64
+#define HTP_FA_CLUSTER_PAGE_KEYS    64     // default and maximum page size; 16 and 32 are also valid (header.page_keys)
 #define HTP_FA_CLUSTER_MAX_CHUNKS   256
 #define HTP_FA_CLUSTER_MAX_HEADS    64
 #define HTP_FA_CLUSTER_MAX_SLOTS    8      // staging ring depth cap (per thread)
@@ -230,17 +230,20 @@ struct htp_fa_cluster_chunk {
 static inline uint64_t htp_fa_cluster_align(uint64_t x, uint64_t a) { return (x + a - 1) / a * a; }
 
 static inline uint64_t htp_fa_cluster_layout(struct htp_fa_cluster_header * h, uint32_t n_layers, uint32_t kv_size,
-                                             uint32_t n_kv_heads, uint32_t D) {
+                                             uint32_t n_kv_heads, uint32_t D, uint32_t page_keys) {
     memset(h, 0, sizeof(*h));
+    if (page_keys != 16 && page_keys != 32 && page_keys != 64) {
+        page_keys = HTP_FA_CLUSTER_PAGE_KEYS;
+    }
     h->magic       = HTP_FA_CLUSTER_MAGIC;
     h->version     = HTP_FA_CLUSTER_VERSION;
     h->n_layers    = n_layers;
     h->kv_size     = kv_size;
     h->n_kv_heads  = n_kv_heads;
     h->D           = D;
-    h->page_keys   = HTP_FA_CLUSTER_PAGE_KEYS;
-    h->page_bytes  = HTP_FA_CLUSTER_PAGE_KEYS * D * 2;
-    h->n_pages_max = (kv_size + HTP_FA_CLUSTER_PAGE_KEYS - 1) / HTP_FA_CLUSTER_PAGE_KEYS;
+    h->page_keys   = page_keys;
+    h->page_bytes  = page_keys * D * 2;
+    h->n_pages_max = (kv_size + page_keys - 1) / page_keys;
     h->chunk_keys  = 1024;
     h->max_chunks  = HTP_FA_CLUSTER_MAX_CHUNKS;
     h->centroid_bytes  = (uint32_t) htp_fa_cluster_align((uint64_t) D * 2, 128);
@@ -250,7 +253,7 @@ static inline uint64_t htp_fa_cluster_layout(struct htp_fa_cluster_header * h, u
     h->off_host_sel  = htp_fa_cluster_align(off, 128); off  = h->off_host_sel  + (uint64_t) n_kv_heads * h->host_sel_stride;
     h->off_echo_sel  = htp_fa_cluster_align(off, 128); off  = h->off_echo_sel  + (uint64_t) n_kv_heads * h->host_sel_stride;
     h->off_centroids = htp_fa_cluster_align(off, 128); off  = h->off_centroids + (uint64_t) n_kv_heads * h->n_pages_max * h->centroid_bytes;
-    h->off_pos_map   = htp_fa_cluster_align(off, 128); off  = h->off_pos_map   + (uint64_t) n_kv_heads * h->n_pages_max * HTP_FA_CLUSTER_PAGE_KEYS * 4;
+    h->off_pos_map   = htp_fa_cluster_align(off, 128); off  = h->off_pos_map   + (uint64_t) n_kv_heads * h->n_pages_max * page_keys * 4;
     h->off_n_valid   = htp_fa_cluster_align(off, 128); off  = h->off_n_valid   + htp_fa_cluster_align((uint64_t) h->n_pages_max * 2, 128);
     h->off_k_pages   = htp_fa_cluster_align(off, 16384); off = h->off_k_pages  + (uint64_t) n_kv_heads * h->n_pages_max * h->page_bytes;
     h->off_v_pages   = htp_fa_cluster_align(off, 16384); off = h->off_v_pages  + (uint64_t) n_kv_heads * h->n_pages_max * h->page_bytes;
