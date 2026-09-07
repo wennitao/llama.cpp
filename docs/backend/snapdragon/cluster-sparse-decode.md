@@ -201,4 +201,67 @@ descriptors per head plus 63 arg-max passes), in line with the estimate. The out
 reference over the echoed lists to 2e-5; with a full budget the result equals the dense set.
 
 
-## Stage 5 -- evaluation (later)
+## Stage 5 -- evaluation on the model (2026-09-06, unit 55b03820, Qwen3-1.7B Q4_0, `-dev HTP0`)
+
+### Speed (`llama-bench -fa 1 -p 0 -n 64 -r 2`, arms alternated, warm-up discarded)
+
+| depth | dense | cluster, 25% budget | cluster, 12.5% budget | shadow |
+|--:|--:|--:|--:|---|
+| d4096  | 20.1-20.4 t/s | 25.3-25.5 (**1.25x**) | 25.9-26.1 (**1.28x**) | full (4352 positions, 484 MB) |
+| d8192  | 15.4-15.5 t/s | 21.2-21.3 (**1.38x**) | 21.8-21.9 (**1.41x**) | capped to the first 6592 positions (733 MB) |
+| d16384 | 10.5 t/s      | 10.5-10.6 (1.00x)     | --                    | none fits the cDSP budget; dense with the reason logged |
+
+The gains are the attention phase shrinking as Stage 1 predicted (op 3.2x faster at 25%), diluted
+by the token's GEMVs and by the part of the context the shadow does not cover (at 8k a quarter of
+the cache stays in the dense tail). The first repetition of each cluster arm runs while the sidecar
+is still catching up, hence the wider error bars; steady state is the upper number. Every run
+exits cleanly at every depth.
+
+### Quality (`llama-perplexity -c 4096 --chunks 2 -b 1 -ub 1`: decode mode, since only decode-shaped attention nodes are tagged)
+
+| arm | PPL |
+|---|--:|
+| dense | 9.133 +/- 0.46 |
+| cluster pages, 100% budget | 9.123 +/- 0.46 (equal: the whole shadow path is exact) |
+| cluster pages, 50% | 15.82 +/- 1.00 |
+| cluster pages, 25%, W 256 | 31.51 +/- 2.48 |
+| cluster pages, 25%, W 1024 | 26.93 +/- 2.00 |
+| cluster pages, 12.5% | 73.55 +/- 6.91 |
+| positional pages (Quest-style baseline), 50% | 15.09 +/- 0.94 |
+| positional pages, 25% | 25.84 +/- 1.91 |
+
+**This is a negative result on the selection policy, and the important one.** The plumbing is
+exact (100% equals dense), and the kernel and sidecar deliver the speed, but choosing pages by the
+dot product of the query with the page's *mean key*, under a fixed per-head budget, loses far too
+much: 1.7x the perplexity at 50%, 3.5x at 25%. And the k-means pages are no better than plain
+positional pages at equal density (15.8 vs 15.1 at 50%, 31.5 vs 25.8 at 25%): the cluster order
+buys bandwidth (Stage 1: +16-20% from contiguous pages) but not selection quality with this
+descriptor. Two mechanisms are the likely cause, both testable with the machinery as it stands:
+
+- **No sink pages.** Qwen3, like most decoders, puts a large share of every row's softmax mass on
+  the first tokens; a page whose mean key scores low for a given query is dropped even when its
+  keys carry that mass. Positional pages keep the sinks in page 0, which is probably why they edge
+  ahead; cluster packing scatters position 0 into whichever cluster its key falls in. The fix is a
+  rule, not a kernel: always select the page(s) holding the first positions (a per-page
+  "contains position < 64" bit in the chunk table, or simply page 0 of chunk 0 in positional mode).
+- **The mean is the wrong descriptor.** Quest-style selection scores a page by an *upper bound*
+  of q.k over the page (per-dimension min/max), which never under-estimates a page that contains a
+  high-scoring key; the mean under-estimates exactly the pages whose keys are spread, and k-means
+  makes pages tighter but not tight enough at 64 keys per page. Min/max descriptors cost two rows
+  per page instead of one (the select pass scores 32 descriptors per call either way).
+
+A score-threshold budget (the prefill kernel's union-threshold policy) instead of a fixed page count
+is the third lever, since the fixed budget spends the same pages on every head regardless of how
+peaked its attention is. None of these changes the shadow, the kernel's list path or the sidecar;
+they change what the select pass scores and what it must always include.
+
+### Status
+
+Built and measured end to end: page-list HVX decode kernel (Stage 1), GPU chunk-local k-means
+(Stage 2), the clustering sidecar with the cDSP memory budget respected (Stage 3), on-device
+selection (Stage 4). Exact at full density; 1.25x / 1.4x decode at 4k / 8k at a 25% budget; the
+shadow-copy design cannot fit a 16k context on this SoC (Stage 3, lesson 2); and page-mean
+selection with a fixed budget is not accurate enough below 100% (this section), with cluster pages
+not beating positional pages. Next: sink pages and min/max descriptors in the select pass, then
+the perplexity sweep again; GPU gather in the sidecar (0.6 ms vs 35 ms per layer); and, for long
+contexts, the in-place layout or Q8 pages that the memory budget demands.
