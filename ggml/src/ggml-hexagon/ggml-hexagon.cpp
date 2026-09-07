@@ -97,6 +97,13 @@ static int    opt_hetero_cpu  = 7;     // relay thread affinity (-1 = none)
 // reports how long it idled waiting for the GPU; the relay moves the share one 64-key block per
 // token toward a few microseconds of wait. Keeps the split useful when the GPU throttles.
 static int    opt_hetero_adapt = 1;
+// Cluster-selected sparse decode attention prototype (GGML_HEXAGON_CLUSTER_ATTN=<density_permille>,<window>[,flags]).
+// The backend owns a cluster-ordered shadow of the KV cache (htp-ops.h, HTP_FA_CLUSTER_*) and tags decode
+// FLASH_ATTN_EXT nodes so the HVX kernel attends over selected 64-key pages plus a dense recent window.
+// -1 = off. Density 0 = host-written page lists (measurement mode); > 0 = on-device selection.
+static int      opt_cluster_density = -1;
+static int      opt_cluster_window  = 256;
+static uint32_t opt_cluster_flags   = 0;
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
@@ -315,10 +322,12 @@ struct ggml_hexagon_opbatch;
 struct ggml_hexagon_opqueue;
 struct htp_opnode;
 struct ggml_hexagon_hetero;
+struct ggml_hexagon_cluster;
 struct ggml_hexagon_session;
 #ifdef GGML_HEXAGON_HETERO
 static void ggml_hexagon_hetero_free(ggml_hexagon_session * sess);
 #endif
+static void ggml_hexagon_cluster_free(ggml_hexagon_session * sess);
 
 struct ggml_hexagon_session {
     std::string      name;
@@ -352,7 +361,8 @@ struct ggml_hexagon_session {
         std::vector<htp_opnode> htp_nodes;
     } cached_graph;
 
-    ggml_hexagon_hetero * hetero = nullptr;
+    ggml_hexagon_hetero *  hetero  = nullptr;
+    ggml_hexagon_cluster * cluster = nullptr;
 
     ggml_hexagon_session(int dev_id, ggml_backend_dev_t dev) noexcept(false);
     ~ggml_hexagon_session() noexcept(true);
@@ -1938,6 +1948,7 @@ void ggml_hexagon_session::release() noexcept(true) {
 #ifdef GGML_HEXAGON_HETERO
     ggml_hexagon_hetero_free(this);
 #endif
+    ggml_hexagon_cluster_free(this);
 
     if (this->valid_iface) {
         // Stop dspqueue/opbatch processing
@@ -4312,6 +4323,120 @@ static void ggml_hexagon_hetero_free(ggml_hexagon_session * sess) {
 
 #endif // GGML_HEXAGON_HETERO
 
+// ---------------------------------------------------------------------------------------
+// Cluster-selected sparse decode attention (research prototype; docs cluster-sparse-decode.md).
+// Stage 1: the backend owns the shadow buffer (htp-ops.h, struct htp_fa_cluster_header) and tags
+// decode FLASH_ATTN_EXT nodes; the per-head page lists are host-written (density 0) or, later,
+// selected on the DSP. The clustering sidecar that fills the shadow comes with a later stage.
+// ---------------------------------------------------------------------------------------
+
+struct ggml_hexagon_cluster {
+    ggml_hexagon_session *       sess = nullptr;
+    ggml_backend_buffer_t        buf  = nullptr;
+    uint8_t *                    base = nullptr;
+    size_t                       size = 0;
+    ggml_context *               tctx = nullptr;
+    ggml_tensor *                ctrl = nullptr;   // hand-wired tensor over the buffer, attached as src[7]
+    struct htp_fa_cluster_header hdr  = {};
+    uint32_t                     n_tagged = 0;
+};
+
+static inline void cluster_dc_civac(const void * p, size_t n) {
+#if defined(__aarch64__)
+    uintptr_t a = (uintptr_t) p & ~(uintptr_t) 63;
+    const uintptr_t e = (uintptr_t) p + n;
+    for (; a < e; a += 64) asm volatile("dc civac, %0" : : "r"(a) : "memory");
+    asm volatile("dsb sy" : : : "memory");
+#else
+    (void) p; (void) n;
+#endif
+}
+
+static bool ggml_hexagon_cluster_init(ggml_hexagon_session * sess, uint32_t n_layers, uint32_t kv_size, uint32_t n_kv_heads, uint32_t D) {
+    auto c = new ggml_hexagon_cluster();
+    c->sess = sess;
+    c->size = (size_t) htp_fa_cluster_layout(&c->hdr, n_layers, kv_size, n_kv_heads, D);
+    c->buf  = ggml_backend_buft_alloc_buffer(&sess->buffer_type, c->size);
+    if (!c->buf) {
+        GGML_LOG_ERROR("ggml-hex: cluster: shadow buffer alloc (%zu MB) failed\n", c->size >> 20);
+        delete c;
+        return false;
+    }
+    ggml_backend_buffer_set_usage(c->buf, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(c->buf->context);
+    c->base = sbuf->base;
+    // Header + directory: zero (covered_end 0 => every layer runs dense until the sidecar publishes).
+    const size_t hdr_bytes = HTP_FA_CLUSTER_DIR_OFF + (size_t) n_layers * HTP_FA_CLUSTER_DIR_STRIDE;
+    memset(c->base, 0, hdr_bytes);
+    memcpy(c->base, &c->hdr, sizeof(c->hdr));
+    cluster_dc_civac(c->base, hdr_bytes);
+
+    ggml_init_params ip = { ggml_tensor_overhead() * 4, nullptr, true };
+    c->tctx = ggml_init(ip);
+    c->ctrl = ggml_new_tensor_1d(c->tctx, GGML_TYPE_F32, (int64_t) (c->size / 4));
+    c->ctrl->buffer = c->buf;
+    c->ctrl->data   = c->base;
+    ggml_set_name(c->ctrl, "hexagon_cluster_shadow");
+    sess->cluster = c;
+    GGML_LOG_INFO("ggml-hex: %s cluster attention: shadow %zu MB (%u layers x %u heads x %u pages of %u keys), density %d permille, window %d, flags 0x%x\n",
+                  sess->c_name(), c->size >> 20, n_layers, n_kv_heads, c->hdr.n_pages_max, c->hdr.page_keys,
+                  opt_cluster_density, opt_cluster_window, opt_cluster_flags);
+    return true;
+}
+
+// Tag a decode FLASH_ATTN_EXT node for the page-list kernel. Returns false (node untouched) when the
+// shape does not fit the prototype. The layer index comes from the KV cache tensor name
+// (cache_k_l%d) and falls back to the node's ordinal among the graph's FA nodes.
+static bool ggml_hexagon_cluster_prepare(ggml_hexagon_session * sess, ggml_tensor * n, const struct htp_fa_kernel_params * kp, int fa_ordinal) {
+    ggml_hexagon_cluster * c = sess->cluster;
+    n->op_params[HTP_FA_CLUSTER_OPP_MAGIC] = 0;
+    const ggml_tensor * q = n->src[0], * k = n->src[1], * v = n->src[2], * m = n->src[3];
+    if (kp->kernel_type != HTP_FA_KERNEL_HVX || !kp->u.hvx.split_kv) return false;
+    if (q->ne[1] != 1 || q->ne[3] != 1) return false;
+    const int DK = (int) q->ne[0], DV = (int) v->ne[0];
+    if (DK != DV || (DK != 128 && DK != 64)) return false;
+    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16) return false;
+    if (m && (m->type != GGML_TYPE_F16 || m->ne[2] != 1)) return false;
+    if (n->src[4] || n->src[5] || n->src[6] || n->src[7]) return false;   // sinks / sparse / hetero: not in the prototype
+    float max_bias = 0.0f;
+    memcpy(&max_bias, &n->op_params[1], sizeof(float));
+    if (max_bias != 0.0f) return false;
+    if (k->ne[2] == 0 || q->ne[2] % k->ne[2] != 0) return false;
+    if ((uint32_t) k->ne[2] != c->hdr.n_kv_heads || (uint32_t) DK != c->hdr.D) return false;
+    if (!ggml_backend_buffer_is_hexagon(q->buffer) || !ggml_backend_buffer_is_hexagon(k->buffer) ||
+        !ggml_backend_buffer_is_hexagon(v->buffer) || (m && !ggml_backend_buffer_is_hexagon(m->buffer))) return false;
+
+    int il = -1;
+    const ggml_tensor * root = k->view_src ? k->view_src : k;
+    if (sscanf(root->name, "cache_k_l%d", &il) != 1) {
+        il = fa_ordinal;
+    }
+    if (il < 0 || (uint32_t) il >= c->hdr.n_layers) return false;
+
+    n->op_params[HTP_FA_CLUSTER_OPP_MAGIC]   = (int32_t) HTP_FA_CLUSTER_MAGIC;
+    n->op_params[HTP_FA_CLUSTER_OPP_LAYER]   = il;
+    n->op_params[HTP_FA_CLUSTER_OPP_DENSITY] = opt_cluster_density;
+    n->op_params[HTP_FA_CLUSTER_OPP_WINDOW]  = opt_cluster_window;
+    n->op_params[HTP_FA_CLUSTER_OPP_FLAGS]   = (int32_t) opt_cluster_flags;
+    n->src[7] = c->ctrl;
+    c->n_tagged++;
+    if (opt_verbose || c->n_tagged == 1) {
+        GGML_LOG_INFO("ggml-hex: cluster: tagged node %s as layer %d (kv %lld, %d heads, D %d)\n",
+                      n->name, il, (long long) k->ne[1], (int) k->ne[2], DK);
+    }
+    return true;
+}
+
+static void ggml_hexagon_cluster_free(ggml_hexagon_session * sess) {
+    ggml_hexagon_cluster * c = sess->cluster;
+    if (!c) return;
+    GGML_LOG_INFO("ggml-hex: %s cluster: %u nodes tagged\n", sess->c_name(), c->n_tagged);
+    if (c->tctx) ggml_free(c->tctx);
+    if (c->buf) ggml_backend_buffer_free(c->buf);
+    delete c;
+    sess->cluster = nullptr;
+}
+
 static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
     switch (t->op) {
         case GGML_OP_FLASH_ATTN_EXT:  return HTP_OP_FLASH_ATTN_EXT;
@@ -4681,6 +4806,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     } else {
         computed_nodes.reserve(graph->n_nodes);
         int hetero_slot = 0;
+        int cluster_fa_ordinal = 0;
 
         // Fuse and finalize
         for (int i = 0; i < graph->n_nodes; ++i) {
@@ -4716,6 +4842,27 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                     }
                 }
 #endif
+                if (opt_cluster_density >= 0 && opt_hetero_frac <= 0.0f) {
+                    if (!sess->cluster) {
+                        // Shadow dims from the first FA node: kv_size from the root KV cache tensor
+                        // ([n_embd_k_gqa, kv_size, n_stream]), n_layers = FA nodes in this graph.
+                        const ggml_tensor * k    = n->src[1];
+                        const ggml_tensor * root = k->view_src ? k->view_src : k;
+                        const uint32_t kv_size   = (uint32_t) (k->view_src ? root->ne[1] : k->ne[1]);
+                        uint32_t n_layers = 0;
+                        for (int j = 0; j < graph->n_nodes; ++j) {
+                            n_layers += graph->nodes[j]->op == GGML_OP_FLASH_ATTN_EXT;
+                        }
+                        if (!ggml_hexagon_cluster_init(sess, n_layers, kv_size, (uint32_t) k->ne[2], (uint32_t) k->ne[0])) {
+                            GGML_LOG_WARN("ggml-hex: cluster attention disabled (init failed)\n");
+                            opt_cluster_density = -1;
+                        }
+                    }
+                    if (sess->cluster) {
+                        ggml_hexagon_cluster_prepare(sess, n, (const struct htp_fa_kernel_params *) node.kernel_params, cluster_fa_ordinal);
+                    }
+                    cluster_fa_ordinal++;
+                }
             } else if (htp_op_is_unary(node.opcode)) {
                 auto inputs = node.get_inputs();
                 const struct ggml_tensor * src0 = inputs[0];
@@ -5448,6 +5595,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_hetero_span = getenv("GGML_HEXAGON_HETERO_SPAN");
     const char * str_hetero_cpu  = getenv("GGML_HEXAGON_HETERO_CPU");
     const char * str_hetero_adapt = getenv("GGML_HEXAGON_HETERO_ADAPT");
+    const char * str_cluster  = getenv("GGML_HEXAGON_CLUSTER_ATTN");
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
     const char * str_vmem     = getenv("GGML_HEXAGON_VMEM");
@@ -5515,6 +5663,17 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
         opt_hetero_frac = 0.0f;
     }
 #endif
+    if (str_cluster) {
+        int density = -1, window = opt_cluster_window;
+        unsigned flags = 0;
+        if (sscanf(str_cluster, "%d,%d,%i", &density, &window, &flags) >= 1 && density >= 0) {
+            opt_cluster_density = density;
+            opt_cluster_window  = window;
+            opt_cluster_flags   = flags;
+        } else {
+            GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_CLUSTER_ATTN='%s' not understood (want <density_permille>,<window>[,flags]); ignored\n", str_cluster);
+        }
+    }
     opt_ndev      = str_ndev     ? strtoul(str_ndev, NULL, 0)             : opt_ndev;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf)                      : opt_hostbuf;
     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;

@@ -96,11 +96,24 @@ struct options {
     int    pad_mb    = 0;      // place K/V this many MB into a larger buffer (alias/TLB footprint experiment)
     int    integrated = 0;     // drive the backend's own hetero path (GGML_HEXAGON_HETERO_FRAC = gpu_frac) on a full-range FA op and check vs CPU
     bool   run_htp = true, run_gpu = true, run_both = true;
+    // --cluster: cluster-page decode kernel measurement (synthetic shadow + host page lists)
+    int    cluster   = 0;
+    int    density   = 25;     // percent of the candidate pages listed per KV head
+    int    sel_scatter = 1;    // 1 = random pages, 0 = the first n pages (contiguous in the shadow)
+    double skew      = 1.0;    // per-head list length skew: head lengths run from skew x mean to (2 - skew) x mean
+    int    nslots    = 2;      // staging ring depth per thread (2, 4, 8)
+    int    desc1d    = 0;      // 1 = one 1D descriptor per shadow page, 0 = 64 x 256 B rows
+    int    window    = 256;    // dense recent window (positions [kv - window, kv))
+    int    perm_identity = 0;  // 1 = pages in positional order (pure bandwidth), 0 = random permutation
+    int    pmu       = 0;      // capture AXI read requests per op (GGML_HEXAGON_PROFILE PMU mode)
+    int    seed      = 1234;
 };
 
 static void usage() {
     printf("usage: llama-hetero-decode-attn [--kv N] [--gpu-frac F] [--iters N] [--span N] [--nh N] [--nkvh N]\n"
-           "         [--cpu N] [--modes htp,gpu,both] [--mask-permille N] [--layers N] [-v]\n");
+           "         [--cpu N] [--modes htp,gpu,both] [--mask-permille N] [--layers N] [--pad-mb N] [--integrated] [-v]\n"
+           "       llama-hetero-decode-attn --cluster [--kv N] [--density PCT] [--sel contig|scatter] [--skew F]\n"
+           "         [--nslots N] [--desc 1d|2d] [--window W] [--perm identity|random] [--pmu] [--iters N] [--seed N]\n");
 }
 
 static bool parse(int argc, char ** argv, options & o) {
@@ -119,6 +132,16 @@ static bool parse(int argc, char ** argv, options & o) {
         else if (a == "--layers")   { if (!next_i(o.layers)) return false; }
         else if (a == "--pad-mb")   { if (!next_i(o.pad_mb)) return false; }
         else if (a == "--integrated") { o.integrated = 1; }
+        else if (a == "--cluster")  { o.cluster = 1; }
+        else if (a == "--density")  { if (!next_i(o.density)) return false; }
+        else if (a == "--skew")     { if (!next_d(o.skew)) return false; }
+        else if (a == "--nslots")   { if (!next_i(o.nslots)) return false; }
+        else if (a == "--window")   { if (!next_i(o.window)) return false; }
+        else if (a == "--seed")     { if (!next_i(o.seed)) return false; }
+        else if (a == "--pmu")      { o.pmu = 1; }
+        else if (a == "--sel")      { if (i + 1 >= argc) return false; o.sel_scatter = std::string(argv[++i]) != "contig"; }
+        else if (a == "--desc")     { if (i + 1 >= argc) return false; o.desc1d = std::string(argv[++i]) == "1d"; }
+        else if (a == "--perm")     { if (i + 1 >= argc) return false; o.perm_identity = std::string(argv[++i]) == "identity"; }
         else if (a == "-v")         { o.verbose = 1; }
         else if (a == "--modes") {
             if (i + 1 >= argc) return false;
@@ -377,6 +400,236 @@ struct stat_acc {
     bool empty() const { return v.empty(); }
 };
 
+// ---------------------------------------------------------------------------------------
+// --cluster: the page-list decode kernel (docs cluster-sparse-decode.md, Stage 1). One layer's
+// shadow (htp-ops.h, struct htp_fa_cluster_header) is built here from a permutation of the
+// positional K/V; per-head page lists are host-written; the FA node is tagged the way the backend
+// tags it (op_params[11..15], src[7]) and checked against a CPU reference over exactly the keys
+// the kernel was told to attend: the listed pages (mask ignored) plus the dense tail (masked).
+// ---------------------------------------------------------------------------------------
+
+static std::vector<std::string> g_prof_lines;
+static void prof_log_cb(ggml_log_level level, const char * text, void *) {
+    if (strstr(text, "profile-op FLASH_ATTN_EXT")) { g_prof_lines.emplace_back(text); return; }
+    if (level != GGML_LOG_LEVEL_DEBUG) fputs(text, stderr);
+}
+// usec and AXI read requests (pmu[7]) of the last captured FLASH_ATTN_EXT profile line
+static bool prof_last(double * usec, double * axi) {
+    if (g_prof_lines.empty()) return false;
+    const std::string & s = g_prof_lines.back();
+    const size_t p = s.find("usec ");
+    if (p == std::string::npos) return false;
+    *usec = atof(s.c_str() + p + 5);
+    *axi  = 0;
+    const size_t b = s.find("pmu [");
+    if (b != std::string::npos) {
+        const size_t e = s.find(']', b);
+        const size_t c = s.rfind(',', e);
+        if (c != std::string::npos && c > b) *axi = atof(s.c_str() + c + 1);
+    }
+    return true;
+}
+
+// CPU reference over an explicit key set of (position, apply_mask) pairs, normalised.
+static void ref_attn_keys(const options & o, const uint8_t * base, const layout & L, int h,
+                          const std::vector<std::pair<int, bool>> & keys, std::vector<double> & out) {
+    const int kvh = h / (o.nh / o.nkvh);
+    const float * q = (const float *) (base + L.q + (size_t) h * o.d * 4);
+    const ggml_fp16_t * mask = (const ggml_fp16_t *) (base + L.mask);
+    const double scale = 1.0 / sqrt((double) o.d);
+    std::vector<double> s(keys.size());
+    double M = -INFINITY;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const int p = keys[i].first;
+        const ggml_fp16_t * kr = (const ggml_fp16_t *) (base + L.k + (size_t) p * L.nbk1 + (size_t) kvh * L.nbk2);
+        double dot = 0;
+        for (int d = 0; d < o.d; ++d) dot += (double) q[d] * ggml_fp16_to_fp32(kr[d]);
+        s[i] = dot * scale + (keys[i].second ? (double) ggml_fp16_to_fp32(mask[p]) : 0.0);
+        M = std::max(M, s[i]);
+    }
+    out.assign(o.d, 0.0);
+    double S = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (std::isinf(s[i])) continue;
+        const double w = exp(s[i] - M);
+        S += w;
+        const int p = keys[i].first;
+        const ggml_fp16_t * vr = (const ggml_fp16_t *) (base + L.v + (size_t) p * L.nbk1 + (size_t) kvh * L.nbk2);
+        for (int d = 0; d < o.d; ++d) out[d] += w * ggml_fp16_to_fp32(vr[d]);
+    }
+    for (int d = 0; d < o.d; ++d) out[d] = S > 0 ? out[d] / S : 0.0;
+}
+
+static int run_cluster(const options & o, ggml_backend_t be, ggml_backend_buffer_t buf, uint8_t * base, const layout & L,
+                       const htp_fa_cluster_header & hdr, size_t shadow_bytes) {
+    const int W = o.window;
+    const int covered_end = o.kv - W;
+    if (W % 64 || covered_end <= 0) { fprintf(stderr, "--window must be a multiple of 64 and smaller than kv\n"); return 1; }
+    if (o.nslots < 2 || o.nslots > HTP_FA_CLUSTER_MAX_SLOTS || (o.nslots & (o.nslots - 1))) { fprintf(stderr, "--nslots must be 2, 4 or 8\n"); return 1; }
+    const int n_cand = covered_end / 64;
+    const int G = o.nh / o.nkvh;
+    uint8_t * lb = base + hdr.layer0_off;   // layer 0
+
+    // header, empty directory, chunk table (1024-key chunks up to covered_end)
+    memcpy(base, &hdr, sizeof(hdr));
+    auto * dir = (htp_fa_cluster_dir *) (base + HTP_FA_CLUSTER_DIR_OFF);
+    memset(dir, 0, sizeof(*dir));
+    auto * chunks = (htp_fa_cluster_chunk *) (lb + hdr.off_chunks);
+    uint32_t n_chunks = 0;
+    for (int pos = 0; pos < covered_end; pos += (int) hdr.chunk_keys) {
+        const int pend = std::min(pos + (int) hdr.chunk_keys, covered_end);
+        chunks[n_chunks++] = { (uint32_t) pos, (uint32_t) pend, (uint32_t) (pos / 64), (uint32_t) ((pend - pos) / 64) };
+    }
+
+    // pages: a permutation of the covered positions, 64 per page, all heads share the page index space
+    std::mt19937 rng(o.seed);
+    std::vector<int> perm(covered_end);
+    for (int i = 0; i < covered_end; ++i) perm[i] = i;
+    if (!o.perm_identity) std::shuffle(perm.begin(), perm.end(), rng);
+    auto * pos_map = (uint32_t *) (lb + hdr.off_pos_map);
+    const size_t head_stride = (size_t) hdr.n_pages_max * hdr.page_bytes;
+    for (int p = 0; p < n_cand; ++p) {
+        for (int i = 0; i < 64; ++i) {
+            const int pos = perm[p * 64 + i];
+            pos_map[p * 64 + i] = (uint32_t) pos;
+            for (int h = 0; h < o.nkvh; ++h) {
+                const size_t poff = (size_t) h * head_stride + (size_t) p * hdr.page_bytes + (size_t) i * o.d * 2;
+                memcpy(lb + hdr.off_k_pages + poff, base + L.k + (size_t) pos * L.nbk1 + (size_t) h * L.nbk2, (size_t) o.d * 2);
+                memcpy(lb + hdr.off_v_pages + poff, base + L.v + (size_t) pos * L.nbk1 + (size_t) h * L.nbk2, (size_t) o.d * 2);
+            }
+        }
+        for (int h = 0; h < o.nkvh; ++h) {   // page descriptor = f16 mean of its keys (for the later selection stages)
+            std::vector<float> acc(o.d, 0.0f);
+            for (int i = 0; i < 64; ++i) {
+                const ggml_fp16_t * kr = (const ggml_fp16_t *) (lb + hdr.off_k_pages + (size_t) h * head_stride + (size_t) p * hdr.page_bytes + (size_t) i * o.d * 2);
+                for (int d = 0; d < o.d; ++d) acc[d] += ggml_fp16_to_fp32(kr[d]);
+            }
+            ggml_fp16_t * c = (ggml_fp16_t *) (lb + hdr.off_centroids + ((size_t) h * hdr.n_pages_max + p) * hdr.centroid_bytes);
+            for (int d = 0; d < o.d; ++d) c[d] = ggml_fp32_to_fp16(acc[d] / 64.0f);
+        }
+    }
+
+    // per-head lists, address ordered
+    std::vector<std::vector<uint16_t>> lists(o.nkvh);
+    size_t pages_total = 0;
+    for (int h = 0; h < o.nkvh; ++h) {
+        double mult = 1.0;
+        if (o.nkvh > 1) mult = 1.0 + (o.skew - 1.0) * (1.0 - 2.0 * h / (o.nkvh - 1));   // skew .. 2 - skew, mean 1
+        int n = (int) lround(n_cand * (o.density / 100.0) * mult);
+        n = std::max(0, std::min(n_cand, n));
+        std::vector<uint16_t> & l = lists[h];
+        if (o.sel_scatter) {
+            std::vector<int> all(n_cand);
+            for (int i = 0; i < n_cand; ++i) all[i] = i;
+            std::shuffle(all.begin(), all.end(), rng);
+            all.resize(n);
+            std::sort(all.begin(), all.end());
+            for (int x : all) l.push_back((uint16_t) x);
+        } else {
+            for (int i = 0; i < n; ++i) l.push_back((uint16_t) i);
+        }
+        pages_total += l.size();
+        uint8_t * e = lb + hdr.off_host_sel + (size_t) h * hdr.host_sel_stride;
+        *(uint32_t *) e = (uint32_t) n;
+        if (n) memcpy(e + 128, l.data(), l.size() * 2);
+    }
+    // publish: data first, then the directory (the kernel reads the directory to find the data)
+    dc_cvac(base, shadow_bytes);
+    dir->n_chunks = n_chunks; dir->n_pages_pub = (uint32_t) n_cand; dir->covered_end = (uint32_t) covered_end;
+    dc_cvac(dir, sizeof(*dir));
+
+    // FA node over the full positional range, tagged the way the backend tags it
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead_custom(8, false), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    const size_t kv_bytes = (size_t) o.kv * L.nbk1;
+    ggml_tensor * shadow = place(buf, base, 0, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) (shadow_bytes / 4)), "shadow");
+    ggml_tensor * q  = place(buf, base, L.q, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, o.d, 1, o.nh, 1), "q");
+    ggml_tensor * kb = place(buf, base, L.k, ggml_new_tensor_1d(ctx, GGML_TYPE_F16, (int64_t) (kv_bytes / 2)), "kbase");
+    ggml_tensor * vb = place(buf, base, L.v, ggml_new_tensor_1d(ctx, GGML_TYPE_F16, (int64_t) (kv_bytes / 2)), "vbase");
+    ggml_tensor * mb = place(buf, base, L.mask, ggml_new_tensor_1d(ctx, GGML_TYPE_F16, o.kv), "mbase");
+    ggml_tensor * kf = ggml_view_4d(ctx, kb, o.d, o.kv, o.nkvh, 1, L.nbk1, L.nbk2, kv_bytes, 0);
+    ggml_tensor * vf = ggml_view_4d(ctx, vb, o.d, o.kv, o.nkvh, 1, L.nbk1, L.nbk2, kv_bytes, 0);
+    ggml_tensor * mf = ggml_view_2d(ctx, mb, o.kv, 1, (size_t) o.kv * 2, 0);
+    kf->buffer = vf->buffer = mf->buffer = buf;
+    ggml_tensor * fa = ggml_flash_attn_ext(ctx, q, kf, vf, mf, 1.0f / sqrtf((float) o.d), 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+    place(buf, base, L.dst, fa, "fa_cluster");
+    ggml_cgraph * g = ggml_new_graph_custom(ctx, 8, false);
+    ggml_build_forward_expand(g, fa);
+    if (!ggml_backend_supports_op(be, fa)) { fprintf(stderr, "HTP0 rejects the FA op\n"); return 1; }
+
+    uint32_t flags = (o.desc1d ? HTP_FA_CLUSTER_FLAG_DESC1D : 0) | HTP_FA_CLUSTER_FLAG_ECHO;
+    { int lg = 0; while ((1 << lg) < o.nslots) lg++; flags |= (uint32_t) lg << 1; }
+    auto set_mode = [&](bool on) {
+        fa->op_params[HTP_FA_CLUSTER_OPP_MAGIC]   = on ? (int32_t) HTP_FA_CLUSTER_MAGIC : 0;
+        fa->op_params[HTP_FA_CLUSTER_OPP_LAYER]   = 0;
+        fa->op_params[HTP_FA_CLUSTER_OPP_DENSITY] = 0;    // host-written lists
+        fa->op_params[HTP_FA_CLUSTER_OPP_WINDOW]  = W;
+        fa->op_params[HTP_FA_CLUSTER_OPP_FLAGS]   = (int32_t) flags;
+        fa->src[7] = on ? shadow : nullptr;
+    };
+
+    const size_t blk_bytes   = 2 * (size_t) 64 * o.d * 2;                       // K + V of one block of one head
+    const size_t bytes_dense = (size_t) (o.kv / 64) * o.nkvh * blk_bytes;
+    const size_t bytes_list  = pages_total * blk_bytes + (size_t) (W / 64) * o.nkvh * blk_bytes;
+    printf("cluster mode: kv %d, window %d, %d candidate pages per head, density %d%% %s, skew %.2f -> %zu listed pages (mean %.1f/head), nslots %d, desc %s, perm %s, mask %d permille\n",
+           o.kv, W, n_cand, o.density, o.sel_scatter ? "scattered" : "contiguous", o.skew, pages_total, (double) pages_total / o.nkvh,
+           o.nslots, o.desc1d ? "1d" : "2d", o.perm_identity ? "identity" : "random", o.mask_frac_permille);
+
+    struct arm_res { stat_acc wall, usec, axi; double worst = 0; };
+    auto run_arm = [&](const char * name, bool on, arm_res & r) {
+        set_mode(on);
+        for (int it = -1; it < o.iters; ++it) {
+            memset(base + L.dst, 0, (size_t) o.nh * o.d * 4);
+            g_prof_lines.clear();
+            const uint64_t t0 = cnt_now();
+            ggml_backend_graph_compute(be, g);
+            const uint64_t t1 = cnt_now();
+            dc_civac(base + L.dst, (size_t) o.nh * o.d * 4);
+            if (it < 0) continue;
+            r.wall.add(ticks_us((double) (t1 - t0)));
+            double us = 0, ax = 0;
+            if (prof_last(&us, &ax)) { r.usec.add(us); r.axi.add(ax); }
+        }
+        double worst = 0;
+        for (int h = 0; h < o.nh; ++h) {
+            std::vector<std::pair<int, bool>> keys;
+            if (on) {
+                for (uint16_t p : lists[h / G]) for (int i = 0; i < 64; ++i) keys.push_back({ (int) pos_map[p * 64 + i], false });
+                for (int p = covered_end; p < o.kv; ++p) keys.push_back({ p, true });
+            } else {
+                for (int p = 0; p < o.kv; ++p) keys.push_back({ p, true });
+            }
+            std::vector<double> ref;
+            ref_attn_keys(o, base, L, h, keys, ref);
+            const float * out = (const float *) (base + L.dst + (size_t) h * o.d * 4);
+            for (int dd = 0; dd < o.d; ++dd) worst = std::max(worst, fabs((double) out[dd] - ref[dd]));
+        }
+        r.worst = worst;
+        const size_t bytes = on ? bytes_list : bytes_dense;
+        const double gbs = r.usec.empty() ? 0.0 : bytes / (r.usec.med() * 1e-6) / 1e9;
+        printf("  %-10s graph_compute med %7.1f us | FA op med %7.1f us (min %7.1f max %7.1f) | %6.2f MB -> %5.1f GB/s | AXI rd req med %.0f (%.0f B/req) | max|err| %.2e %s\n",
+               name, r.wall.med(), r.usec.med(), r.usec.mn(), r.usec.mx(), bytes / 1048576.0, gbs,
+               r.axi.med(), r.axi.med() > 0 ? bytes / r.axi.med() : 0.0, worst, worst < 2e-2 ? "OK" : "MISMATCH");
+    };
+    arm_res dense, list;
+    run_arm("dense", false, dense);
+    run_arm("page list", true, list);
+    {
+        bool ok = true;
+        dc_civac(lb + hdr.off_echo_sel, (size_t) o.nkvh * hdr.host_sel_stride);
+        for (int h = 0; h < o.nkvh; ++h) {
+            const uint8_t * e = lb + hdr.off_echo_sel + (size_t) h * hdr.host_sel_stride;
+            if (*(const uint32_t *) e != lists[h].size() || (lists[h].size() && memcmp(e + 128, lists[h].data(), lists[h].size() * 2))) ok = false;
+        }
+        printf("  echoed lists %s; page list vs dense FA op: %.2fx time, %.2fx bytes\n", ok ? "match the host lists" : "DO NOT match (page path not taken?)",
+               dense.usec.empty() || list.usec.empty() ? 0.0 : list.usec.med() / dense.usec.med(), (double) bytes_list / bytes_dense);
+        if (!ok) { ggml_free(ctx); return 3; }
+    }
+    ggml_free(ctx);
+    return (dense.worst < 2e-2 && list.worst < 2e-2) ? 0 : 2;
+}
+
 int main(int argc, char ** argv) {
     options o;
     if (!parse(argc, argv, o)) return 1;
@@ -390,6 +643,13 @@ int main(int argc, char ** argv) {
         setenv("GGML_HEXAGON_HETERO_SPAN", std::to_string(o.span).c_str(), 1);
         setenv("GGML_HEXAGON_ASYNC", "0", 1);
     }
+    if (o.cluster) {
+        setenv("GGML_HEXAGON_ASYNC", "0", 1);
+        setenv("GGML_HEXAGON_PROFILE", o.pmu ? "0x3,0x41,0xce,0x43,0xcf,0x7d,0x8c,0x40" : "1", 1);
+        unsetenv("GGML_HEXAGON_HETERO_FRAC");
+        unsetenv("GGML_HEXAGON_CLUSTER_ATTN");   // the tool tags its own node
+        ggml_log_set(prof_log_cb, nullptr);
+    }
     if (o.cpu >= 0) { cpu_set_t set; CPU_ZERO(&set); CPU_SET(o.cpu, &set); if (sched_setaffinity(0, sizeof(set), &set)) perror("sched_setaffinity"); }
     calibrate_realtime();
 
@@ -402,6 +662,14 @@ int main(int argc, char ** argv) {
     L.nbk1 = L.nbk2 * o.nkvh;
     L.part_stride = 128 + (size_t) o.d * 4;
     const size_t kv_bytes = (size_t) o.kv * L.nbk1;
+    htp_fa_cluster_header shadow_hdr = {};
+    size_t shadow_bytes = 0;
+    if (o.cluster) {
+        // one layer's shadow at the front of the buffer; the positional data moves up behind it
+        shadow_bytes = (size_t) htp_fa_cluster_layout(&shadow_hdr, 1, (uint32_t) o.kv, (uint32_t) o.nkvh, (uint32_t) o.d);
+        shadow_bytes = ((shadow_bytes + (1 << 20) - 1) >> 20) << 20;
+        L.q += shadow_bytes; L.mask += shadow_bytes; L.dst += shadow_bytes; L.parts += shadow_bytes; L.k += shadow_bytes;
+    }
     L.k += (size_t) o.pad_mb << 20;
     L.v = L.k + kv_bytes;
     L.total = ((L.v + kv_bytes + (1 << 20) - 1) >> 20) << 20;
@@ -433,6 +701,12 @@ int main(int argc, char ** argv) {
         memset(base + L.parts, 0, L.parts_size);
         memset(base, 0, L.flags_end);
         dc_cvac(base, L.total);
+    }
+
+    if (o.cluster) {
+        const int rc = run_cluster(o, be, buf, base, L, shadow_hdr, shadow_bytes);
+        ggml_backend_buffer_free(buf); ggml_backend_free(be);
+        return rc;
     }
 
     // HTP graph: probe(handshake) -> FA over [gpu_kv, kv) -> probe(ping)

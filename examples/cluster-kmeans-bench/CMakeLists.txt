@@ -1,0 +1,7 @@
+set(TARGET llama-cluster-kmeans-bench)
+find_package(OpenCL REQUIRED)
+add_executable(${TARGET} cluster-kmeans-bench.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE ggml OpenCL::OpenCL ${CMAKE_THREAD_LIBS_INIT})
+target_compile_definitions(${TARGET} PRIVATE CL_TARGET_OPENCL_VERSION=300)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)

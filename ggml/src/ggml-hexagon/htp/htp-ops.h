@@ -2,6 +2,8 @@
 #define HTP_OPS_H
 
 #include <assert.h>
+#include <stdint.h>
+#include <string.h>
 
 // ggml-common.h must be included prio to this header
 
@@ -158,6 +160,104 @@ enum htp_sync_probe_rec {
 #define HTP_FA_HETERO_MAX_SLOTS      30
 #define HTP_FA_HETERO_BUF_SIZE       (8 * 1024 * 1024)
 #define HTP_FA_HETERO_DONE_TIMEOUT_US 50000
+
+// Cluster-selected sparse decode attention (dev prototype; host env GGML_HEXAGON_CLUSTER_ATTN).
+//
+// The backend owns a "shadow" copy of the KV cache in cluster order: per layer and KV head the
+// keys are packed into 64-key pages (16 KB per page per tensor), each page described by the f16
+// mean of its keys. A decode FLASH_ATTN_EXT tagged with these op_params (static per node) and the
+// shadow buffer as src[7] attends over a per-head LIST of pages plus a dense tail of the positional
+// cache [dense_start, n_kv) with the normal mask. Everything that changes per token is DATA in the
+// shadow buffer (the host graph cache makes op_params static): the layer directory publishes how
+// far the clustering reaches (covered_end), and the kernel derives the dense tail from the chunk
+// table so no key is attended twice. covered_end == 0 reproduces the dense kernel exactly.
+#define HTP_FA_CLUSTER_OPP_MAGIC    11     // op_params[11]: HTP_FA_CLUSTER_MAGIC enables the mode
+#define HTP_FA_CLUSTER_OPP_LAYER    12     // op_params[12]: layer index (directory / per-layer region)
+#define HTP_FA_CLUSTER_OPP_DENSITY  13     // op_params[13]: page budget, permille of the candidates; 0 = host-written lists
+#define HTP_FA_CLUSTER_OPP_WINDOW   14     // op_params[14]: recent window W (keys) always attended densely
+#define HTP_FA_CLUSTER_OPP_FLAGS    15     // op_params[15]: HTP_FA_CLUSTER_FLAG_*
+#define HTP_FA_CLUSTER_MAGIC        0x434c4b56u
+#define HTP_FA_CLUSTER_VERSION      1u
+#define HTP_FA_CLUSTER_FLAG_DESC1D      (1u << 0)              // fetch shadow pages with one 1D descriptor (else 64 x 256 B rows)
+#define HTP_FA_CLUSTER_FLAG_NSLOTS(f)   (((f) >> 1) & 7u)      // log2 of the staging slots per thread; 0 = default (2)
+#define HTP_FA_CLUSTER_FLAG_ECHO        (1u << 4)              // write the lists the kernel used into echo_sel
+#define HTP_FA_CLUSTER_FLAG_COALESCE    (1u << 5)              // merge consecutive pages into one descriptor (reserved)
+#define HTP_FA_CLUSTER_FLAG_FOLD_SUM    (1u << 6)              // GQA score fold: sum over the group (else max)
+#define HTP_FA_CLUSTER_FLAG_MINPAGES(f) (((f) >> 8) & 0xffu)   // minimum pages per head when a budget is used
+#define HTP_FA_CLUSTER_PAGE_KEYS    64
+#define HTP_FA_CLUSTER_MAX_CHUNKS   256
+#define HTP_FA_CLUSTER_MAX_HEADS    64
+#define HTP_FA_CLUSTER_MAX_SLOTS    8      // staging ring depth cap (per thread)
+#define HTP_FA_CLUSTER_DIR_OFF      4096
+#define HTP_FA_CLUSTER_DIR_STRIDE   128
+
+// Shadow buffer, byte 0. Written once by the host; the DSP invalidates before reading.
+struct htp_fa_cluster_header {
+    uint32_t magic, version, n_layers, kv_size;
+    uint32_t n_kv_heads, D, page_keys, page_bytes;      // page_bytes = page_keys * D * 2
+    uint32_t n_pages_max, chunk_keys, max_chunks, flags;
+    uint32_t centroid_bytes, host_sel_stride, pad0, pad1;
+    uint64_t layer0_off, layer_stride, hetero_off;      // hetero_off: 0 = no hetero control region
+    // per-layer sub-region offsets, bytes from the layer base (all 128-B aligned, pages 16 KB aligned)
+    uint64_t off_chunks;      // [max_chunks] x struct htp_fa_cluster_chunk
+    uint64_t off_host_sel;    // [n_kv_heads] x host_sel_stride: { uint32_t n; uint32_t pad[31]; uint16_t pages[]; }
+    uint64_t off_echo_sel;    // same shape, written by the kernel under HTP_FA_CLUSTER_FLAG_ECHO
+    uint64_t off_centroids;   // [n_kv_heads][n_pages_max] x f16[D] (centroid_bytes rows)
+    uint64_t off_pos_map;     // [n_pages_max] x uint32_t[page_keys]: positional row of each key
+    uint64_t off_n_valid;     // [n_pages_max] x uint16_t (reserved: pages are full in v1)
+    uint64_t off_k_pages;     // [n_kv_heads][n_pages_max] x [page_keys][D] f16
+    uint64_t off_v_pages;     // same
+};
+
+// Per-layer directory entry @ HTP_FA_CLUSTER_DIR_OFF + il * HTP_FA_CLUSTER_DIR_STRIDE.
+struct htp_fa_cluster_dir {
+    uint32_t covered_end;     // positions [0, covered_end) are clustered; a multiple of 64; written LAST
+    uint32_t n_pages_pub;     // pages readable (immutable once published)
+    uint32_t n_chunks;
+    uint32_t stale;           // 1: the layer was rewritten below covered_end -> kernel runs dense
+    uint32_t t_gpu_us, t_publish_us;
+    uint32_t pad[26];
+};
+
+struct htp_fa_cluster_chunk {
+    uint32_t pos_begin, pos_end;   // positional range this chunk clustered; pos_end % 64 == 0
+    uint32_t page_first, n_pages;  // its pages, per KV head
+};
+
+// Single source of truth for the shadow layout (host backend, tools, and the DSP read the same
+// offsets from the header this fills). Returns the buffer size in bytes. Sub-regions are 128-B
+// aligned, page regions 16 KB aligned, layers 64 KB aligned.
+static inline uint64_t htp_fa_cluster_align(uint64_t x, uint64_t a) { return (x + a - 1) / a * a; }
+
+static inline uint64_t htp_fa_cluster_layout(struct htp_fa_cluster_header * h, uint32_t n_layers, uint32_t kv_size,
+                                             uint32_t n_kv_heads, uint32_t D) {
+    memset(h, 0, sizeof(*h));
+    h->magic       = HTP_FA_CLUSTER_MAGIC;
+    h->version     = HTP_FA_CLUSTER_VERSION;
+    h->n_layers    = n_layers;
+    h->kv_size     = kv_size;
+    h->n_kv_heads  = n_kv_heads;
+    h->D           = D;
+    h->page_keys   = HTP_FA_CLUSTER_PAGE_KEYS;
+    h->page_bytes  = HTP_FA_CLUSTER_PAGE_KEYS * D * 2;
+    h->n_pages_max = (kv_size + HTP_FA_CLUSTER_PAGE_KEYS - 1) / HTP_FA_CLUSTER_PAGE_KEYS;
+    h->chunk_keys  = 1024;
+    h->max_chunks  = HTP_FA_CLUSTER_MAX_CHUNKS;
+    h->centroid_bytes  = (uint32_t) htp_fa_cluster_align((uint64_t) D * 2, 128);
+    h->host_sel_stride = (uint32_t) htp_fa_cluster_align(128 + 2ull * h->n_pages_max, 128);
+    uint64_t off = 0;
+    h->off_chunks    = off;                            off += (uint64_t) h->max_chunks * sizeof(struct htp_fa_cluster_chunk);
+    h->off_host_sel  = htp_fa_cluster_align(off, 128); off  = h->off_host_sel  + (uint64_t) n_kv_heads * h->host_sel_stride;
+    h->off_echo_sel  = htp_fa_cluster_align(off, 128); off  = h->off_echo_sel  + (uint64_t) n_kv_heads * h->host_sel_stride;
+    h->off_centroids = htp_fa_cluster_align(off, 128); off  = h->off_centroids + (uint64_t) n_kv_heads * h->n_pages_max * h->centroid_bytes;
+    h->off_pos_map   = htp_fa_cluster_align(off, 128); off  = h->off_pos_map   + (uint64_t) h->n_pages_max * HTP_FA_CLUSTER_PAGE_KEYS * 4;
+    h->off_n_valid   = htp_fa_cluster_align(off, 128); off  = h->off_n_valid   + htp_fa_cluster_align((uint64_t) h->n_pages_max * 2, 128);
+    h->off_k_pages   = htp_fa_cluster_align(off, 16384); off = h->off_k_pages  + (uint64_t) n_kv_heads * h->n_pages_max * h->page_bytes;
+    h->off_v_pages   = htp_fa_cluster_align(off, 16384); off = h->off_v_pages  + (uint64_t) n_kv_heads * h->n_pages_max * h->page_bytes;
+    h->layer_stride  = htp_fa_cluster_align(off, 65536);
+    h->layer0_off    = htp_fa_cluster_align(HTP_FA_CLUSTER_DIR_OFF + (uint64_t) n_layers * HTP_FA_CLUSTER_DIR_STRIDE, 65536);
+    return h->layer0_off + (uint64_t) n_layers * h->layer_stride;
+}
 
 #define HTP_OP_MAX_DIMS    4    // aka GGML_MAX_DIMS
 #define HTP_OP_MAX_INPUTS  8    // sparse flash-attention carries sel (src 5) and its per-row count (src 6); hetero decode FA carries its control buffer (src 7)
