@@ -118,7 +118,66 @@ still 3.6x inside the budget. The sidecar can run under prefill without touching
 
 
 
-## Stage 3 -- clustering sidecar (later)
+## Stage 3 -- clustering sidecar in the backend (built, measured 2026-09-06)
+
+A host thread with its own OpenCL queue (`ggml_hexagon_cluster_sidecar`, pattern of the hetero
+relay). The backend tracks the `SET_ROWS` nodes that write `cache_k_l%d` / `cache_v_l%d`, reads the
+row-index leaf, and after each batch completes posts a job {positions written, n_tokens}. Per layer
+the sidecar keeps `written_end` / `covered_end`; whenever a 1024-position chunk is pending (and, at
+the end of a prompt, a tail of at least two pages) it copies the chunk's K rows to the GPU, runs the
+Stage 2 k-means (k-means++ init on a 256-key subsample, Lloyd with early stop, 8 iterations max),
+reads the assignment back, sorts keys by (cluster, distance) on the CPU, gathers K and V rows into
+the shadow pages in that order, computes the f16 page descriptors, and publishes: chunk entry and
+page count first, `covered_end` last, each followed by a cache clean. Pages already published are
+never rewritten; positions written from 0 again reset the layer; out-of-range or non-contiguous
+indices skip the batch or mark the layer stale (dense). `GGML_HEXAGON_CLUSTER_VERIFY=1` re-checks
+every published chunk against the cache (pos_map a permutation, page rows bit-exact, descriptors
+within 1e-2); `GGML_HEXAGON_CLUSTER_POSITIONAL=1` is the Quest-style baseline (pages of 64
+consecutive positions, no k-means).
+
+Correctness on the model (Qwen3-1.7B, 4.6k-token prompt): every chunk verified; greedy text
+identical to dense at density 1000 and at 250; decode-mode perplexity at density 1000 equals
+dense (9.1330 vs 9.1332, ctx 4096).
+
+### Three things that cost a debugging round each
+
+1. **The SET_ROWS index leaf must be read before compute, not after.** It is a transient graph
+   input whose buffer the scheduler recycles for activations during the graph, so reading it after
+   completion returns float garbage; every layer went stale and the kernel silently ran dense
+   (no token speedup, no error). The positions are now captured at the top of `graph_compute`,
+   after llama's `set_inputs` and before the ops run; the job is posted after completion, when the
+   DSP has written the rows.
+2. **The shadow doubles the KV footprint, and the cDSP has one ~3.2 GB virtual space.** Weights,
+   cache and shadow are all mapped into it (`vmem 3355443200` at init, 3200 MB reported by the
+   session). Qwen3-1.7B at 16k is 1.9 GB of cache + 1.3 GB of weights: a full shadow cannot be
+   mapped, the fastrpc mapping is delayed, and the DSP faults on first touch -- with the fault
+   surfacing even when the cluster kernel path was bypassed, which is what identified it. At 8k the
+   total sits exactly at the budget (3.24 GB), which was the intermittent segfault. Init now sizes
+   the shadow to what is left after the cache and a weights margin (`GGML_HEXAGON_CLUSTER_MEM_MB`
+   overrides) and clusters only that many leading positions:
+
+   | context | KV cache | shadow | outcome |
+   |--:|--:|--:|---|
+   | 4k  | 0.50 GB | 484 MB, all 4352 positions | full |
+   | 8k  | 0.97 GB | 733 MB, first 6592 of 8448 positions | capped |
+   | 12k | 1.43 GB | 178 MB, first 1600 positions | mostly dense |
+   | 16k | 1.91 GB | none fits | dense, with the reason logged |
+
+   This is plan risk R7 realised and it is a property of the shadow-copy design on this device,
+   not of the kernel: the production form has to drop the positional copy for clustered ranges
+   (in-place permutation) or shrink the pages (Q8 descriptors and pages halve it).
+3. **llama frees the KV cache before the backend session is released**, while the sidecar may
+   still be clustering queued chunks from it: a segfault at exit after correct results. The hexagon
+   buffer free now quiesces the sidecar (drops queued jobs, waits for a chunk in flight, forgets the
+   roots) and stop drops the queue.
+
+Sidecar cost on the model: ~10 ms of GPU k-means and ~35 ms of CPU work per layer per chunk (the
+CPU does the k-means++ init, the sort, the gather into the shadow and the page means), i.e. ~1.3 s
+per 28-layer chunk against a ~0.56 s prefill ubatch, so at 4k the sidecar finishes ~2 s after the
+prompt and the first decode tokens see a partly covered shadow (correct, just less sparse). The
+Stage 2 bench showed the gather and page means take 0.6 ms on the GPU; moving them there is the
+obvious next step and would bring the sidecar under the prefill time.
+
 
 ## Stage 4 -- on-device selection inside the FA op (built, measured 2026-09-06)
 
