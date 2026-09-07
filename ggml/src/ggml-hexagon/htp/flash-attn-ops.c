@@ -105,6 +105,7 @@ struct htp_fa_context {
     // walks a per-head list: cl_sel_n[kvh] shadow pages (contiguous 16 KB per tensor, no mask)
     // followed by the dense positional blocks [cl_dense_b0, n_blocks) with the mask.
     bool            cl_on;
+    bool            cl_inplace;        // pages are page_keys consecutive rows of the positional K/V (HTP_FA_CLUSTER_HDR_INPLACE)
     uint32_t        cl_flags;
     const uint8_t * cl_k_pages;        // shadow K pages of this layer: [kvh][page] x page_bytes
     const uint8_t * cl_v_pages;
@@ -3096,6 +3097,17 @@ static inline void hvx_fa_dec_blk_src(const struct htp_fa_context * factx, const
             if (page >= factx->cl_n_cand) {
                 page = factx->cl_n_cand - 1;   // clamp: a bad index must never form a wild address
             }
+            if (factx->cl_inplace) {
+                // the page is rows [page*PK, page*PK + PK) of the positional cache: the dense block fetch
+                // (nb[1] stride) without the mask -- every candidate row lies below dense_start <= nek1
+                const uint32_t ic = page * factx->cl_page_keys;
+                b->k      = (const uint8_t *) k->data + ((size_t) ic * k->nb[1] + ik2 * k->nb[2] + ik3 * k->nb[3]);
+                b->v      = (const uint8_t *) v->data + ((size_t) ic * v->nb[1] + iv2 * v->nb[2] + iv3 * v->nb[3]);
+                b->bsz    = factx->cl_page_keys;
+                b->pos    = UINT32_MAX;
+                b->contig = false;
+                return;
+            }
             const size_t   off  = (size_t) kvh * factx->cl_head_stride + (size_t) page * factx->cl_page_bytes;
             b->k      = factx->cl_k_pages + off;
             b->v      = factx->cl_v_pages + off;
@@ -3538,6 +3550,95 @@ static inline void hvx_fa_cl_inval(const void * p, size_t n) {
     }
 }
 
+// ---- in-place descriptors computed on the DSP -------------------------------------------------
+// Page p of a layer is rows [p*PK, p*PK+PK) of the positional K cache. The host publishes how many
+// rows are complete (htp_fa_cluster_hdir.rows_valid, written before the graph is submitted); the op
+// computes the f16 mean of every complete page not yet described -- one 2D descriptor per page brings
+// all heads of its rows into VTCM -- and publishes the count in the DSP-owned directory. The rows
+// come through the DMA engine like every other K row, so the CPU never reads DSP-written data.
+struct hvx_fa_desc_job {
+    const struct htp_ops_context * octx;
+    const uint8_t * kdata;
+    uint32_t  nbk1, nek2, DK, PK, p0, p1, n_pages_max, cbytes;
+    size_t    row_bytes;      // nek2 * DK * 2: the heads of one row, contiguous
+    uint8_t * cent;           // this layer's descriptors: [nek2][n_pages_max] x cbytes
+    uint8_t * vtcm;
+    size_t    vtcm_stride;    // PK * row_bytes per thread
+};
+
+static void flash_attn_ext_f16_desc_thread(unsigned int nth, unsigned int ith, void * data) {
+    const struct hvx_fa_desc_job * j = (const struct hvx_fa_desc_job *) data;
+    dma_queue * dma = j->octx->ctx->dma[ith];
+    uint8_t * stage = j->vtcm + (size_t) ith * j->vtcm_stride;
+    const HVX_Vector inv = hvx_vec_splat_f32(1.0f / (float) j->PK);
+    const uint32_t nvec = j->DK / 64;   // f16 vectors per head row (DK 128 -> 2)
+    for (uint32_t p = j->p0 + ith; p < j->p1; p += nth) {
+        dma_queue_push(dma, dma_make_ptr(stage, j->kdata + (size_t) p * j->PK * j->nbk1), j->row_bytes, j->nbk1, j->row_bytes, j->PK);
+        dma_queue_pop(dma);
+        for (uint32_t h = 0; h < j->nek2; ++h) {
+            HVX_Vector acc[2][2];
+            for (uint32_t v = 0; v < nvec; ++v) { acc[v][0] = Q6_V_vzero(); acc[v][1] = Q6_V_vzero(); }
+            for (uint32_t i = 0; i < j->PK; ++i) {
+                const HVX_Vector * row = (const HVX_Vector *) (stage + (size_t) i * j->row_bytes + (size_t) h * j->DK * 2);
+                for (uint32_t v = 0; v < nvec; ++v) {
+                    HVX_VectorPair w = hvx_vec_f16_to_f32(row[v]);
+                    acc[v][0] = HVX_OP_ADD_F32(acc[v][0], Q6_V_lo_W(w));
+                    acc[v][1] = HVX_OP_ADD_F32(acc[v][1], Q6_V_hi_W(w));
+                }
+            }
+            HVX_Vector * out = (HVX_Vector *) (j->cent + ((size_t) h * j->n_pages_max + p) * j->cbytes);
+            for (uint32_t v = 0; v < nvec; ++v) {
+                out[v] = hvx_vec_f32_to_f16(HVX_OP_MUL_F32(acc[v][0], inv), HVX_OP_MUL_F32(acc[v][1], inv));
+            }
+        }
+    }
+}
+
+// Bring the DSP-owned directory of layer il up to hdir.rows_valid: shrink after a rewind, or describe
+// the newly complete pages. Returns false when the op cannot run in cluster mode.
+static bool hvx_fa_cl_dsp_desc(const struct htp_ops_context * octx, const uint8_t * base, const struct htp_fa_cluster_header * hdr,
+                               uint32_t il, const uint8_t * layer_base, struct htp_fa_cluster_dir * dir, uint32_t nek2, uint32_t DK) {
+    const struct htp_fa_cluster_hdir * hd = (const struct htp_fa_cluster_hdir *) (base + HTP_FA_CLUSTER_HDIR_OFF + (size_t) il * HTP_FA_CLUSTER_DIR_STRIDE);
+    hvx_fa_cl_inval(hd, sizeof(*hd));
+    uint32_t want = hd->rows_valid / hdr->page_keys;
+    if (want > hdr->n_pages_max) {
+        want = hdr->n_pages_max;
+    }
+    if (want < dir->n_pages_pub) {
+        dir->n_pages_pub = want;
+        dir->covered_end = want * hdr->page_keys;
+        qurt_mem_cache_clean((qurt_addr_t) dir, sizeof(*dir), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+    } else if (want > dir->n_pages_pub) {
+        const struct htp_tensor * k = octx->src[1];
+        const size_t row_bytes = (size_t) nek2 * DK * 2;
+        if (k->nb[2] != DK * 2 || k->nb[1] < row_bytes || (DK % 64) != 0 || DK > 128) {
+            return false;   // heads must be contiguous within a row
+        }
+        struct hvx_fa_desc_job j;
+        j.octx = octx; j.kdata = (const uint8_t *) (uintptr_t) k->data; j.nbk1 = k->nb[1]; j.nek2 = nek2; j.DK = DK; j.PK = hdr->page_keys;
+        j.p0 = dir->n_pages_pub; j.p1 = want; j.n_pages_max = hdr->n_pages_max; j.cbytes = hdr->centroid_bytes; j.row_bytes = row_bytes;
+        j.cent = (uint8_t *) (uintptr_t) (layer_base + hdr->off_centroids);
+        j.vtcm = octx->ctx->vtcm_base; j.vtcm_stride = (size_t) hdr->page_keys * row_bytes;
+        uint32_t nth = octx->n_threads;
+        while (nth > 1 && j.vtcm_stride * nth > octx->ctx->vtcm_size) {
+            nth--;
+        }
+        if (j.vtcm_stride > octx->ctx->vtcm_size) {
+            return false;
+        }
+        work_queue_run(octx->ctx->work_queue, flash_attn_ext_f16_desc_thread, &j, nth);
+        // publish: descriptors first (the select pass reads them through the DMA engine), then the count
+        for (uint32_t h = 0; h < nek2; ++h) {
+            qurt_mem_cache_clean((qurt_addr_t) (j.cent + ((size_t) h * hdr->n_pages_max + j.p0) * hdr->centroid_bytes),
+                                 (size_t) (want - j.p0) * hdr->centroid_bytes, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+        }
+        dir->n_pages_pub = want;
+        dir->covered_end = want * hdr->page_keys;
+        qurt_mem_cache_clean((qurt_addr_t) dir, sizeof(*dir), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+    }
+    return true;
+}
+
 // Returns true when this op runs in cluster mode; fills factx->cl_* except the VTCM list copy
 // (hvx_fa_cl_copy_lists, after the VTCM allocation). Any inconsistency degrades to dense.
 static bool hvx_fa_cl_setup(struct htp_fa_context * factx, const struct htp_ops_context * octx,
@@ -3557,12 +3658,27 @@ static bool hvx_fa_cl_setup(struct htp_fa_context * factx, const struct htp_ops_
     if (il >= hdr->n_layers) {
         return false;
     }
-    const struct htp_fa_cluster_dir * dir = (const struct htp_fa_cluster_dir *) (base + HTP_FA_CLUSTER_DIR_OFF + (size_t) il * HTP_FA_CLUSTER_DIR_STRIDE);
+    struct htp_fa_cluster_dir * dir = (struct htp_fa_cluster_dir *) (uintptr_t) (base + HTP_FA_CLUSTER_DIR_OFF + (size_t) il * HTP_FA_CLUSTER_DIR_STRIDE);
     hvx_fa_cl_inval(dir, sizeof(*dir));
-    if (dir->stale || dir->covered_end == 0 || dir->n_chunks == 0) {
+    const bool inplace = (hdr->flags & HTP_FA_CLUSTER_HDR_INPLACE) != 0;
+    const uint8_t * layer_base = base + hdr->layer0_off + (size_t) il * hdr->layer_stride;
+    if (inplace && (hdr->flags & HTP_FA_CLUSTER_HDR_DSP_DESC)) {
+        if (!hvx_fa_cl_dsp_desc(octx, base, hdr, il, layer_base, dir, nek2, DK)) {
+            return false;
+        }
+    }
+    if (dir->stale || dir->covered_end == 0 || (!inplace && dir->n_chunks == 0)) {
         return false;
     }
-    const uint8_t * layer_base = base + hdr->layer0_off + (size_t) il * hdr->layer_stride;
+    // Rows the host vouches for before this graph was submitted. The sidecar publishes asynchronously:
+    // after a reset or rewind its directory is stale until it catches up, and the first graph of a new
+    // context (position 0, the attention sink) must not attend pages of the previous one.
+    uint32_t rows_ok = UINT32_MAX;
+    if (hdr->flags & HTP_FA_CLUSTER_HDR_HOST_ROWS) {
+        const struct htp_fa_cluster_hdir * hd = (const struct htp_fa_cluster_hdir *) (base + HTP_FA_CLUSTER_HDIR_OFF + (size_t) il * HTP_FA_CLUSTER_DIR_STRIDE);
+        hvx_fa_cl_inval(hd, sizeof(*hd));
+        rows_ok = hd->rows_valid;
+    }
     const struct htp_fa_cluster_chunk * chunks = (const struct htp_fa_cluster_chunk *) (layer_base + hdr->off_chunks);
     const uint32_t n_chunks = MIN(dir->n_chunks, hdr->max_chunks);
     hvx_fa_cl_inval(chunks, (size_t) n_chunks * sizeof(*chunks));
@@ -3571,9 +3687,20 @@ static bool hvx_fa_cl_setup(struct htp_fa_context * factx, const struct htp_ops_
     // candidates are the pages of every chunk up to it. Chunks are appended in position order.
     const uint32_t W = (uint32_t) octx->op_params[HTP_FA_CLUSTER_OPP_WINDOW];
     uint32_t dense_start = 0, n_cand = 0;
-    for (uint32_t c = 0; c < n_chunks; ++c) {
+    if (inplace) {
+        // In-place pages: the candidates are the complete published pages that leave at least W
+        // positions to the dense tail; the boundary is rounded down to a 64-key block so the tail
+        // is addressed exactly as the dense kernel addresses it (tail = W .. W+63 keys).
+        const uint32_t avail = MIN(MIN(dir->covered_end, dir->n_pages_pub * hdr->page_keys), rows_ok);
+        if (nek1 <= W) {
+            return false;
+        }
+        dense_start = MIN(avail, nek1 - W) & ~(FLASH_ATTN_BLOCK_SIZE - 1);
+        n_cand      = dense_start / hdr->page_keys;
+    }
+    for (uint32_t c = 0; !inplace && c < n_chunks; ++c) {
         const struct htp_fa_cluster_chunk ch = chunks[c];
-        if (ch.pos_end > dir->covered_end || ch.pos_end + W > nek1 || (ch.pos_end % FLASH_ATTN_BLOCK_SIZE) != 0) {
+        if (ch.pos_end > dir->covered_end || ch.pos_end > rows_ok || ch.pos_end + W > nek1 || (ch.pos_end % FLASH_ATTN_BLOCK_SIZE) != 0) {
             break;
         }
         if (ch.page_first + ch.n_pages > dir->n_pages_pub || ch.page_first + ch.n_pages > hdr->n_pages_max) {
@@ -3587,8 +3714,9 @@ static bool hvx_fa_cl_setup(struct htp_fa_context * factx, const struct htp_ops_
     }
 
     factx->cl_flags          = (uint32_t) octx->op_params[HTP_FA_CLUSTER_OPP_FLAGS];
-    factx->cl_k_pages        = layer_base + hdr->off_k_pages;
-    factx->cl_v_pages        = layer_base + hdr->off_v_pages;
+    factx->cl_inplace        = inplace;
+    factx->cl_k_pages        = inplace ? NULL : layer_base + hdr->off_k_pages;
+    factx->cl_v_pages        = inplace ? NULL : layer_base + hdr->off_v_pages;
     factx->cl_page_bytes     = hdr->page_bytes;
     factx->cl_page_keys      = hdr->page_keys;
     factx->cl_head_stride    = (size_t) hdr->n_pages_max * hdr->page_bytes;
@@ -3895,6 +4023,7 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     // check out degrades to the dense kernel.
     factx.dec_nslots = 2;
     factx.cl_on      = false;
+    factx.cl_inplace = false;
     factx.cl_flags   = 0;
     struct hvx_fa_cl_setup cls;
     if (dec && !het_base && octx->src[7] && octx->src[7]->data &&

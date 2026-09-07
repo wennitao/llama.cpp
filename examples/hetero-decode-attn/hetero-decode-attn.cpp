@@ -109,6 +109,8 @@ struct options {
     int    pmu       = 0;      // capture AXI read requests per op (GGML_HEXAGON_PROFILE PMU mode)
     int    select_device = 0;  // 1 = the kernel selects the pages itself (density as budget), 0 = host-written lists
     int    page_keys = 64;     // keys per shadow page: 16, 32 or 64
+    int    inplace = 0;        // 1 = in-place pages (rows of the positional cache; shadow holds descriptors only)
+    int    chunk = 1024;       // keys per chunk-table entry (shadow mode)
     int    seed      = 1234;
 };
 
@@ -144,6 +146,8 @@ static bool parse(int argc, char ** argv, options & o) {
         else if (a == "--pmu")      { o.pmu = 1; }
         else if (a == "--select-device") { o.select_device = 1; }
         else if (a == "--page-keys") { if (!next_i(o.page_keys)) return false; }
+        else if (a == "--inplace")   { o.inplace = 1; o.perm_identity = 1; }
+        else if (a == "--chunk")     { if (!next_i(o.chunk)) return false; }
         else if (a == "--sel")      { if (i + 1 >= argc) return false; o.sel_scatter = std::string(argv[++i]) != "contig"; }
         else if (a == "--desc")     { if (i + 1 >= argc) return false; o.desc1d = std::string(argv[++i]) == "1d"; }
         else if (a == "--perm")     { if (i + 1 >= argc) return false; o.perm_identity = std::string(argv[++i]) == "identity"; }
@@ -480,10 +484,13 @@ static int run_cluster(const options & o, ggml_backend_t be, ggml_backend_buffer
     memcpy(base, &hdr, sizeof(hdr));
     auto * dir = (htp_fa_cluster_dir *) (base + HTP_FA_CLUSTER_DIR_OFF);
     memset(dir, 0, sizeof(*dir));
+    auto * hdir = (htp_fa_cluster_hdir *) (base + HTP_FA_CLUSTER_HDIR_OFF);
+    memset(hdir, 0, sizeof(*hdir));
+    hdir->rows_valid = (uint32_t) covered_end;
     auto * chunks = (htp_fa_cluster_chunk *) (lb + hdr.off_chunks);
     uint32_t n_chunks = 0;
-    for (int pos = 0; pos < covered_end; pos += (int) hdr.chunk_keys) {
-        const int pend = std::min(pos + (int) hdr.chunk_keys, covered_end);
+    for (int pos = 0; pos < covered_end; pos += o.chunk) {
+        const int pend = std::min(pos + o.chunk, covered_end);
         chunks[n_chunks++] = { (uint32_t) pos, (uint32_t) pend, (uint32_t) (pos / PK), (uint32_t) ((pend - pos) / PK) };
     }
 
@@ -495,7 +502,7 @@ static int run_cluster(const options & o, ggml_backend_t be, ggml_backend_buffer
     auto * pos_map = (uint32_t *) (lb + hdr.off_pos_map);   // per head; one permutation shared here
     const size_t head_stride = (size_t) hdr.n_pages_max * hdr.page_bytes;
     for (int p = 0; p < n_cand; ++p) {
-        for (int i = 0; i < PK; ++i) {
+        for (int i = 0; i < PK && !o.inplace; ++i) {
             const int pos = perm[p * PK + i];
             for (int h = 0; h < o.nkvh; ++h) pos_map[((size_t) h * hdr.n_pages_max + p) * PK + i] = (uint32_t) pos;
             for (int h = 0; h < o.nkvh; ++h) {
@@ -507,7 +514,9 @@ static int run_cluster(const options & o, ggml_backend_t be, ggml_backend_buffer
         for (int h = 0; h < o.nkvh; ++h) {   // page descriptor = f16 mean of its keys (for the later selection stages)
             std::vector<float> acc(o.d, 0.0f);
             for (int i = 0; i < PK; ++i) {
-                const ggml_fp16_t * kr = (const ggml_fp16_t *) (lb + hdr.off_k_pages + (size_t) h * head_stride + (size_t) p * hdr.page_bytes + (size_t) i * o.d * 2);
+                const ggml_fp16_t * kr = o.inplace
+                    ? (const ggml_fp16_t *) (base + L.k + (size_t) (p * PK + i) * L.nbk1 + (size_t) h * L.nbk2)
+                    : (const ggml_fp16_t *) (lb + hdr.off_k_pages + (size_t) h * head_stride + (size_t) p * hdr.page_bytes + (size_t) i * o.d * 2);
                 for (int d = 0; d < o.d; ++d) acc[d] += ggml_fp16_to_fp32(kr[d]);
             }
             ggml_fp16_t * c = (ggml_fp16_t *) (lb + hdr.off_centroids + ((size_t) h * hdr.n_pages_max + p) * hdr.centroid_bytes);
@@ -581,8 +590,8 @@ static int run_cluster(const options & o, ggml_backend_t be, ggml_backend_buffer
     const uint32_t budget = (uint32_t) (((uint64_t) n_cand * o.density * 10 + 999) / 1000);   // the kernel's formula
     if (o.select_device) pages_total = (size_t) budget * o.nkvh;
     const size_t bytes_list  = pages_total * page_bytes2 + (size_t) (W / 64) * o.nkvh * blk_bytes;
-    printf("cluster mode (%s): kv %d, window %d, page %d keys, %d candidate pages per head, density %d%% %s, skew %.2f -> %zu listed pages (mean %.1f/head), nslots %d, desc %s, perm %s, mask %d permille\n",
-           o.select_device ? "device selection" : "host lists", o.kv, W, PK, n_cand, o.density, o.sel_scatter ? "scattered" : "contiguous", o.skew, pages_total, (double) pages_total / o.nkvh,
+    printf("cluster mode (%s%s): kv %d, window %d, chunk %d (%u entries), page %d keys, %d candidate pages per head, density %d%% %s, skew %.2f -> %zu listed pages (mean %.1f/head), nslots %d, desc %s, perm %s, mask %d permille\n",
+           o.select_device ? "device selection" : "host lists", o.inplace ? ", in-place pages" : "", o.kv, W, o.chunk, n_chunks, PK, n_cand, o.density, o.sel_scatter ? "scattered" : "contiguous", o.skew, pages_total, (double) pages_total / o.nkvh,
            o.nslots, o.desc1d ? "1d" : "2d", o.perm_identity ? "identity" : "random", o.mask_frac_permille);
 
     auto read_echo = [&]() {
@@ -647,7 +656,7 @@ static int run_cluster(const options & o, ggml_backend_t be, ggml_backend_buffer
         for (int h = 0; h < o.nh; ++h) {
             std::vector<std::pair<int, bool>> keys;
             if (on) {
-                for (uint16_t p : lists[h / G]) for (int i = 0; i < PK; ++i) keys.push_back({ (int) pos_map[((size_t) (h / G) * hdr.n_pages_max + p) * PK + i], false });
+                for (uint16_t p : lists[h / G]) for (int i = 0; i < PK; ++i) keys.push_back({ o.inplace ? (int) p * PK + i : (int) pos_map[((size_t) (h / G) * hdr.n_pages_max + p) * PK + i], false });
                 for (int p = covered_end; p < o.kv; ++p) keys.push_back({ p, true });
             } else {
                 for (int p = 0; p < o.kv; ++p) keys.push_back({ p, true });
@@ -721,7 +730,7 @@ int main(int argc, char ** argv) {
     size_t shadow_bytes = 0;
     if (o.cluster) {
         // one layer's shadow at the front of the buffer; the positional data moves up behind it
-        shadow_bytes = (size_t) htp_fa_cluster_layout(&shadow_hdr, 1, (uint32_t) o.kv, (uint32_t) o.nkvh, (uint32_t) o.d, (uint32_t) o.page_keys);
+        shadow_bytes = (size_t) htp_fa_cluster_layout_ex(&shadow_hdr, 1, (uint32_t) o.kv, (uint32_t) o.nkvh, (uint32_t) o.d, (uint32_t) o.page_keys, HTP_FA_CLUSTER_HDR_HOST_ROWS | (o.inplace ? HTP_FA_CLUSTER_HDR_INPLACE : 0u));
         shadow_bytes = ((shadow_bytes + (1 << 20) - 1) >> 20) << 20;
         L.q += shadow_bytes; L.mask += shadow_bytes; L.dst += shadow_bytes; L.parts += shadow_bytes; L.k += shadow_bytes;
     }

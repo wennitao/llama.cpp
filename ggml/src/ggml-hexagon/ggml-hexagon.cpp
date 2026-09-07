@@ -111,6 +111,9 @@ static int      opt_cluster_chunk   = 1024; // keys per clustering chunk (multip
 static int      opt_cluster_positional = 0; // 1 = baseline: pages are 64 consecutive positions (no k-means), descriptor = mean
 static int      opt_cluster_mem_mb   = 0;    // shadow memory budget in MB; 0 = what is left of the cDSP vmem budget after weights + KV
 static int      opt_cluster_page     = 64;   // keys per shadow page: 16, 32 or 64 (GGML_HEXAGON_CLUSTER_PAGE)
+static int      opt_cluster_inplace  = 0;    // 1 = pages are consecutive rows of llama's cache; the shadow holds only the page means (GGML_HEXAGON_CLUSTER_INPLACE)
+static int      opt_cluster_desc_cpu = 0;    // in-place mode: 1 = the CPU sidecar computes the page means (diagnostic); 0 = the FA op does (GGML_HEXAGON_CLUSTER_DESC_CPU)
+static int      opt_cluster_lag      = 0;    // rows held back from publication (diagnostic: CPU visibility of DSP-written rows) (GGML_HEXAGON_CLUSTER_LAG)
 static int      opt_cluster_sink     = 0;    // sink keys (positions [0, n)): packed into page 0 by the sidecar, which the kernel always selects (GGML_HEXAGON_CLUSTER_SINK)
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
@@ -4492,6 +4495,9 @@ struct ggml_hexagon_cluster_sidecar {
     std::vector<float> dist;
     std::vector<int> perm;
     std::vector<float> acc;
+    // delayed re-verification (GGML_HEXAGON_CLUSTER_VERIFY): the previous chunk's pages vs the cache rows, re-read later
+    std::vector<uint32_t> last_pos0, last_pos1, last_page_first;   // per layer
+    uint64_t n_stale_rows = 0, n_checked_rows = 0;
     // stats
     uint64_t n_jobs = 0, n_chunks = 0, n_resets = 0, n_verify_fail = 0;
     double   t_gpu_ms = 0, t_cpu_ms = 0, lag_max_ms = 0;
@@ -4543,6 +4549,42 @@ static bool cluster_run_chunk(ggml_hexagon_cluster_sidecar * s, uint32_t il, uin
     const uint8_t * krows = (const uint8_t *) L.k_root->data + (size_t) pos0 * nbk_row;
     const uint8_t * vrows = (const uint8_t *) L.v_root->data + (size_t) pos0 * L.v_root->nb[1];
     const auto t0 = std::chrono::steady_clock::now();
+    if (opt_cluster_verify && s->last_pos1.size() == c->layers.size() && s->last_pos1[il] > s->last_pos0[il] && s->last_pos1[il] <= pos0 && opt_cluster_positional) {
+        // Delayed re-verification: the previous chunk's pages were copied right after its rows were written.
+        // Re-read those cache rows now and count the rows that differ: any difference means this core read
+        // stale data the first time (positional pages: page row i of the chunk is position pos0 + i).
+        const uint32_t q0 = s->last_pos0[il], q1 = s->last_pos1[il], pf = s->last_page_first[il];
+        const uint8_t * kq = (const uint8_t *) L.k_root->data + (size_t) q0 * nbk_row;
+        const uint8_t * vq = (const uint8_t *) L.v_root->data + (size_t) q0 * L.v_root->nb[1];
+        cluster_dc_civac(kq, (size_t) (q1 - q0) * nbk_row);
+        cluster_dc_civac(vq, (size_t) (q1 - q0) * L.v_root->nb[1]);
+        const uint8_t * lb0 = c->base + hdr.layer0_off + (size_t) il * hdr.layer_stride;
+        uint32_t stale = 0, stale_v = 0, stale_c = 0, first_bad = UINT32_MAX;
+        for (uint32_t i = 0; i < q1 - q0; ++i) {
+            for (uint32_t h = 0; h < H; ++h) {
+                const uint8_t * page_row = lb0 + hdr.off_k_pages + (size_t) h * ((size_t) hdr.n_pages_max * hdr.page_bytes) + ((size_t) pf * PK + i) * D * 2;
+                const uint8_t * vpage_row = lb0 + hdr.off_v_pages + (size_t) h * ((size_t) hdr.n_pages_max * hdr.page_bytes) + ((size_t) pf * PK + i) * D * 2;
+                if (memcmp(page_row, kq + (size_t) i * nbk_row + (size_t) h * D * 2, (size_t) D * 2)) { stale++; if (first_bad == UINT32_MAX) first_bad = q0 + i; break; }
+                if (memcmp(vpage_row, vq + (size_t) i * L.v_root->nb[1] + (size_t) h * D * 2, (size_t) D * 2)) { stale_v++; if (first_bad == UINT32_MAX) first_bad = q0 + i; break; }
+            }
+        }
+        // descriptors: recompute the mean of each page from the cache rows as they are now
+        for (uint32_t h = 0; h < H; ++h) {
+            for (uint32_t p = 0; p < (q1 - q0) / PK; ++p) {
+                const uint16_t * cp = (const uint16_t *) (lb0 + hdr.off_centroids + ((size_t) h * hdr.n_pages_max + pf + p) * hdr.centroid_bytes);
+                bool bad = false;
+                for (uint32_t d = 0; d < D && !bad; d += 17) {
+                    double m = 0; for (uint32_t i = 0; i < PK; ++i) m += cluster_f16_to_f32(((const uint16_t *) (kq + (size_t) (p * PK + i) * nbk_row + (size_t) h * D * 2))[d]);
+                    m /= PK;
+                    if (fabs(m - cluster_f16_to_f32(cp[d])) > 2e-2 + 2e-2 * fabs(m)) bad = true;
+                }
+                stale_c += bad;
+            }
+        }
+        s->n_checked_rows += q1 - q0; s->n_stale_rows += stale + stale_v + stale_c;
+        if (stale || stale_v || stale_c) GGML_LOG_WARN("ggml-hex: cluster: layer %u chunk [%u,%u) re-read at [%u,%u): K rows differ %u, V rows differ %u, descriptors off %u (first row %u): STALE\n",
+                                                        il, q0, q1, pos0, pos1, stale, stale_v, stale_c, first_bad);
+    }
     // the DSP wrote these rows; make sure this core reads them from memory
     cluster_dc_civac(krows, (size_t) N * nbk_row);
     cluster_dc_civac(vrows, (size_t) N * L.v_root->nb[1]);
@@ -4638,6 +4680,10 @@ static bool cluster_run_chunk(ggml_hexagon_cluster_sidecar * s, uint32_t il, uin
     dir->covered_end = pos1;
     cluster_dc_civac(dir, sizeof(*dir));
     L.covered_end = pos1;
+    if (opt_cluster_verify) {
+        if (s->last_pos1.size() != c->layers.size()) { s->last_pos0.assign(c->layers.size(), 0); s->last_pos1.assign(c->layers.size(), 0); s->last_page_first.assign(c->layers.size(), 0); }
+        s->last_pos0[il] = pos0; s->last_pos1[il] = pos1; s->last_page_first[il] = page_first;
+    }
     const auto t3 = std::chrono::steady_clock::now();
     s->t_gpu_ms += std::chrono::duration<double, std::milli>(t2 - t1).count();
     s->t_cpu_ms += std::chrono::duration<double, std::milli>(t1 - t0).count() + std::chrono::duration<double, std::milli>(t3 - t2).count();
@@ -4671,6 +4717,67 @@ static bool cluster_run_chunk(ggml_hexagon_cluster_sidecar * s, uint32_t il, uin
                           bad == 0 ? "verified" : bad == 1 ? "POS_MAP NOT A PERMUTATION" : bad == 2 ? "PAGE ROW MISMATCH" : "DESCRIPTOR MISMATCH",
                           std::chrono::duration<double, std::milli>(t2 - t1).count(), std::chrono::duration<double, std::milli>(t3 - t2 + t1 - t0).count());
         }
+    }
+    return true;
+}
+
+// ---- in-place pages: no shadow rows, only descriptors -----------------------------------------
+// Page p of a layer is rows [p*PK, p*PK+PK) of llama's cache. The sidecar publishes the f16 mean of
+// every complete page as its descriptor (the same centroid region the select pass reads) and the
+// count of published pages; the kernel fetches the selected pages from the cache itself with the
+// dense block's strided descriptor. A rewind below covered_end shrinks the published prefix.
+static void cluster_inplace_shrink(ggml_hexagon_cluster * c, uint32_t il, uint32_t pos) {
+    ggml_hexagon_cluster_layer & L = c->layers[il];
+    const uint32_t PK = c->hdr.page_keys;
+    const uint32_t new_cov = pos / PK * PK;
+    if (new_cov >= L.covered_end) return;
+    auto * dir = (htp_fa_cluster_dir *) (c->base + HTP_FA_CLUSTER_DIR_OFF + (size_t) il * HTP_FA_CLUSTER_DIR_STRIDE);
+    dir->covered_end = new_cov;
+    cluster_dc_civac(dir, sizeof(*dir));
+    dir->n_pages_pub = new_cov / PK;
+    cluster_dc_civac(dir, sizeof(*dir));
+    L.covered_end = new_cov; L.n_pages = new_cov / PK;
+}
+
+static bool cluster_run_inplace(ggml_hexagon_cluster_sidecar * s, uint32_t il) {
+    ggml_hexagon_cluster * c = s->c;
+    ggml_hexagon_cluster_layer & L = c->layers[il];
+    const htp_fa_cluster_header & hdr = c->hdr;
+    const uint32_t PK = hdr.page_keys, H = s->H, D = s->D;
+    const uint32_t p0 = L.covered_end / PK;
+    const uint32_t we = L.written_end > (uint32_t) opt_cluster_lag ? L.written_end - (uint32_t) opt_cluster_lag : 0;   // rows old enough to publish
+    uint32_t p1 = we / PK;
+    if (p1 > hdr.n_pages_max) p1 = hdr.n_pages_max;
+    if (p1 <= p0 || !L.k_root) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint32_t nbk_row = (uint32_t) L.k_root->nb[1];
+    const uint8_t * krows = (const uint8_t *) L.k_root->data;
+    cluster_dc_civac(krows + (size_t) p0 * PK * nbk_row, (size_t) (p1 - p0) * PK * nbk_row);   // the DSP wrote these rows
+    uint8_t * lb = c->base + hdr.layer0_off + (size_t) il * hdr.layer_stride;
+    const float inv = 1.0f / (float) PK;
+    for (uint32_t h = 0; h < H; ++h) {
+        uint8_t * cent = lb + hdr.off_centroids + ((size_t) h * hdr.n_pages_max + p0) * hdr.centroid_bytes;
+        for (uint32_t p = p0; p < p1; ++p) {
+            std::fill(s->acc.begin(), s->acc.end(), 0.0f);
+            for (uint32_t i = 0; i < PK; ++i) {
+                const uint16_t * row = (const uint16_t *) (krows + (size_t) (p * PK + i) * nbk_row + (size_t) h * D * 2);
+                for (uint32_t d = 0; d < D; ++d) s->acc[d] += cluster_f16_to_f32(row[d]);
+            }
+            uint16_t * cp = (uint16_t *) (cent + (size_t) (p - p0) * hdr.centroid_bytes);
+            for (uint32_t d = 0; d < D; ++d) cp[d] = ggml_fp32_to_fp16(s->acc[d] * inv);
+        }
+        cluster_dc_civac(cent, (size_t) (p1 - p0) * hdr.centroid_bytes);
+    }
+    auto * dir = (htp_fa_cluster_dir *) (c->base + HTP_FA_CLUSTER_DIR_OFF + (size_t) il * HTP_FA_CLUSTER_DIR_STRIDE);
+    dir->n_pages_pub = p1;
+    cluster_dc_civac(dir, sizeof(*dir));
+    dir->covered_end = p1 * PK;
+    cluster_dc_civac(dir, sizeof(*dir));
+    L.covered_end = p1 * PK; L.n_pages = p1;
+    s->t_cpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    s->n_chunks++;
+    if (opt_verbose && opt_cluster_verify) {
+        GGML_LOG_INFO("ggml-hex: cluster: layer %u in-place pages %u..%u published (covered %u)\n", il, p0, p1 - 1, L.covered_end);
     }
     return true;
 }
@@ -4712,6 +4819,20 @@ static void ggml_hexagon_cluster_sidecar_main(ggml_hexagon_cluster_sidecar * s) 
                 cluster_reset_layer(c, il);   // the cache is being filled from position 0 again
                 s->n_resets++;
             }
+            if (opt_cluster_inplace) {
+                // descriptors above a rewritten position are stale: shrink the published prefix, then
+                // publish every complete page below the new contiguous end
+                if (!job.contiguous) {
+                    cluster_inplace_shrink(c, il, (uint32_t) job.pos_min);
+                    L.written_end = std::min<uint32_t>(L.written_end, (uint32_t) job.pos_min);
+                    continue;
+                }
+                if ((uint64_t) job.pos_min > L.written_end) continue;   // a gap: nothing is published across it
+                if ((uint64_t) job.pos_min < L.covered_end) cluster_inplace_shrink(c, il, (uint32_t) job.pos_min);
+                L.written_end = (uint32_t) job.pos_max + 1;
+                cluster_run_inplace(s, il);
+                continue;
+            }
             if (!job.contiguous || (uint64_t) job.pos_min < L.covered_end) {
                 if (!L.stale) {
                     L.stale = true;
@@ -4725,8 +4846,9 @@ static void ggml_hexagon_cluster_sidecar_main(ggml_hexagon_cluster_sidecar * s) 
             if ((uint64_t) job.pos_min > L.written_end) { L.stale = true; continue; }   // a gap: no clustering across it
             L.written_end = std::max<uint32_t>(L.written_end, (uint32_t) job.pos_max + 1);
             const uint32_t chunk = (uint32_t) opt_cluster_chunk;
+            const uint32_t we = L.written_end > (uint32_t) opt_cluster_lag ? L.written_end - (uint32_t) opt_cluster_lag : 0;   // rows old enough to publish
             // the shadow may cover fewer positions than the cache (memory budget): stop at its capacity
-            while (L.written_end - L.covered_end >= chunk && (c->hdr.n_pages_max - L.n_pages) * c->hdr.page_keys >= chunk) {
+            while (we > L.covered_end && we - L.covered_end >= chunk && (c->hdr.n_pages_max - L.n_pages) * c->hdr.page_keys >= chunk) {
                 if (!cluster_run_chunk(s, il, L.covered_end, L.covered_end + chunk)) { L.stale = true; break; }
             }
             if (end_of_prefill && !L.stale) {
@@ -4753,6 +4875,18 @@ static void ggml_hexagon_cluster_sidecar_main(ggml_hexagon_cluster_sidecar * s) 
 static bool ggml_hexagon_cluster_sidecar_start(ggml_hexagon_cluster * c) {
     auto s = new ggml_hexagon_cluster_sidecar();
     s->c = c; s->N = (uint32_t) opt_cluster_chunk; s->H = c->hdr.n_kv_heads; s->D = c->hdr.D; s->C = s->N / c->hdr.page_keys;
+    if (opt_cluster_inplace && !opt_cluster_desc_cpu) {
+        // the FA op computes the descriptors itself: no sidecar thread at all
+        delete s;
+        return true;
+    }
+    if (opt_cluster_inplace) {
+        // descriptors only: a CPU thread, no OpenCL
+        s->acc.resize(s->D);
+        c->side = s;
+        s->th = std::thread(ggml_hexagon_cluster_sidecar_main, s);
+        return true;
+    }
     cl_int err; cl_uint n = 0;
     if (!cluster_cl_ok(clGetPlatformIDs(1, &s->plat, &n), "clGetPlatformIDs") || !n) { delete s; return false; }
     if (!cluster_cl_ok(clGetDeviceIDs(s->plat, CL_DEVICE_TYPE_GPU, 1, &s->dev, &n), "clGetDeviceIDs") || !n) { delete s; return false; }
@@ -4792,6 +4926,7 @@ static void ggml_hexagon_cluster_sidecar_stop(ggml_hexagon_cluster * c) {
     { std::lock_guard<std::mutex> lk(s->mu); s->stop = true; s->jobs.clear(); }
     s->cv.notify_one();
     if (s->th.joinable()) s->th.join();
+    if (opt_cluster_verify) GGML_LOG_WARN("ggml-hex: cluster sidecar delayed re-verify: %llu of %llu rows were stale when first read\n", (unsigned long long) s->n_stale_rows, (unsigned long long) s->n_checked_rows);
     GGML_LOG_INFO("ggml-hex: cluster sidecar: %llu jobs, %llu chunks, %llu resets, gpu %.1f ms, cpu %.1f ms, max lag %.1f ms, verify failures %llu\n",
                   (unsigned long long) s->n_jobs, (unsigned long long) s->n_chunks, (unsigned long long) s->n_resets, s->t_gpu_ms, s->t_cpu_ms, s->lag_max_ms,
                   (unsigned long long) s->n_verify_fail);
@@ -4867,6 +5002,20 @@ static void ggml_hexagon_cluster_track_graph(ggml_hexagon_session * sess, const 
         if (v < 0 || v >= (int64_t) c->kv_cache_size) { bad = true; break; }
         mn = std::min(mn, v); mx = std::max(mx, v);
     }
+    if (c->hdr.flags & (HTP_FA_CLUSTER_HDR_DSP_DESC | HTP_FA_CLUSTER_HDR_HOST_ROWS)) {
+        // rows [0, mn) were written by earlier graphs and are in the sequence (a write from 0 is a reset,
+        // a write below the previous end a rewind). Written on the dispatch thread BEFORE the graph is
+        // submitted, so the kernel never uses pages the asynchronous sidecar has not yet retired; in
+        // DSP-descriptor mode the FA op also describes pages up to here.
+        const uint32_t rows_valid = (bad || mx < 0) ? 0u : (uint32_t) mn;
+        for (uint32_t il = 0; il < c->layers.size(); ++il) {
+            auto * hd = (htp_fa_cluster_hdir *) (c->base + HTP_FA_CLUSTER_HDIR_OFF + (size_t) il * HTP_FA_CLUSTER_DIR_STRIDE);
+            if (hd->rows_valid != rows_valid) {
+                hd->rows_valid = rows_valid;
+                cluster_dc_civac(hd, sizeof(*hd));
+            }
+        }
+    }
     if (bad || mx < 0) return;   // out-of-range (rewind, multi-stream, recycled buffer): skip this batch
     ggml_hexagon_cluster_job & j = c->pending_job;
     j.seq = ++c->seq; j.n_tokens = (int32_t) n; j.pos_min = mn; j.pos_max = mx;
@@ -4903,10 +5052,18 @@ static bool ggml_hexagon_cluster_init(ggml_hexagon_session * sess, uint32_t n_la
                           : (vmem > kv_bytes + weights_margin ? vmem - kv_bytes - weights_margin : 0);
     struct htp_fa_cluster_header hdr;
     uint32_t kv_shadow = kv_size;
-    uint64_t size = htp_fa_cluster_layout(&hdr, n_layers, kv_shadow, n_kv_heads, D, (uint32_t) opt_cluster_page);
-    if (size > budget) {
+    const uint32_t hdr_flags = HTP_FA_CLUSTER_HDR_HOST_ROWS | (opt_cluster_inplace ? (HTP_FA_CLUSTER_HDR_INPLACE | (opt_cluster_desc_cpu ? 0u : HTP_FA_CLUSTER_HDR_DSP_DESC)) : 0u);
+    if (n_layers > HTP_FA_CLUSTER_MAX_LAYERS) {
+        GGML_LOG_WARN("ggml-hex: cluster attention disabled: %u layers exceed the directory (%d)\n", n_layers, HTP_FA_CLUSTER_MAX_LAYERS);
+        opt_cluster_density = -1;
+        return false;
+    }
+    uint64_t size = htp_fa_cluster_layout_ex(&hdr, n_layers, kv_shadow, n_kv_heads, D, (uint32_t) opt_cluster_page, hdr_flags);
+    // In-place pages keep only descriptors (1/32 of the KV with 16-key pages, 1/128 with 64-key): the
+    // budget is for the shadow copy, which does not exist here.
+    if (!opt_cluster_inplace && size > budget) {
         kv_shadow = ((uint32_t) ((double) kv_size * (double) budget / (double) size)) & ~63u;
-        while (kv_shadow >= 1024 && (size = htp_fa_cluster_layout(&hdr, n_layers, kv_shadow, n_kv_heads, D, (uint32_t) opt_cluster_page)) > budget) {
+        while (kv_shadow >= 1024 && (size = htp_fa_cluster_layout_ex(&hdr, n_layers, kv_shadow, n_kv_heads, D, (uint32_t) opt_cluster_page, hdr_flags)) > budget) {
             kv_shadow -= 1024;
         }
         if (kv_shadow < 1024 || size > budget) {
@@ -4933,8 +5090,8 @@ static bool ggml_hexagon_cluster_init(ggml_hexagon_session * sess, uint32_t n_la
     ggml_backend_buffer_set_usage(c->buf, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
     auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(c->buf->context);
     c->base = sbuf->base;
-    // Header + directory: zero (covered_end 0 => every layer runs dense until the sidecar publishes).
-    const size_t hdr_bytes = HTP_FA_CLUSTER_DIR_OFF + (size_t) n_layers * HTP_FA_CLUSTER_DIR_STRIDE;
+    // Header + directories: zero (covered_end 0 => every layer runs dense until pages are published).
+    const size_t hdr_bytes = (size_t) c->hdr.layer0_off;
     memset(c->base, 0, hdr_bytes);
     memcpy(c->base, &c->hdr, sizeof(c->hdr));
     cluster_dc_civac(c->base, hdr_bytes);
@@ -4953,8 +5110,8 @@ static bool ggml_hexagon_cluster_init(ggml_hexagon_session * sess, uint32_t n_la
 #else
     GGML_LOG_WARN("ggml-hex: cluster: built without OpenCL; no clustering sidecar, decode runs dense\n");
 #endif
-    GGML_LOG_INFO("ggml-hex: %s cluster attention: shadow %zu MB (%u layers x %u heads x %u pages of %u keys), density %d permille, window %d, flags 0x%x, sink %d\n",
-                  sess->c_name(), c->size >> 20, n_layers, n_kv_heads, c->hdr.n_pages_max, c->hdr.page_keys,
+    GGML_LOG_INFO("ggml-hex: %s cluster attention: %s %zu MB (%u layers x %u heads x %u pages of %u keys), density %d permille, window %d, flags 0x%x, sink %d\n",
+                  sess->c_name(), opt_cluster_inplace ? (opt_cluster_desc_cpu ? "in-place pages, CPU descriptors" : "in-place pages, DSP descriptors") : "shadow", c->size >> 20, n_layers, n_kv_heads, c->hdr.n_pages_max, c->hdr.page_keys,
                   opt_cluster_density, opt_cluster_window, opt_cluster_flags, opt_cluster_sink);
     return true;
 }
@@ -6188,6 +6345,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_cluster_mem   = getenv("GGML_HEXAGON_CLUSTER_MEM_MB");
     const char * str_cluster_page  = getenv("GGML_HEXAGON_CLUSTER_PAGE");
     const char * str_cluster_sink  = getenv("GGML_HEXAGON_CLUSTER_SINK");
+    const char * str_cluster_inpl  = getenv("GGML_HEXAGON_CLUSTER_INPLACE");
+    const char * str_cluster_lag   = getenv("GGML_HEXAGON_CLUSTER_LAG");
+    const char * str_cluster_dcpu  = getenv("GGML_HEXAGON_CLUSTER_DESC_CPU");
     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
     const char * str_vmem     = getenv("GGML_HEXAGON_VMEM");
@@ -6277,6 +6437,10 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
         opt_cluster_page = 64;
     }
     opt_cluster_sink = str_cluster_sink ? atoi(str_cluster_sink) : opt_cluster_sink;
+    opt_cluster_inplace = str_cluster_inpl ? atoi(str_cluster_inpl) : opt_cluster_inplace;
+    opt_cluster_lag     = str_cluster_lag  ? atoi(str_cluster_lag)  : opt_cluster_lag;
+    opt_cluster_desc_cpu = str_cluster_dcpu ? atoi(str_cluster_dcpu) : opt_cluster_desc_cpu;
+    if (opt_cluster_inplace) opt_cluster_positional = 1;   // in-place pages are positional by construction
     if (opt_cluster_sink < 0 || opt_cluster_sink > opt_cluster_page) {
         GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_CLUSTER_SINK=%d out of range (0..page keys %d); using %d\n", opt_cluster_sink, opt_cluster_page, opt_cluster_page);
         opt_cluster_sink = opt_cluster_page;

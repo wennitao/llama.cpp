@@ -430,6 +430,89 @@ attention bytes: at 6.2% the attention op is mostly its fixed costs (26 us floor
 descriptor pair per page) and the rest of the token is the weight stream, which sparse attention
 cannot touch.
 
+## Stage 6 -- in-place positional pages: no shadow (built 2026-09-07)
+
+`GGML_HEXAGON_CLUSTER_INPLACE=1`. Page p of a layer is rows [p*PK, p*PK+PK) of llama's own cache
+(PK = `GGML_HEXAGON_CLUSTER_PAGE`, 16 or 64). The shadow buffer keeps only the header, the
+per-layer directory and the page descriptors (one f16 mean per page per KV head: 256 B per page,
+1 MB for a 1k context, 14 MB for 16k with 64-key pages, 56 MB with 16-key pages); there are no K/V
+pages, pos_map or n_valid (`HTP_FA_CLUSTER_HDR_INPLACE` in `header.flags`; `htp_fa_cluster_layout_ex`
+lays the regions out with zero size). What changes:
+
+- **Sidecar.** A CPU thread and nothing else: no OpenCL, no k-means, no gather. After every graph
+  it computes the mean of each newly completed page from the cache rows the DSP just wrote (a cache
+  clean/invalidate first, as before), writes the descriptors, cleans them, then publishes
+  `n_pages_pub` and `covered_end = n_pages_pub * PK`. A page of 16 keys is 16 rows x 2 KB read and
+  16k f16 conversions, tens of microseconds; a 4k prompt costs ~0.1 s of sidecar CPU in total,
+  hidden behind the next ubatch, and one new page every PK decode tokens. The readiness lag that
+  cost the shadow design the first ~100 decode tokens after a prompt is gone.
+- **Rewinds.** Positional pages make invalidation trivial: rows written below `covered_end` shrink
+  the published prefix to the page boundary below the lowest rewritten position and the pages are
+  recomputed as rows arrive; nothing goes `stale`. Non-contiguous writes shrink to the lowest
+  position and stop publishing until contiguous writes resume from there. A write from position 0
+  resets the layer as before.
+- **Kernel.** `hvx_fa_cl_setup` takes `dense_start = min(covered_end, n_kv - W)` rounded down to a
+  64-key block and `n_cand = dense_start / PK`; `hvx_fa_dec_blk_src` addresses a selected page as
+  rows `page*PK ..` of the positional K/V with the dense block's strided descriptor (`nb[1]`
+  stride), `bsz = PK`, no mask (every candidate row lies below `dense_start <= n_kv`). The select
+  pass, the lists, the staging ring and the merge are untouched. The dense tail is therefore
+  exactly W rounded up to the next 64-key block: with W 64, 64..127 keys, no longer snapped to a
+  1024-key clustering chunk. With `GGML_HEXAGON_CLUSTER_SINK=4` forcing page 0, the attended set is
+  the sink page + W..W+63 recent keys + the top pages by descriptor score: the 4 + 64 + selected
+  design, on the cache as it stands.
+- **Limitations.** Single sequence; full attention only (the pages skip the mask, so a sliding-window
+  layer would attend outside its window: not tagged for Qwen3, which has none); the window is a
+  whole 64-key block.
+
+### Who computes the descriptors: a coherence lesson (2026-09-07)
+
+The first in-place build computed the page means on the host, as the shadow sidecar had always
+done, and was not exact: 100% of the pages gave PPL 9.39 against 9.13 dense, greedy text diverged
+after a dozen tokens, and the sparse arms degraded much faster than the shadow mode had
+(6.2%: 14.7 vs 9.18). Isolating it:
+
+- the kernel's strided page fetch is exact at the op level (host lists, device selection, 16- and
+  64-key pages, `max|err|` 2e-5, same time as shadow pages: 16k / 16-key / 6% = 404 vs 401 us);
+- the host thread's clean-and-invalidate does not corrupt rows (sidecar active with the kernel
+  forced dense: PPL 9.1332, identical to dense);
+- but the **shadow** path itself breaks the same way when its chunk shrinks from 256 to 128 keys
+  (PPL 20.85 / 21.07 vs 9.128 at 256), even though a delayed re-read of every published page found
+  no row that differed from the cache.
+
+Three more measurements found it. Holding publication back by 64 or 256 rows changed nothing
+(in-place 9.41 / 9.41; 128-key chunks 20.99), so it was not timing. The kernel with a 128-key
+chunk table (32 entries) is exact in the tool. And a **single**-context perplexity run is exact for
+every mode (dense 9.357; 128-key shadow chunks 9.374; in-place CPU descriptors 9.331): the damage
+appears only in the second perplexity context, right after `llama_memory_clear`. That is the
+mechanism: the sidecar retires the old coverage *asynchronously*, so the first graph of the new
+context still sees the previous directory, and its query -- position 0, the attention sink --
+attends pages of the previous context (stale shadow pages, or in-place cache rows 1..191 that
+have not been rewritten yet). One corrupted token, but the sink's K/V poison every later token of
+the context: PPL 47 on that context with the shadow (21 over both), +6% in-place. With 256- or
+1024-key chunks no chunk fits below the 192-key horizon of a first graph, the kernel falls back to
+dense, and nothing happens -- the shadow design had been correct by accident.
+
+Two fixes, both kept. **Synchronous clamp** (`HTP_FA_CLUSTER_HDR_HOST_ROWS`, every mode): the dispatch
+thread writes `hdir.rows_valid` = the lowest row this graph will write, on its own 128-B line,
+before the graph is submitted; the kernel never uses a page or chunk beyond it, so a reset or
+rewind takes effect on the very next graph while the sidecar catches up. **DSP-owned descriptors**
+(`HTP_FA_CLUSTER_HDR_DSP_DESC`, the default for in-place mode) go further and remove the host from
+the data path entirely: the FA op computes the descriptors itself from `rows_valid`. The host writes one word per layer before a graph
+is submitted (`hdir.rows_valid`: rows [0, n) complete and in the sequence, taken from the SET_ROWS
+index leaf), on its own 128-B line; the op reads it, describes any complete page not yet described
+(one 2D descriptor per page brings all heads' rows into VTCM, HVX f16->f32 sums, f16 mean, flushed
+before the select pass DMAs it), shrinks after a rewind, and owns the directory. No sidecar thread,
+no OpenCL, no host read of DSP-written memory at all. The first decode token after a prompt pays a
+one-time catch-up (all pages of the prompt: ~0.4 ms per layer per 4k of context).
+
+With DSP descriptors the in-place mode is exact across the reset: two-context decode-mode PPL at
+100% is **9.1185** (dense 9.1332, shadow 9.123-9.128). Greedy text at 100% still differs from dense
+after a dozen tokens, identically for CPU and DSP descriptors, while the single-context perplexity
+matches to 0.3%; with a complete attended set and an exact op-level check, that is the score-ordered
+accumulation flipping a near-tie token, not a defect.
+
+DSP_DESC_NUMBERS
+
 ### Status
 
 Built and measured end to end: page-list HVX decode kernel (Stage 1), GPU chunk-local k-means
