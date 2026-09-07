@@ -118,6 +118,16 @@ struct htp_fa_context {
     uint32_t        cl_sel_n[HTP_FA_CLUSTER_MAX_HEADS];
     uint8_t         cl_head_order[HTP_FA_CLUSTER_MAX_HEADS];   // heads sorted by descending list length
     uint32_t        cl_next_unit;      // dynamic unit dispatch (atomic)
+    // on-device selection (density > 0): score the query against the page descriptors, take the
+    // top cl_budget pages per KV head (flash_attn_ext_f16_select_thread)
+    uint32_t        cl_density;        // permille of the candidates; 0 = host-written lists
+    uint32_t        cl_budget;         // pages per head selected on device
+    const uint8_t * cl_cent;           // this layer's page descriptors: [kvh][n_pages_max] x cl_cent_bytes
+    uint32_t        cl_cent_bytes;
+    uint32_t        cl_sel_rows;       // candidate rows staged per head, rounded up to 32
+    uint8_t *       cl_sel_c;          // VTCM per thread: cl_sel_rows x cl_cent_bytes (descriptor staging)
+    uint8_t *       cl_sel_s;          // VTCM per thread: cl_sel_rows/32 score vectors
+    size_t          cl_sel_c_stride, cl_sel_s_stride;
 
     uint64_t t_start;
 };
@@ -3583,8 +3593,28 @@ static bool hvx_fa_cl_setup(struct htp_fa_context * factx, const struct htp_ops_
 
     s->hdr = hdr; s->layer_base = layer_base; s->n_cand = n_cand; s->dense_start = dense_start; s->host_sel = NULL;
 
-    if (octx->op_params[HTP_FA_CLUSTER_OPP_DENSITY] != 0) {
-        return false;    // on-device selection: not built yet (Stage 4)
+    factx->cl_density    = (uint32_t) octx->op_params[HTP_FA_CLUSTER_OPP_DENSITY];
+    factx->cl_budget     = 0;
+    factx->cl_cent       = layer_base + hdr->off_centroids;
+    factx->cl_cent_bytes = hdr->centroid_bytes;
+    factx->cl_sel_rows   = (n_cand + 31) & ~31u;
+    if (factx->cl_density != 0) {
+        // On-device selection: every head gets the same budget; the lists are built by the select
+        // pass after the VTCM allocation. The descriptor must be exactly one DK-wide f16 row.
+        if (hdr->centroid_bytes != hex_round_up((size_t) DK * 2, 128) || DK % 64 != 0) {
+            return false;
+        }
+        uint32_t b = (uint32_t) (((uint64_t) n_cand * factx->cl_density + 999) / 1000);
+        const uint32_t min_pages = HTP_FA_CLUSTER_FLAG_MINPAGES(factx->cl_flags);
+        if (b < min_pages) b = min_pages;
+        if (b > n_cand)    b = n_cand;
+        factx->cl_budget = b;
+        for (uint32_t h = 0; h < nek2; ++h) {
+            factx->cl_sel_n[h]      = b;
+            factx->cl_head_order[h] = (uint8_t) h;
+        }
+        s->max_total = b + factx->cl_n_dense_blocks;
+        return true;
     }
     // Host-written lists: lengths now (the split pick needs them), pages after the VTCM alloc.
     s->host_sel = layer_base + hdr->off_host_sel;
@@ -3619,16 +3649,18 @@ static bool hvx_fa_cl_setup(struct htp_fa_context * factx, const struct htp_ops_
 
 static void hvx_fa_cl_copy_lists(struct htp_fa_context * factx, const struct hvx_fa_cl_setup * s, uint32_t nek2) {
     const uint32_t stride = s->hdr->host_sel_stride;
-    for (uint32_t h = 0; h < nek2; ++h) {
-        const uint16_t * pages = (const uint16_t *) (s->host_sel + (size_t) h * stride + 128);
-        uint16_t * dst = factx->cl_sel_pages + (size_t) h * factx->cl_n_pages_max;
-        const uint32_t n = factx->cl_sel_n[h];
-        for (uint32_t i = 0; i < n; ++i) {
-            uint32_t p = pages[i];
-            if (p >= factx->cl_n_cand) {
-                p = factx->cl_n_cand - 1;   // clamp the INDEX, never the count (sparse-HMX convention)
+    if (s->host_sel) {
+        for (uint32_t h = 0; h < nek2; ++h) {
+            const uint16_t * pages = (const uint16_t *) (s->host_sel + (size_t) h * stride + 128);
+            uint16_t * dst = factx->cl_sel_pages + (size_t) h * factx->cl_n_pages_max;
+            const uint32_t n = factx->cl_sel_n[h];
+            for (uint32_t i = 0; i < n; ++i) {
+                uint32_t p = pages[i];
+                if (p >= factx->cl_n_cand) {
+                    p = factx->cl_n_cand - 1;   // clamp the INDEX, never the count (sparse-HMX convention)
+                }
+                dst[i] = (uint16_t) p;
             }
-            dst[i] = (uint16_t) p;
         }
     }
     if (factx->cl_flags & HTP_FA_CLUSTER_FLAG_ECHO) {
@@ -3639,6 +3671,99 @@ static void hvx_fa_cl_copy_lists(struct htp_fa_context * factx, const struct hvx
             memcpy(e + 128, factx->cl_sel_pages + (size_t) h * factx->cl_n_pages_max, (size_t) factx->cl_sel_n[h] * 2);
         }
         qurt_mem_cache_clean((qurt_addr_t) echo, (size_t) nek2 * stride, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+    }
+}
+
+// On-device page selection: one unit per KV head. Stage the head's page descriptors and its G
+// query rows in VTCM, score every descriptor against every query row of the group
+// (hvx_dot_f16_f16_aa_rx32_tree, 32 descriptors per call), fold the group by max (or sum), then
+// take the top cl_budget pages by repeated masked arg-max (B passes over n_cand/32 vectors; a few
+// microseconds for the budgets that matter). The list comes out in score order.
+static void flash_attn_ext_f16_select_thread(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_fa_context * factx = (struct htp_fa_context *) data;
+    const struct htp_ops_context * octx = factx->octx;
+    const struct htp_tensor * q = octx->src[0];
+    const struct htp_tensor * k = octx->src[1];
+
+    const uint32_t nek2 = k->ne[2];
+    const uint32_t DK   = k->ne[0];
+    const uint32_t G    = factx->dec_G;
+    const uint32_t nbq1 = q->nb[1], nbq2 = q->nb[2];
+    const size_t   size_q_row = DK * ((q->type == HTP_TYPE_F32) ? 4 : 2);
+    const uint32_t n_cand  = factx->cl_n_cand;
+    const uint32_t n_vec   = (n_cand + 31) / 32;
+    const uint32_t B       = factx->cl_budget;
+    const uint32_t cbytes  = factx->cl_cent_bytes;
+    const bool     fold_sum = (factx->cl_flags & HTP_FA_CLUSTER_FLAG_FOLD_SUM) != 0;
+
+    dma_queue * dma = octx->ctx->dma[ith];
+    uint8_t * spad_q = factx->spad_q + factx->size_q_block * factx->dec_R * ith;
+    uint8_t * spad_c = factx->cl_sel_c + factx->cl_sel_c_stride * ith;
+    HVX_Vector * scores = (HVX_Vector *) (factx->cl_sel_s + factx->cl_sel_s_stride * ith);
+
+    int32_t __attribute__((aligned(128))) ramp[32];
+    for (int i = 0; i < 32; ++i) ramp[i] = i;
+    const HVX_Vector iota    = *(const HVX_Vector *) ramp;
+    const HVX_Vector neg_inf = hvx_vec_splat_f32(-INFINITY);
+    const int32_t    BIG     = 0x40000000;
+
+    for (uint32_t kvh = ith; kvh < nek2; kvh += nth) {
+        // descriptors of this head, in chunks of <= 128 rows per descriptor
+        const uint8_t * cent = factx->cl_cent + (size_t) kvh * factx->cl_n_pages_max * cbytes;
+        for (uint32_t r0 = 0; r0 < n_cand; r0 += 128) {
+            const uint32_t nr = MIN(128u, n_cand - r0);
+            dma_queue_push(dma, dma_make_ptr(spad_c + (size_t) r0 * cbytes, cent + (size_t) r0 * cbytes), cbytes, cbytes, cbytes, nr);
+        }
+        // the G query rows of this KV head (decode: neq1 == 1, so row g is head kvh*G + g)
+        for (uint32_t g = 0; g < G; ++g) {
+            const uint8_t * q_row = (const uint8_t *) q->data + (size_t) (kvh * G + g) * nbq2;
+            dma_queue_push(dma, dma_make_ptr(spad_q + g * factx->size_q_block, q_row), factx->size_q_row_padded, nbq1, size_q_row, 1);
+        }
+        for (uint32_t r0 = 0; r0 < n_cand; r0 += 128) {
+            dma_queue_pop(dma);
+        }
+        for (uint32_t g = 0; g < G; ++g) {
+            uint8_t * qv = dma_queue_pop(dma).dst;
+            if (factx->is_q_fp32) {
+                hvx_copy_f16_f32_aa(qv, qv, DK);
+            }
+        }
+
+        // scores: lane j of vector i is the folded score of page 32*i + j
+        for (uint32_t i = 0; i < n_vec; ++i) {
+            const uint8_t * rows = spad_c + (size_t) i * 32 * cbytes;
+            HVX_Vector s = hvx_dot_f16_f16_aa_rx32_tree(spad_q, rows, cbytes, DK, 1.0f);
+            for (uint32_t g = 1; g < G; ++g) {
+                HVX_Vector sg = hvx_dot_f16_f16_aa_rx32_tree(spad_q + g * factx->size_q_block, rows, cbytes, DK, 1.0f);
+                s = fold_sum ? HVX_OP_ADD_F32(s, sg) : Q6_Vsf_vmax_VsfVsf(s, sg);
+            }
+            const uint32_t valid = (i + 1) * 32 <= n_cand ? 32 : n_cand - i * 32;
+            if (valid < 32) {
+                s = Q6_V_vmux_QVV(Q6_Q_vsetq_R(valid * 4), s, neg_inf);
+            }
+            scores[i] = s;
+        }
+
+        // top-B by repeated masked arg-max
+        uint16_t * out = factx->cl_sel_pages + (size_t) kvh * factx->cl_n_pages_max;
+        for (uint32_t b = 0; b < B; ++b) {
+            HVX_Vector m = scores[0];
+            for (uint32_t i = 1; i < n_vec; ++i) {
+                m = Q6_Vsf_vmax_VsfVsf(m, scores[i]);
+            }
+            const HVX_Vector mx = hvx_vec_reduce_max_f32(m);
+            // first lane equal to the max, as BIG - global_index so the max reduction finds the min index
+            HVX_Vector best = Q6_V_vzero();
+            for (uint32_t i = 0; i < n_vec; ++i) {
+                const HVX_VectorPred eq = Q6_Q_vcmp_eq_VwVw(scores[i], mx);
+                const HVX_Vector cand = Q6_Vw_vsub_VwVw(Q6_V_vsplat_R(BIG), Q6_Vw_vadd_VwVw(iota, Q6_V_vsplat_R((int32_t) (i * 32))));
+                best = Q6_Vw_vmax_VwVw(best, Q6_V_vmux_QVV(eq, cand, Q6_V_vzero()));
+            }
+            const int32_t  idx = BIG - hvx_vec_get_i32(hvx_vec_reduce_max_i32(best));
+            const uint32_t vi = (uint32_t) idx / 32, li = (uint32_t) idx % 32;
+            scores[vi] = Q6_V_vmux_QVV(Q6_Q_vcmp_eq_VwVw(iota, Q6_V_vsplat_R((int32_t) li)), neg_inf, scores[vi]);
+            out[b] = (uint16_t) idx;
+        }
     }
 }
 
@@ -3781,6 +3906,9 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
         factx.dec_stride_part = HVX_FA_DEC_PART_HDR + size_vkq_acc;
         factx.dec_n_split = hvx_fa_dec_pick_split(neq3 * nek2, factx.cl_on ? cls.max_total : n_blocks_htp, octx->n_threads, 8);
         const size_t lists_bytes = factx.cl_on ? hex_round_up((size_t) nek2 * factx.cl_n_pages_max * sizeof(uint16_t), 128) : 0;
+        const bool   cl_select   = factx.cl_on && factx.cl_density != 0;
+        factx.cl_sel_c_stride = cl_select ? (size_t) factx.cl_sel_rows * factx.cl_cent_bytes : 0;
+        factx.cl_sel_s_stride = cl_select ? (size_t) (factx.cl_sel_rows / 32) * VLEN : 0;
         for (;;) {
             factx.dec_bps     = (n_blocks_htp + factx.dec_n_split - 1) / factx.dec_n_split;
             factx.dec_n_units = neq3 * nek2 * factx.dec_n_split;
@@ -3792,6 +3920,8 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
             factx.spad_a = vtcm_seq_alloc(&vtcm_cur, size_vkq_acc * R * octx->n_threads);
             factx.dec_partials = vtcm_seq_alloc(&vtcm_cur, factx.dec_stride_part * rows_total * factx.dec_n_split);
             factx.cl_sel_pages = (uint16_t *) vtcm_seq_alloc(&vtcm_cur, lists_bytes);
+            factx.cl_sel_c     = vtcm_seq_alloc(&vtcm_cur, factx.cl_sel_c_stride * octx->n_threads);
+            factx.cl_sel_s     = vtcm_seq_alloc(&vtcm_cur, factx.cl_sel_s_stride * octx->n_threads);
             if ((size_t) (vtcm_cur - octx->ctx->vtcm_base) <= octx->ctx->vtcm_size) {
                 break;
             }
@@ -3803,7 +3933,10 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
             factx.dec_n_split = 1;        // retry once without splitting
         }
         if (dec && factx.cl_on) {
-            hvx_fa_cl_copy_lists(&factx, &cls, nek2);
+            if (cl_select && !(octx->flags & HTP_OPFLAGS_SKIP_COMPUTE)) {
+                work_queue_run(octx->ctx->work_queue, flash_attn_ext_f16_select_thread, &factx, octx->n_threads);
+            }
+            hvx_fa_cl_copy_lists(&factx, &cls, nek2);   // host lists (density 0) and/or the echo
         }
         factx.cl_next_unit = 0;
     }

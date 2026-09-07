@@ -25,6 +25,7 @@
 #include <CL/cl_ext.h>
 
 #include <algorithm>
+#include <iterator>
 #include <cinttypes>
 #include <cmath>
 #include <cstdint>
@@ -106,6 +107,7 @@ struct options {
     int    window    = 256;    // dense recent window (positions [kv - window, kv))
     int    perm_identity = 0;  // 1 = pages in positional order (pure bandwidth), 0 = random permutation
     int    pmu       = 0;      // capture AXI read requests per op (GGML_HEXAGON_PROFILE PMU mode)
+    int    select_device = 0;  // 1 = the kernel selects the pages itself (density as budget), 0 = host-written lists
     int    seed      = 1234;
 };
 
@@ -113,7 +115,7 @@ static void usage() {
     printf("usage: llama-hetero-decode-attn [--kv N] [--gpu-frac F] [--iters N] [--span N] [--nh N] [--nkvh N]\n"
            "         [--cpu N] [--modes htp,gpu,both] [--mask-permille N] [--layers N] [--pad-mb N] [--integrated] [-v]\n"
            "       llama-hetero-decode-attn --cluster [--kv N] [--density PCT] [--sel contig|scatter] [--skew F]\n"
-           "         [--nslots N] [--desc 1d|2d] [--window W] [--perm identity|random] [--pmu] [--iters N] [--seed N]\n");
+           "         [--nslots N] [--desc 1d|2d] [--window W] [--perm identity|random] [--pmu] [--select-device] [--iters N] [--seed N]\n");
 }
 
 static bool parse(int argc, char ** argv, options & o) {
@@ -139,6 +141,7 @@ static bool parse(int argc, char ** argv, options & o) {
         else if (a == "--window")   { if (!next_i(o.window)) return false; }
         else if (a == "--seed")     { if (!next_i(o.seed)) return false; }
         else if (a == "--pmu")      { o.pmu = 1; }
+        else if (a == "--select-device") { o.select_device = 1; }
         else if (a == "--sel")      { if (i + 1 >= argc) return false; o.sel_scatter = std::string(argv[++i]) != "contig"; }
         else if (a == "--desc")     { if (i + 1 >= argc) return false; o.desc1d = std::string(argv[++i]) == "1d"; }
         else if (a == "--perm")     { if (i + 1 >= argc) return false; o.perm_identity = std::string(argv[++i]) == "identity"; }
@@ -563,7 +566,7 @@ static int run_cluster(const options & o, ggml_backend_t be, ggml_backend_buffer
     auto set_mode = [&](bool on) {
         fa->op_params[HTP_FA_CLUSTER_OPP_MAGIC]   = on ? (int32_t) HTP_FA_CLUSTER_MAGIC : 0;
         fa->op_params[HTP_FA_CLUSTER_OPP_LAYER]   = 0;
-        fa->op_params[HTP_FA_CLUSTER_OPP_DENSITY] = 0;    // host-written lists
+        fa->op_params[HTP_FA_CLUSTER_OPP_DENSITY] = o.select_device ? o.density * 10 : 0;   // permille budget, or host-written lists
         fa->op_params[HTP_FA_CLUSTER_OPP_WINDOW]  = W;
         fa->op_params[HTP_FA_CLUSTER_OPP_FLAGS]   = (int32_t) flags;
         fa->src[7] = on ? shadow : nullptr;
@@ -571,10 +574,41 @@ static int run_cluster(const options & o, ggml_backend_t be, ggml_backend_buffer
 
     const size_t blk_bytes   = 2 * (size_t) 64 * o.d * 2;                       // K + V of one block of one head
     const size_t bytes_dense = (size_t) (o.kv / 64) * o.nkvh * blk_bytes;
+    const uint32_t budget = (uint32_t) (((uint64_t) n_cand * o.density * 10 + 999) / 1000);   // the kernel's formula
+    if (o.select_device) pages_total = (size_t) budget * o.nkvh;
     const size_t bytes_list  = pages_total * blk_bytes + (size_t) (W / 64) * o.nkvh * blk_bytes;
-    printf("cluster mode: kv %d, window %d, %d candidate pages per head, density %d%% %s, skew %.2f -> %zu listed pages (mean %.1f/head), nslots %d, desc %s, perm %s, mask %d permille\n",
-           o.kv, W, n_cand, o.density, o.sel_scatter ? "scattered" : "contiguous", o.skew, pages_total, (double) pages_total / o.nkvh,
+    printf("cluster mode (%s): kv %d, window %d, %d candidate pages per head, density %d%% %s, skew %.2f -> %zu listed pages (mean %.1f/head), nslots %d, desc %s, perm %s, mask %d permille\n",
+           o.select_device ? "device selection" : "host lists", o.kv, W, n_cand, o.density, o.sel_scatter ? "scattered" : "contiguous", o.skew, pages_total, (double) pages_total / o.nkvh,
            o.nslots, o.desc1d ? "1d" : "2d", o.perm_identity ? "identity" : "random", o.mask_frac_permille);
+
+    auto read_echo = [&]() {
+        std::vector<std::vector<uint16_t>> e(o.nkvh);
+        dc_civac(lb + hdr.off_echo_sel, (size_t) o.nkvh * hdr.host_sel_stride);
+        for (int h = 0; h < o.nkvh; ++h) {
+            const uint8_t * p = lb + hdr.off_echo_sel + (size_t) h * hdr.host_sel_stride;
+            const uint32_t n = std::min<uint32_t>(*(const uint32_t *) p, (uint32_t) n_cand);
+            e[h].assign((const uint16_t *) (p + 128), (const uint16_t *) (p + 128) + n);
+        }
+        return e;
+    };
+    // host's own top-B per KV head: max over the group of q_g . descriptor, f32 q x f16 descriptors
+    auto host_topb = [&](int kvh, uint32_t B, double * gap) {
+        std::vector<std::pair<double, int>> sc(n_cand);
+        for (int p = 0; p < n_cand; ++p) {
+            double best = -INFINITY;
+            const ggml_fp16_t * c = (const ggml_fp16_t *) (lb + hdr.off_centroids + ((size_t) kvh * hdr.n_pages_max + p) * hdr.centroid_bytes);
+            for (int g = 0; g < G; ++g) {
+                const float * qg = (const float *) (base + L.q + (size_t) (kvh * G + g) * o.d * 4);
+                double dot = 0; for (int d = 0; d < o.d; ++d) dot += (double) qg[d] * ggml_fp16_to_fp32(c[d]);
+                best = std::max(best, dot);
+            }
+            sc[p] = { best, p };
+        }
+        std::sort(sc.begin(), sc.end(), [](auto & a, auto & b) { return a.first > b.first; });
+        *gap = (B < (uint32_t) n_cand && B > 0) ? sc[B - 1].first - sc[B].first : 0.0;
+        std::vector<uint16_t> r; for (uint32_t i = 0; i < B && i < sc.size(); ++i) r.push_back((uint16_t) sc[i].second);
+        return r;
+    };
 
     struct arm_res { stat_acc wall, usec, axi; double worst = 0; };
     auto run_arm = [&](const char * name, bool on, arm_res & r) {
@@ -590,6 +624,20 @@ static int run_cluster(const options & o, ggml_backend_t be, ggml_backend_buffer
             r.wall.add(ticks_us((double) (t1 - t0)));
             double us = 0, ax = 0;
             if (prof_last(&us, &ax)) { r.usec.add(us); r.axi.add(ax); }
+        }
+        if (on && o.select_device) {
+            // the kernel chose the pages: check against exactly what it echoed, and report how far its
+            // f16 scoring landed from the host's f32 top-B (differences only among near-ties are expected)
+            lists = read_echo();
+            size_t sym = 0; double gap_min = 1e30; int short_lists = 0;
+            for (int h = 0; h < o.nkvh; ++h) {
+                double gap = 0; std::vector<uint16_t> hb = host_topb(h, budget, &gap);
+                std::sort(hb.begin(), hb.end()); std::vector<uint16_t> dl = lists[h]; std::sort(dl.begin(), dl.end());
+                std::vector<uint16_t> diff; std::set_symmetric_difference(hb.begin(), hb.end(), dl.begin(), dl.end(), std::back_inserter(diff));
+                sym += diff.size(); gap_min = std::min(gap_min, gap); if (lists[h].size() != budget) short_lists++;
+            }
+            printf("  device selection: budget %u pages/head, echoed lists %s, symmetric difference vs host f32 top-B: %zu pages over %d heads (min score gap at the boundary %.3g)\n",
+                   budget, short_lists ? "WRONG LENGTH" : "full", sym, o.nkvh, gap_min);
         }
         double worst = 0;
         for (int h = 0; h < o.nh; ++h) {
@@ -615,7 +663,7 @@ static int run_cluster(const options & o, ggml_backend_t be, ggml_backend_buffer
     arm_res dense, list;
     run_arm("dense", false, dense);
     run_arm("page list", true, list);
-    {
+    if (!o.select_device) {
         bool ok = true;
         dc_civac(lb + hdr.off_echo_sel, (size_t) o.nkvh * hdr.host_sel_stride);
         for (int h = 0; h < o.nkvh; ++h) {
@@ -625,6 +673,9 @@ static int run_cluster(const options & o, ggml_backend_t be, ggml_backend_buffer
         printf("  echoed lists %s; page list vs dense FA op: %.2fx time, %.2fx bytes\n", ok ? "match the host lists" : "DO NOT match (page path not taken?)",
                dense.usec.empty() || list.usec.empty() ? 0.0 : list.usec.med() / dense.usec.med(), (double) bytes_list / bytes_dense);
         if (!ok) { ggml_free(ctx); return 3; }
+    } else {
+        printf("  page list vs dense FA op: %.2fx time, %.2fx bytes\n",
+               dense.usec.empty() || list.usec.empty() ? 0.0 : list.usec.med() / dense.usec.med(), (double) bytes_list / bytes_dense);
     }
     ggml_free(ctx);
     return (dense.worst < 2e-2 && list.worst < 2e-2) ? 0 : 2;

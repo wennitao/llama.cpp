@@ -120,6 +120,26 @@ still 3.6x inside the budget. The sidecar can run under prefill without touching
 
 ## Stage 3 -- clustering sidecar (later)
 
-## Stage 4 -- on-device selection (later)
+## Stage 4 -- on-device selection inside the FA op (built, measured 2026-09-06)
+
+`flash_attn_ext_f16_select_thread` runs before the decode pass when the density tag is non-zero:
+one unit per KV head stages the head's page descriptors (chunks of <= 128 rows per descriptor) and
+its G query rows in VTCM, scores 32 descriptors per `hvx_dot_f16_f16_aa_rx32_tree` call per query
+row, folds the group by max (flag: sum), pads the last group with -inf, and takes the top-B pages by
+repeated masked arg-max (B = ceil(n_cand x density / 1000), clamped by the min-pages flag). The list
+is in score order; the Stage 1 list path runs unchanged behind it. Tool: `--select-device`
+(density becomes the permille budget; the CPU recomputes the f32 top-B and the reference attends the
+echoed device list).
+
+| kv | budget | device list vs host f32 top-B | FA op (device selection) | FA op (host lists, Stage 1) | dense |
+|--:|--:|---|--:|--:|--:|
+| 4096  | 15 of 60   | identical, all 8 heads | 186 us | 178 us | 564 us |
+| 16384 | 63 of 252  | identical, all 8 heads | 551 us | 513 us | 2093 us |
+| 4096  | 60 of 60   | identical (full set)   | 507 us | 491 us | 568 us |
+
+Selection costs ~8 us per op at 4k (60 candidates) and ~38 us at 16k (252 candidates: 64 KB of
+descriptors per head plus 63 arg-max passes), in line with the estimate. The outputs match the CPU
+reference over the echoed lists to 2e-5; with a full budget the result equals the dense set.
+
 
 ## Stage 5 -- evaluation (later)
