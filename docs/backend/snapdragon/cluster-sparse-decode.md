@@ -511,21 +511,38 @@ after a dozen tokens, identically for CPU and DSP descriptors, while the single-
 matches to 0.3%; with a complete attended set and an exact op-level check, that is the score-ordered
 accumulation flipping a near-tie token, not a defect.
 
-Measured so far with the in-place kernel path (the DSP-descriptor build shares it; the speed rows
-below come from the CPU-descriptor build before the clamp, whose sidecar cost was negligible):
+Final measurements, DSP descriptors, W 64, sink page on (unit 87b3a4aa, 2026-09-08). Quality is the
+two-context decode-mode perplexity at ctx 4096 (dense 9.133 +/- 0.46):
+
+| budget | 64-key pages | 16-key pages | shadow positional (for reference) |
+|--:|--:|--:|--:|
+| 100%  | 9.1185 | -- | 9.128 |
+| 25%   | 9.20 | -- | 9.14 |
+| 12.5% | 9.51 | 9.09 | 9.36 / 9.11 |
+| 6.2%  | -- | 9.27 | 9.18 |
+
+The same pages and the same descriptors (up to f16 rounding of the mean) give the same quality as
+the shadow-positional arms. With the synchronous clamp the two paths that broke across a context
+reset are exact as well: shadow positional pages with 128-key chunks 9.1183 (was 20.9), in-place
+with CPU descriptors 9.1185 (was 9.39).
+
+Speed, `llama-bench -fa 1 -p 0`, arms alternated, two rounds:
 
 | d (context) | dense | in-place 64-key, 25% | in-place 16-key, 6.2% | in-place 16-key, 12.5% |
 |--:|--:|--:|--:|--:|
-| 4096 (tg64)  | 20.2 t/s | 26.0 (1.29x) | 26.5 (1.31x) | 24.7 (1.22x) |
-| 8192 (tg64)  | 15.4 | 23.9 (1.55x) | 24.6 (1.60x) | -- |
-| 16384 (tg32) | 8.5 (hot device) | 13.6 (1.60x) | 14.5-15.0 (1.75x) | 12.9-13.3 (1.55x) |
+| 4096 (tg64)  | 20.1-20.3 t/s | 26.1-26.2 (1.30x) | 26.5-26.8 (1.32x) | 24.7-24.8 (1.23x) |
+| 8192 (tg64)  | 15.4-15.5 | 23.6-23.7 (1.53x) | 24.2-24.7 (1.58x) | -- |
+| 16384 (tg32) | 10.5-10.8 | 19.6-19.7 (**1.85x**) | 20.3-21.1 (**1.95x**) | 18.2-18.4 (1.72x) |
 
 16k is the first context length at which this device has ever decoded sparse: the shadow design's
-memory budget went to zero there and disabled the mode; the in-place buffer is 15 MB. In-place
-pages cost the same as shadow pages on the token (d4096 25%: 26.0 vs 25.6-26.0 for the shadow
-positional arm). The quality arms at 25% / 12.5% / 6.2% and the 16k perplexity with DSP descriptors
-were interrupted by a device swap and are queued (`cl_resume.sh`); the expected values are the
-shadow-positional ones above (same pages, same descriptors up to f16 rounding of the mean).
+memory budget went to zero there and disabled the mode; the in-place buffer is 15 MB. The
+first decode token after a 4k prompt pays the descriptor catch-up for 64 pages x 28 layers: tg1
+after pp4096 is 29.4-31.1 t/s against 31.1-31.4 dense, i.e. 0.4-1.9 ms once, and pp4096 itself is
+unchanged (1751-1767 vs 1754-1762 t/s). In-place pages cost the same as shadow pages on the token
+(d4096, 64-key 25%: 26.1-26.2 vs 25.6-26.0).
+
+At 16k, decode-mode perplexity over one 16384-token context of `corpus16k.txt` (a concatenation, so
+the absolute value is low): 16-key pages at 6.2% = 3.794; dense and 64-key 25% = PPL16K_PENDING.
 
 ### Status
 
@@ -541,7 +558,7 @@ at dense perplexity at 25%; without it the same arms lost 1.7-3.5x. Frontier at 
 12% of the context. K-means pages are no better in quality and slower on the token (sidecar
 backlog). In-place positional pages with
 DSP-computed descriptors (Stage 6) replace the shadow: exact across context resets, 15 MB at 16k,
-16k decodes at 1.6-1.75x. Next, in order: finish the in-place quality arms and 16k perplexity, positional
-pages without a shadow -- done -- then (in-place pages of llama's cache + one mean per page: removes the memory
+quality at dense level down to 12.5% (16-key pages), decode 1.30x / 1.55x / 1.9x at 4k / 8k / 16k.
+Next, in order: (in-place pages of llama's cache + one mean per page: removes the memory
 problem, the gather and the lag), positional tail pages so the dense window is really 64 keys, and
 the fixed per-page cost (K|V in one descriptor, several 16-key pages per 64-lane softmax).
