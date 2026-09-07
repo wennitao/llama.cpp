@@ -297,13 +297,39 @@ buy more than 2x in selection quality per byte to pay off on this kernel; a kern
 several small pages into one 64-lane softmax would remove most of the fixed part. Device
 selection stays exact at 16 keys (lists equal the host top-B; 2 near-tie pages differ at 16k).
 
+On the model (unit 55b03820, same protocol as Stage 5):
+
+| arm | 64-key pages | 16-key pages |
+|---|--:|--:|
+| decode d4096 tg64, 25% budget | 25.2-25.7 t/s (1.25x) | 21.9-22.0 t/s (1.09x) |
+| PPL, cluster pages, 50%        | 15.82 | 12.41 |
+| PPL, cluster pages, 25%        | 31.51 | 21.11 |
+| PPL, cluster pages, 12.5%      | 73.55 | 38.47 |
+| PPL, positional pages, 50%     | 15.09 | **10.81** |
+| PPL, positional pages, 25%     | 25.84 | 15.04 |
+| dense | 9.13 | 9.13 |
+
+Finer pages help quality a great deal (positional 25% at 16 keys equals positional 50% at 64
+keys), and positional pages beat k-means pages at every page size and density -- the cluster
+order buys bandwidth, not selection accuracy, with the mean descriptor. But per unit of TIME the
+finer page does not pay on this kernel: 16-key positional at 25% (PPL 15.0, 306 us per layer,
+1.09x on the token) is matched by 64-key positional at 50% (PPL 15.1, 283 us, ~1.1x). The
+quality-per-time frontier is set by the ~2.3 us fixed cost per page, so the kernel change that
+packs several 16-key pages into one 64-lane softmax is what would let fine granularity pay, and
+the descriptor (min/max bounds) and the sink pages remain the levers for accuracy at a given
+budget. The best point measured so far is 16-key positional pages at 50%: PPL 10.8 (dense 9.1)
+at about the speed of dense attention.
+
 ### Status
 
 Built and measured end to end: page-list HVX decode kernel (Stage 1), GPU chunk-local k-means
 (Stage 2), the clustering sidecar with the cDSP memory budget respected (Stage 3), on-device
-selection (Stage 4). Exact at full density; 1.25x / 1.4x decode at 4k / 8k at a 25% budget; the
-shadow-copy design cannot fit a 16k context on this SoC (Stage 3, lesson 2); and page-mean
-selection with a fixed budget is not accurate enough below 100% (this section), with cluster pages
-not beating positional pages. Next: sink pages and min/max descriptors in the select pass, then
-the perplexity sweep again; GPU gather in the sidecar (0.6 ms vs 35 ms per layer); and, for long
-contexts, the in-place layout or Q8 pages that the memory budget demands.
+selection (Stage 4), page sizes 16/32/64. Exact at full density; 1.25x / 1.4x decode at 4k / 8k
+at a 25% budget with 64-key pages; the sidecar costs prefill nothing; the shadow-copy design
+cannot fit a 16k context on this SoC (Stage 3, lesson 2). Selection accuracy is the open problem:
+page-mean selection with a fixed budget loses 1.7x PPL at 50% with 64-key pages, 16-key pages
+bring positional selection to 1.18x at 50% but at half the bandwidth, and k-means pages never beat
+positional pages. Next, in order: min/max page descriptors and forced sink pages in the select
+pass (accuracy at a given budget), a kernel that packs several 16-key pages per 64-lane softmax
+(so fine granularity stops costing 2x), GPU gather in the sidecar (readiness lag), and for long
+contexts the in-place layout or Q8 pages the memory budget demands.
