@@ -511,7 +511,21 @@ after a dozen tokens, identically for CPU and DSP descriptors, while the single-
 matches to 0.3%; with a complete attended set and an exact op-level check, that is the score-ordered
 accumulation flipping a near-tie token, not a defect.
 
-DSP_DESC_NUMBERS
+Measured so far with the in-place kernel path (the DSP-descriptor build shares it; the speed rows
+below come from the CPU-descriptor build before the clamp, whose sidecar cost was negligible):
+
+| d (context) | dense | in-place 64-key, 25% | in-place 16-key, 6.2% | in-place 16-key, 12.5% |
+|--:|--:|--:|--:|--:|
+| 4096 (tg64)  | 20.2 t/s | 26.0 (1.29x) | 26.5 (1.31x) | 24.7 (1.22x) |
+| 8192 (tg64)  | 15.4 | 23.9 (1.55x) | 24.6 (1.60x) | -- |
+| 16384 (tg32) | 8.5 (hot device) | 13.6 (1.60x) | 14.5-15.0 (1.75x) | 12.9-13.3 (1.55x) |
+
+16k is the first context length at which this device has ever decoded sparse: the shadow design's
+memory budget went to zero there and disabled the mode; the in-place buffer is 15 MB. In-place
+pages cost the same as shadow pages on the token (d4096 25%: 26.0 vs 25.6-26.0 for the shadow
+positional arm). The quality arms at 25% / 12.5% / 6.2% and the 16k perplexity with DSP descriptors
+were interrupted by a device swap and are queued (`cl_resume.sh`); the expected values are the
+shadow-positional ones above (same pages, same descriptors up to f16 rounding of the mean).
 
 ### Status
 
@@ -525,7 +539,9 @@ rule: always select the page holding the sink tokens (`GGML_HEXAGON_CLUSTER_SINK
 at dense perplexity at 25%; without it the same arms lost 1.7-3.5x. Frontier at 4k: positional
 64-key pages at 25% = 1.30x at dense PPL; positional 16-key pages at 6.2% = 1.32x at +0.5%, reading
 12% of the context. K-means pages are no better in quality and slower on the token (sidecar
-backlog). Next, in order: positional
-pages without a shadow (in-place pages of llama's cache + one mean per page: removes the memory
+backlog). In-place positional pages with
+DSP-computed descriptors (Stage 6) replace the shadow: exact across context resets, 15 MB at 16k,
+16k decodes at 1.6-1.75x. Next, in order: finish the in-place quality arms and 16k perplexity, positional
+pages without a shadow -- done -- then (in-place pages of llama's cache + one mean per page: removes the memory
 problem, the gather and the lag), positional tail pages so the dense window is really 64 keys, and
 the fixed per-page cost (K|V in one descriptor, several 16-key pages per 64-lane softmax).
