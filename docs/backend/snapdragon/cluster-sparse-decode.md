@@ -754,7 +754,33 @@ between are ever clustered or skipped.
   against 571 us dense; at kv 16384, 6%: 381 us against 2108 us. The 100% arm costs 800 us (every
   run a separate partial block: the price of variable units when nothing is skipped).
 
-RUNS_MODEL_RESULTS
+**On the model** (unit b4bd0901, Qwen3-1.7B Q4_0, `-dev HTP0`, sinks 4, W 64, avg cluster 32):
+
+Quality, two-context decode-mode PPL at ctx 4096 (dense 9.133):
+
+| arm | PPL |
+|---|--:|
+| runs 100% (exactness) | 9.121 |
+| runs 12.5%, chunk 1024 | 9.063 |
+| runs 6.2%, chunk 1024 | 9.087 |
+| runs 12.5%, avg cluster 16 | 8.977 |
+| runs 12.5%, chunk 256 | 9.058 |
+| runs 6.2%, chunk 256 | 9.175 |
+
+Speed (`llama-bench -fa 1 -p 0`, arms alternated). The first build's sidecar was serial over the
+28 layers (~35 ms per layer and chunk) and finished ~4 s after a 4k prompt, so a tg64 run was mostly
+dense (1.10x at 4k, 1.16x at 8k, noisy). Parallelizing the sidecar across layers
+(`GGML_HEXAGON_CLUSTER_THREADS`, default 4; thread-local scratch, the OpenCL k-means serialized)
+made it keep up with prefill:
+
+| d (context) | dense | runs 12.5% | runs 6.2% | runs 6.2%, chunk 256 | in-place positional 16-key 6.2% |
+|--:|--:|--:|--:|--:|--:|
+| 4096 tg64 | 20.0-20.3 t/s | 25.3-25.5 (1.26x) | 26.0-26.3 (1.30x) | 26.5-26.8 (1.32x) | 26.7 |
+| 8192 tg64 | 15.5-15.6 | 19.2-19.3 (1.24x) | -- | 20.2-20.7 (1.32x) | -- |
+| 4096 tg512 (serial sidecar) | 19.7-20.1 | 24.1-24.3 | 25.2-25.3 | -- | 26.7-27.0 |
+| 8192 tg512 (serial sidecar) | 15.4 | 18.8 | 19.7 | -- | -- |
+
+RUNS_SPOT_RESULTS
 
 ### Status
 
