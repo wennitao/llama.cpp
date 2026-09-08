@@ -546,6 +546,26 @@ the absolute value is low): dense 3.781, 16-key pages at 6.2% 3.794 (+0.3%, read
 context, decoding 1.95x faster), 64-key pages at 25% 3.812 (+0.8%). The budget that holds at 4k
 holds at 16k.
 
+## Stage 7 -- retrieval quality: positional vs k-means pages on RULER at 4k (GPU emulation, 2026-09-08)
+
+Perplexity cannot separate the two page orders (both sit at dense level with the sink page), and it
+is dominated by local context. RULER's synthetic tasks (needle-in-a-haystack in eight variants,
+variable tracking, common/frequent word extraction, two QA tasks) test exactly what page selection
+can break: a few tokens far back that the query must find. The HTP decode attention was emulated in
+PyTorch on an H100 (`examples/sparse-attn-sim/ruler_sparse.py`, registered as a custom attention
+function for the HF Qwen3-1.7B bf16 model): dense prefill; at decode, dense tail = the last
+W..W+63 keys, candidate pages over the rest, page descriptor = f16 mean, score = max over the GQA
+group of q . descriptor, page 0 (the sinks) always taken, top-B pages with B = ceil(density x
+n_cand), softmax over the selected keys only. Positional pages are PK consecutive keys; cluster
+pages come from k-means over the prompt's keys per layer and KV head (C = n/PK clusters, 8 Lloyd
+iterations, keys sorted by (cluster, distance), sinks first), i.e. the shadow design's clustering
+with the whole prompt as one chunk -- its best case. RULER data: the official generators, 100
+samples per task, 4096 tokens, Qwen3 tokenizer, base template; scoring with RULER's own
+string-match metrics (`ruler_summarize.py`). Same budgets as the device frontier: 64-key pages at
+25%, 16-key pages at 12.5% and 6.2%.
+
+RULER_TABLE
+
 ### Status
 
 Built and measured end to end: page-list HVX decode kernel (Stage 1), GPU chunk-local k-means
