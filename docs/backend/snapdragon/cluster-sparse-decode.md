@@ -548,6 +548,8 @@ holds at 16k.
 
 ## Stage 7 -- retrieval quality: positional vs k-means pages on RULER at 4k (GPU emulation, 2026-09-08)
 
+Consolidated results record: [ruler-page-vs-cluster.md](ruler-page-vs-cluster.md). The sections below are the working notes.
+
 Perplexity cannot separate the two page orders (both sit at dense level with the sink page), and it
 is dominated by local context. RULER's synthetic tasks (needle-in-a-haystack in eight variants,
 variable tracking, common/frequent word extraction, two QA tasks) test exactly what page selection
