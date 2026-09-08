@@ -780,9 +780,38 @@ made it keep up with prefill:
 | 4096 tg512 (serial sidecar) | 19.7-20.1 | 24.1-24.3 | 25.2-25.3 | -- | 26.7-27.0 |
 | 8192 tg512 (serial sidecar) | 15.4 | 18.8 | 19.7 | -- | -- |
 
-RUNS_SPOT_RESULTS
+**Retrieval on the device and the chunk question.** The device clusters per prefill chunk, the
+RULER emulation clustered the whole prompt. Re-running the emulator with chunk-local clustering
+(`--cchunk`, 12.5% budget, avg 32):
+
+| task | dense | whole prompt | chunk 1024 | chunk 256 | positional 16-key |
+|---|--:|--:|--:|--:|--:|
+| niah_multikey_3 (UUIDs) | 98 | 98 | 97 | 93 | 63 |
+| niah_multikey_2 | 99 | 99 | 99 | 98 | 99 |
+| vt / cwe / fwe | 93.4 / 96.0 / 63.7 | 93.0 / 96.1 / 62.7 | 94.4 / 97.6 / 63.0 | 95.0 / 97.0 / 60.0 | 90.8 / 87.3 / 58.7 |
+| **13-task average** | **87.2** | **87.3** | **87.3** | **86.6** | **82.9** |
+
+1024-key chunks lose nothing; 256-key chunks cost 0.7 on the average and 5 points on the UUID task,
+because chunk-local clustering multiplies the number of "digit clusters" by the number of chunks and
+a fixed budget then cannot take them all. On the device (20 prompts, 64 generated tokens, hot unit)
+the same pattern with a smaller budget: `niah_single_3` 100 for dense and every runs arm;
+`niah_multikey_3` dense 95, runs 12.5% chunk 1024 **85**, runs 6.2% chunk 256 **15**. A 40-prompt
+sweep over budgets and chunk sizes was interrupted by a device swap and is queued.
+
+**Recommendation for the device**: whole clusters of 32 keys, centroid scoring, sinks and window
+outside the clustering, 1024-key chunks with the end-of-prefill tail clustered, 12.5% budget, the
+parallel sidecar: at dense perplexity, 1.26x at 4k and 1.24x at 8k on tg64 with retrieval within a
+few points of dense; 6.2% buys another 4-6% of speed and keeps single-needle retrieval but not the
+hardest multi-key case. The chunk size trades retrieval for nothing at d = 4096 (the tail is
+clustered at the end of prefill either way), so keep 1024.
 
 ### Status
+
+Stage 8: whole-cluster selection runs on the HTP (`GGML_HEXAGON_CLUSTER_RUNS=1`): op-level exact,
+dense-level perplexity, 1.26x / 1.30x at 4k and 1.24x / 1.32x at 8k (12.5% / 6.2%) once the sidecar
+was parallelized across layers; 1024-key chunk-local clustering matches whole-prompt clustering on
+RULER (87.3), 256-key chunks cost 0.7; on the device the UUID retrieval task is 85 at 12.5% against
+95 dense with 20 prompts.
 
 Built and measured end to end: page-list HVX decode kernel (Stage 1), GPU chunk-local k-means
 (Stage 2), the clustering sidecar with the cDSP memory budget respected (Stage 3), on-device

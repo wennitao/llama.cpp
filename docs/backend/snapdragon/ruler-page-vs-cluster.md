@@ -96,6 +96,14 @@ Score = max over the GQA group (2 query heads per KV head) of the descriptor sco
 | qa_2 | 37 | 38 | 33 | 36 | 37 |
 | **average** | **87.2** | **79.6** | **78.7** | **75.2** | **86.4** |
 
+### Chunk-local clustering (what the device can do incrementally), 12.5% budget, avg 32
+
+| task | dense | whole prompt | chunk 1024 | chunk 256 |
+|---|--:|--:|--:|--:|
+| niah_multikey_3 | 98 | 98 | 97 | 93 |
+| vt / cwe / fwe | 93.4 / 96.0 / 63.7 | 93.0 / 96.1 / 62.7 | 94.4 / 97.6 / 63.0 | 95.0 / 97.0 / 60.0 |
+| **average** | **87.2** | **87.3** | **87.3** | **86.6** |
+
 ## Findings
 
 1. **Whole-cluster selection is at dense level at every budget**: 87.6 / 87.3 / 86.4 against 87.2
@@ -117,7 +125,10 @@ Score = max over the GQA group (2 query heads per KV head) of the descriptor sco
    the only thing the cut preserved was the aggregation advantage of clustering. This is the
    variant the first device design implemented, and the reason the earlier "positional pages are
    good enough" conclusion was wrong for retrieval.
-5. Mechanism: all the digits (or all the UUID fragments) of a context land in the same few
+5. Chunk-local clustering with 1024-key chunks (the device's incremental scheme) matches whole-prompt
+   clustering; 256-key chunks cost 0.7 on the average and 5 points on the UUID task, since every chunk
+   contributes its own digit clusters and a fixed budget cannot take them all.
+6. Mechanism: all the digits (or all the UUID fragments) of a context land in the same few
    clusters; selecting a cluster fetches every candidate value at once and the exact attention over
    the fetched keys picks the right one. The unit of selection must therefore be the whole cluster,
    and the sinks must be kept out of the clustering (their norms pull centroids).
