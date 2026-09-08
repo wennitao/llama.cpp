@@ -645,6 +645,60 @@ descriptor pass with vmin/vmax instead of a sum) and an elementwise multiply-max
 and query head instead of the rx32 dot: roughly 2-3x the select pass, i.e. a few percent of the
 attention op at 4k and 15-20% of it at 16k unless the descriptors are made hierarchical.
 
+### Whole-cluster selection: the k-means result above was an artifact of the page cut
+
+The "k-means" arms above are the device variant: keys sorted by cluster and then **cut into fixed
+16- or 64-key DMA pages**, each page scored by its own mean, the sink keys inside the k-means. That
+cutting destroys what clustering is for. `--mode cluster_var` is the policy the clustering papers
+actually use (ClusterKV, Squeezed Attention): k-means over the **middle keys only** (positions 4 ..
+ds; the sinks and the recent window are never clustered), variable-size clusters (average 32 keys,
+20 Lloyd iterations), score = max over the GQA group of q . centroid, clusters taken **whole** in
+score order until the key budget is filled, sinks and window always attended. Same budgets,
+"attended" measured the same way:
+
+| task | dense | positional 64-key 25% | **whole clusters 25%** | positional 16-key 12.5% | positional 16-key 12.5% + bounds | **whole clusters 12.5%** | positional 16-key 6.2% | **whole clusters 6.2%** |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| attended | 100% | 27.5% | 27.0% | 14.8% | 14.8% | 14.9% | 8.8% | 8.9% |
+| niah_single_1 | 100 | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| niah_single_2 | 100 | 98 | 100 | 100 | 100 | 100 | 100 | 100 |
+| niah_single_3 | 98 | 96 | 100 | 97 | 100 | 100 | 97 | 100 |
+| niah_multikey_1 | 100 | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| niah_multikey_2 | 99 | 98 | 99 | 99 | 98 | 99 | 93 | 98 |
+| niah_multikey_3 | 98 | 75 | **98** | 63 | 81 | **98** | 34 | **97** |
+| niah_multivalue | 99.2 | 96.5 | 99.0 | 97.2 | 99.2 | 99.2 | 96.8 | 100 |
+| niah_multiquery | 100 | 98.2 | 100 | 99.8 | 99.8 | 99.8 | 99.2 | 99.8 |
+| vt | 93.4 | 92.4 | 93.2 | 90.8 | 94.4 | 93.0 | 90.6 | 94.6 |
+| cwe | 96.0 | 94.3 | 97.1 | 87.3 | 87.9 | 96.1 | 82.6 | 93.5 |
+| fwe | 63.7 | 60.7 | 65.7 | 58.7 | 55.7 | 62.7 | 54.3 | 57.7 |
+| qa_1 | 49 | 50 | 49 | 50 | 55 | 49 | 49 | 46 |
+| qa_2 | 37 | 36 | 38 | 35 | 40 | 38 | 38 | 37 |
+| **average** | **87.2** | **84.2** | **87.6** | **82.9** | **85.5** | **87.3** | **79.6** | **86.4** |
+
+Whole-cluster selection is at dense level at every budget: 87.6 / 87.3 / 86.4 against 87.2 while
+reading 27% / 15% / 9% of the keys, with the UUID needles at 97-98 where positional pages fall to
+75 / 63 / 34 and bound descriptors only reach 81. The mechanism: all the digits (or all the
+UUID fragments) of a context land in the same clusters, so selecting a cluster fetches every
+candidate value at once and the exact attention picks the right one; a positional page has to be
+found through a mean diluted by the sentence around the needle. The aggregation tasks stay at
+dense level too (cwe 96-97, fwe 63-66 at 25%/12.5%), for the reason the page-cut variant already
+showed. So the ranking of page orders on this benchmark is: whole clusters > positional pages with
+bounds (16-key) > positional pages with means > page-cut clusters, and the earlier conclusion that
+"positional pages are good enough" holds for perplexity and for retrieval at 25%, but not for
+retrieval at the budgets where the speedup lives.
+
+**What this means for the device.** Whole-cluster selection needs the keys of a cluster to be
+fetchable as one unit, and that is exactly what the cluster-ordered **shadow** layout provides: a
+cluster is a contiguous run of rows in cluster order, one variable-length 2D descriptor fetches it,
+and the per-descriptor fixed cost (the thing that made 16-key pages cost twice per byte) is
+amortized over the whole cluster. The in-place layout cannot do this: a 32-key cluster scattered
+over the positional cache is 32 descriptors of 256 B. So the design returns to the shadow copy,
+with what was learned since: sinks and window outside the clustering, whole clusters instead of a
+page cut (the kernel's list of (offset, length) runs instead of page indices; the select pass
+scores centroids and accumulates sizes to the budget), descriptors and directory owned by the DSP
+or clamped synchronously, and the memory problem (a second copy of the K/V of the clustered range)
+to be paid for with Q8 pages or a partial shadow of the oldest context. The GPU sidecar that
+clusters during prefill is the piece that already exists.
+
 ### Status
 
 Built and measured end to end: page-list HVX decode kernel (Stage 1), GPU chunk-local k-means
@@ -660,9 +714,11 @@ at dense perplexity at 25%; without it the same arms lost 1.7-3.5x. Frontier at 
 backlog). In-place positional pages with
 DSP-computed descriptors (Stage 6) replace the shadow: exact across context resets, 15 MB at 16k,
 quality at dense level down to 12.5% (16-key pages), decode 1.30x / 1.55x / 1.9x at 4k / 8k / 16k.
-On RULER at 4k positional pages beat k-means pages at every budget
-(84.2 / 82.9 / 79.6 vs 82.2 / 81.9 / 75.2 against 87.2 dense), and 16-key pages with min/max bound
-descriptors at 12.5% reach 85.5 while reading 14.8% of the keys. Next, in order: bound descriptors
-on the device, (in-place pages of llama's cache + one mean per page: removes the memory
+On RULER at 4k, positional pages beat *page-cut* k-means pages (84.2 / 82.9 / 79.6 vs 82.2 /
+81.9 / 75.2 against 87.2 dense), but **whole-cluster selection with the sinks and window excluded
+from clustering is at dense level at every budget (87.6 / 87.3 / 86.4 while reading 27% / 15% / 9%
+of the keys)**, so the cluster-ordered shadow layout, fetching whole clusters as single runs, is
+the design to return to for retrieval-heavy workloads. Next, in order: whole-cluster selection on
+the device (shadow layout, run lists, DSP-owned metadata), (in-place pages of llama's cache + one mean per page: removes the memory
 problem, the gather and the lag), positional tail pages so the dense window is really 64 keys, and
 the fixed per-page cost (K|V in one descriptor, several 16-key pages per 64-lane softmax).
