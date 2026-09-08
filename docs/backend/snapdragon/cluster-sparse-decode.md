@@ -604,7 +604,46 @@ What the table says:
   right UUID does not score high enough for a 25% budget. This is the Quest observation, and the
   reason the bound-descriptor arms below exist.
 
-RULER_BOUNDS
+**Bound descriptors** (Quest-style: per-dimension min and max of the page's keys, score =
+sum_d max(q_d min_d, q_d max_d), an upper bound on any key's dot product; `--desc minmax`), same
+budgets, same runs otherwise:
+
+| task | dense | positional 64-key 25%, mean | positional 64-key 25%, bounds | k-means 64-key 25%, mean | k-means 64-key 25%, bounds | positional 16-key 12.5%, mean | positional 16-key 12.5%, bounds |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| niah_single_1 | 100 | 100 | 100 | 93 | 100 | 100 | 100 |
+| niah_single_2 | 100 | 98 | 100 | 89 | 96 | 100 | 100 |
+| niah_single_3 | 98 | 96 | 99 | 82 | 87 | 97 | 100 |
+| niah_multikey_1 | 100 | 100 | 100 | 98 | 99 | 100 | 100 |
+| niah_multikey_2 | 99 | 98 | 93 | 96 | 96 | 99 | 98 |
+| niah_multikey_3 | 98 | 75 | 63 | 78 | 74 | 63 | **81** |
+| niah_multivalue | 99.2 | 96.5 | 99.2 | 96.0 | 97.5 | 97.2 | 99.2 |
+| niah_multiquery | 100 | 98.2 | 99.2 | 97.8 | 98.0 | 99.8 | 99.8 |
+| vt | 93.4 | 92.4 | 92.6 | 93.2 | 93.6 | 90.8 | 94.4 |
+| cwe | 96.0 | 94.3 | 91.2 | 97.0 | 87.9 | 87.3 | 87.9 |
+| fwe | 63.7 | 60.7 | 56.7 | 68.0 | 53.7 | 58.7 | 55.7 |
+| qa_1 | 49 | 50 | 47 | 48 | 46 | 50 | 55 |
+| qa_2 | 37 | 36 | 38 | 33 | 34 | 35 | 40 |
+| **average** | **87.2** | **84.2** | **83.0** | **82.2** | **81.7** | **82.9** | **85.5** |
+
+Bounds are a page-size question. Over 16-key pages they are the best sparse configuration measured:
+85.5 against 87.2 dense while reading 14.8% of the keys, UUID retrieval 63 -> 81, every other
+needle task 98-100, variable tracking above dense. Over 64-key pages they are worse than the mean
+(83.0 vs 84.2): the per-dimension envelope of 64 keys is so wide that most pages look possible and
+the ranking stops discriminating (UUID retrieval 75 -> 63). This is why Quest uses 16-key pages.
+K-means pages lose their one advantage under bounds (cwe 97 -> 88, fwe 68 -> 54), since that
+advantage came from the mean of a cluster of repeated words matching the query.
+
+**What this means for the device.** Two configurations, both positional, both in-place:
+- quality first: 16-key pages, min/max descriptors, 12.5% budget -- RULER 85.5 (98% of dense),
+  decode about 1.2x at 4k and 1.7x at 16k from the device measurements of the 12.5% arm, minus the
+  cost of the bound pass;
+- speed first: 16-key pages, mean descriptor, 6.2% budget -- RULER 79.6 (91% of dense; single
+  needles still 97-100, aggregation tasks and UUIDs pay), decode 1.32x at 4k and 1.95x at 16k.
+
+The bound pass on the HTP is two descriptor rows per page (min and max, computed by the same DSP
+descriptor pass with vmin/vmax instead of a sum) and an elementwise multiply-max-reduce per page
+and query head instead of the rx32 dot: roughly 2-3x the select pass, i.e. a few percent of the
+attention op at 4k and 15-20% of it at 16k unless the descriptors are made hierarchical.
 
 ### Status
 
@@ -621,6 +660,9 @@ at dense perplexity at 25%; without it the same arms lost 1.7-3.5x. Frontier at 
 backlog). In-place positional pages with
 DSP-computed descriptors (Stage 6) replace the shadow: exact across context resets, 15 MB at 16k,
 quality at dense level down to 12.5% (16-key pages), decode 1.30x / 1.55x / 1.9x at 4k / 8k / 16k.
-Next, in order: (in-place pages of llama's cache + one mean per page: removes the memory
+On RULER at 4k positional pages beat k-means pages at every budget
+(84.2 / 82.9 / 79.6 vs 82.2 / 81.9 / 75.2 against 87.2 dense), and 16-key pages with min/max bound
+descriptors at 12.5% reach 85.5 while reading 14.8% of the keys. Next, in order: bound descriptors
+on the device, (in-place pages of llama's cache + one mean per page: removes the memory
 problem, the gather and the lag), positional tail pages so the dense window is really 64 keys, and
 the fixed per-page cost (K|V in one descriptor, several 16-key pages per 64-lane softmax).
