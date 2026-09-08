@@ -18,7 +18,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, 
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, sdpa_mask
 
-CFG = dict(mode="dense", page=64, density=0.25, window=64, sink=4, iters=8)
+CFG = dict(mode="dense", page=64, density=0.25, window=64, sink=4, iters=8, desc="mean")
 STATE = {}       # layer_idx -> dict(perm=[Hkv, n0] LongTensor or None, n0=int)
 STATS = dict(steps=0, keys_attended=0, keys_total=0)
 
@@ -87,9 +87,15 @@ def sparse_attention_forward(module, query, key, value, attention_mask, scaling=
     else:
         idx = None
         kc = k[:, :ds]
-    desc = kc.view(Hkv, n_cand, PK, D).float().mean(2)                                  # [Hkv, n_cand, D]
     q = query[0, :, 0].float().view(Hkv, G, D)                                           # [Hkv, G, D]
-    s = torch.einsum("hgd,hpd->hgp", q, desc).amax(1)                                   # [Hkv, n_cand] GQA fold: max
+    kp = kc.view(Hkv, n_cand, PK, D).float()
+    if CFG["desc"] == "minmax":
+        # Quest-style upper bound: sum_d max(q_d * min_d, q_d * max_d) over the page's keys (two descriptor rows)
+        kmin, kmax = kp.amin(2), kp.amax(2)                                               # [Hkv, n_cand, D]
+        s = torch.maximum(q[:, :, None, :] * kmin[:, None], q[:, :, None, :] * kmax[:, None]).sum(-1).amax(1)   # [Hkv, n_cand]
+    else:
+        desc = kp.mean(2)                                                                # [Hkv, n_cand, D]
+        s = torch.einsum("hgd,hpd->hgp", q, desc).amax(1)                               # [Hkv, n_cand] GQA fold: max
     s[:, 0] = float("inf")                                                             # sink page always selected
     Bp = max(1, min(n_cand, math.ceil(dens * n_cand)))
     top = s.topk(Bp, dim=1).indices                                                     # [Hkv, Bp]
@@ -142,19 +148,20 @@ def main():
     ap.add_argument("--density", type=float, default=0.25)
     ap.add_argument("--window", type=int, default=64)
     ap.add_argument("--sink", type=int, default=4)
+    ap.add_argument("--desc", default="mean", choices=["mean", "minmax"], help="page descriptor: mean key (device) or Quest-style min/max bounds")
     ap.add_argument("--limit", type=int, default=0, help="samples per task (0 = all)")
     ap.add_argument("--model", default="Qwen/Qwen3-1.7B")
     ap.add_argument("--chat", action="store_true", help="wrap the prompt in the chat template (thinking off)")
     ap.add_argument("--full_gen", action="store_true", help="generate the full token budget (RULER default) instead of stopping after the first answer line")
     a = ap.parse_args()
-    CFG.update(mode=a.mode, page=a.page, density=a.density, window=a.window, sink=a.sink)
+    CFG.update(mode=a.mode, page=a.page, density=a.density, window=a.window, sink=a.sink, desc=a.desc)
     os.makedirs(a.out_dir, exist_ok=True)
 
     tok = AutoTokenizer.from_pretrained(a.model)
     model = AutoModelForCausalLM.from_pretrained(a.model, torch_dtype=torch.bfloat16, attn_implementation="sparse_sim").cuda().eval()
     eos = [tok.eos_token_id] + ([tok.convert_tokens_to_ids("<|im_end|>")] if "<|im_end|>" in tok.get_vocab() else [])
     eos = sorted(set(e for e in eos if e is not None))
-    print(f"mode {a.mode} page {a.page} density {a.density} window {a.window} sink {a.sink}; eos {eos}", flush=True)
+    print(f"mode {a.mode} page {a.page} density {a.density} window {a.window} sink {a.sink} desc {a.desc}; eos {eos}", flush=True)
 
     for task in a.tasks.split(","):
         path = os.path.join(a.data_dir, task, "validation.jsonl")

@@ -564,7 +564,47 @@ samples per task, 4096 tokens, Qwen3 tokenizer, base template; scoring with RULE
 string-match metrics (`ruler_summarize.py`). Same budgets as the device frontier: 64-key pages at
 25%, 16-key pages at 12.5% and 6.2%.
 
-RULER_TABLE
+Scores (RULER string match, 100 samples per task; "attended" is the mean fraction of keys read at
+decode, sink page and dense tail included):
+
+| task | dense | positional 64-key 25% | k-means 64-key 25% | positional 16-key 12.5% | k-means 16-key 12.5% | positional 16-key 6.2% | k-means 16-key 6.2% |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| attended | 100% | 27.5% | 27.5% | 14.8% | 14.8% | 8.8% | 8.8% |
+| niah_single_1 | 100 | 100 | 93 | 100 | 94 | 100 | 87 |
+| niah_single_2 | 100 | 98 | 89 | 100 | 94 | 100 | 87 |
+| niah_single_3 | 98 | 96 | 82 | 97 | 91 | 97 | 77 |
+| niah_multikey_1 | 100 | 100 | 98 | 100 | 100 | 100 | 97 |
+| niah_multikey_2 | 99 | 98 | 96 | 99 | 98 | 93 | 93 |
+| niah_multikey_3 | 98 | 75 | 78 | 63 | 61 | 34 | 30 |
+| niah_multivalue | 99.2 | 96.5 | 96.0 | 97.2 | 95.8 | 96.8 | 84.0 |
+| niah_multiquery | 100 | 98.2 | 97.8 | 99.8 | 98.8 | 99.2 | 96.5 |
+| vt | 93.4 | 92.4 | 93.2 | 90.8 | 91.4 | 90.6 | 87.2 |
+| cwe | 96.0 | 94.3 | 97.0 | 87.3 | 96.4 | 82.6 | 94.8 |
+| fwe | 63.7 | 60.7 | 68.0 | 58.7 | 63.7 | 54.3 | 61.7 |
+| qa_1 | 49 | 50 | 48 | 50 | 46 | 49 | 46 |
+| qa_2 | 37 | 36 | 33 | 35 | 35 | 38 | 36 |
+| **average** | **87.2** | **84.2** | **82.2** | **82.9** | **81.9** | **79.6** | **75.2** |
+
+What the table says:
+
+- **Positional pages beat k-means pages at every budget on the average** (84.2 vs 82.2, 82.9 vs
+  81.9, 79.6 vs 75.2), and the gap widens as the budget shrinks. The mechanism is visible in the
+  single-needle rows: a needle is several tokens ("the special magic number for X is 1234567"),
+  positional pages keep them together, k-means scatters them into different clusters and pages, and
+  a partially selected needle yields a partially right answer (the model then writes "54372. Wait,
+  but the text also mentions...").
+- **K-means pages win the two aggregation tasks** (`cwe` 97 vs 94 and 96 vs 87; `fwe` 68 vs 61, above
+  dense). Repeated words cluster together, so one selected page carries all occurrences: exactly
+  the case where semantic grouping is the right unit. It is a real but narrow advantage.
+- **Positional pages at 25% are within two points of dense on 11 of 13 tasks**, at 12.5% on 10
+  of 13, and even at 6.2% (8.8% of the keys read) retrieval of a single needle is still 97-100.
+  The budget-limited tasks are the ones that need many scattered facts at once (`cwe`, `fwe`).
+- **The mean descriptor fails on `niah_multikey_3`** (UUID keys and UUID values: 98 dense, 75 / 63 /
+  34 positional). A page mean cannot represent a 30-token random string, so the page holding the
+  right UUID does not score high enough for a 25% budget. This is the Quest observation, and the
+  reason the bound-descriptor arms below exist.
+
+RULER_BOUNDS
 
 ### Status
 
