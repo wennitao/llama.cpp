@@ -106,6 +106,15 @@ struct htp_fa_context {
     // followed by the dense positional blocks [cl_dense_b0, n_blocks) with the mask.
     bool            cl_on;
     bool            cl_inplace;        // pages are page_keys consecutive rows of the positional K/V (HTP_FA_CLUSTER_HDR_INPLACE)
+    bool            cl_runs;           // whole-cluster runs (HTP_FA_CLUSTER_HDR_RUNS): lists are DMA blocks of selected runs
+    struct htp_fa_cluster_blk * cl_sel_blk;   // VTCM: [nek2][cl_max_blk] blocks (runs mode)
+    const uint8_t * cl_runs_tab;       // this layer's run table: [kvh][cl_n_pages_max(=n_runs_max)] x struct htp_fa_cluster_run
+    uint32_t        cl_max_blk;        // blocks per head the list can hold
+    uint32_t        cl_rows_max;       // shadow rows per head
+    uint32_t        cl_row_bytes;      // D * 2
+    uint32_t        cl_budget_rows;    // runs mode: rows per head charged to the budget
+    uint8_t *       cl_sel_r;          // VTCM per thread: run table staging (runs mode)
+    size_t          cl_sel_r_stride;
     uint32_t        cl_flags;
     const uint8_t * cl_k_pages;        // shadow K pages of this layer: [kvh][page] x page_bytes
     const uint8_t * cl_v_pages;
@@ -3093,6 +3102,21 @@ static inline void hvx_fa_dec_blk_src(const struct htp_fa_context * factx, const
     if (factx->cl_on) {
         const uint32_t nsel = factx->cl_sel_n[kvh];
         if (j < nsel) {
+            if (factx->cl_runs) {
+                // a DMA block of a selected cluster: contiguous rows of the head's shadow, no mask
+                const struct htp_fa_cluster_blk * e = factx->cl_sel_blk + (size_t) kvh * factx->cl_max_blk + j;
+                uint32_t row = e->row, bsz = e->bsz;
+                if (bsz == 0 || bsz > FLASH_ATTN_BLOCK_SIZE || row + bsz > factx->cl_rows_max) {
+                    row = 0; bsz = 1;   // never a wild address
+                }
+                const size_t off = (size_t) kvh * factx->cl_head_stride + (size_t) row * factx->cl_row_bytes;
+                b->k      = factx->cl_k_pages + off;
+                b->v      = factx->cl_v_pages + off;
+                b->bsz    = bsz;
+                b->pos    = UINT32_MAX;
+                b->contig = true;
+                return;
+            }
             uint32_t page = factx->cl_sel_pages[(size_t) kvh * factx->cl_n_pages_max + j];
             if (page >= factx->cl_n_cand) {
                 page = factx->cl_n_cand - 1;   // clamp: a bad index must never form a wild address
@@ -3686,6 +3710,8 @@ static bool hvx_fa_cl_setup(struct htp_fa_context * factx, const struct htp_ops_
     // dense_start = the last chunk boundary that leaves at least W positions to the dense tail;
     // candidates are the pages of every chunk up to it. Chunks are appended in position order.
     const uint32_t W = (uint32_t) octx->op_params[HTP_FA_CLUSTER_OPP_WINDOW];
+    const bool     runs = (hdr->flags & HTP_FA_CLUSTER_HDR_RUNS) != 0;
+    const uint32_t units_max = runs ? hdr->n_runs_max : hdr->n_pages_max;   // descriptor units per head (runs or pages)
     uint32_t dense_start = 0, n_cand = 0;
     if (inplace) {
         // In-place pages: the candidates are the complete published pages that leave at least W
@@ -3703,7 +3729,7 @@ static bool hvx_fa_cl_setup(struct htp_fa_context * factx, const struct htp_ops_
         if (ch.pos_end > dir->covered_end || ch.pos_end > rows_ok || ch.pos_end + W > nek1 || (ch.pos_end % FLASH_ATTN_BLOCK_SIZE) != 0) {
             break;
         }
-        if (ch.page_first + ch.n_pages > dir->n_pages_pub || ch.page_first + ch.n_pages > hdr->n_pages_max) {
+        if (ch.page_first + ch.n_pages > dir->n_pages_pub || ch.page_first + ch.n_pages > units_max) {
             break;
         }
         dense_start = ch.pos_end;
@@ -3715,12 +3741,18 @@ static bool hvx_fa_cl_setup(struct htp_fa_context * factx, const struct htp_ops_
 
     factx->cl_flags          = (uint32_t) octx->op_params[HTP_FA_CLUSTER_OPP_FLAGS];
     factx->cl_inplace        = inplace;
+    factx->cl_runs           = runs;
     factx->cl_k_pages        = inplace ? NULL : layer_base + hdr->off_k_pages;
     factx->cl_v_pages        = inplace ? NULL : layer_base + hdr->off_v_pages;
     factx->cl_page_bytes     = hdr->page_bytes;
     factx->cl_page_keys      = hdr->page_keys;
     factx->cl_head_stride    = (size_t) hdr->n_pages_max * hdr->page_bytes;
-    factx->cl_n_pages_max    = hdr->n_pages_max;
+    factx->cl_n_pages_max    = runs ? hdr->n_runs_max : hdr->n_pages_max;   // per-head descriptor / list stride (units)
+    factx->cl_rows_max       = hdr->n_pages_max * hdr->page_keys;
+    factx->cl_row_bytes      = DK * 2;
+    factx->cl_runs_tab       = layer_base + hdr->off_runs;
+    factx->cl_max_blk        = runs ? hdr->n_pages_max + hdr->n_runs_max : 0;
+    factx->cl_budget_rows    = 0;
     factx->cl_n_cand         = n_cand;
     factx->cl_dense_b0       = dense_start / FLASH_ATTN_BLOCK_SIZE;
     factx->cl_n_dense_blocks = factx->n_blocks - factx->cl_dense_b0;
@@ -3738,6 +3770,25 @@ static bool hvx_fa_cl_setup(struct htp_fa_context * factx, const struct htp_ops_
         if (hdr->centroid_bytes != hex_round_up((size_t) DK * 2, 128) || DK % 64 != 0) {
             return false;
         }
+        if (runs) {
+            // Row budget over the candidate rows minus the forced (sink) rows; the select pass takes whole
+            // runs in score order until it is filled. The block count is only known after selection, so
+            // the split pick gets an upper bound.
+            const struct htp_fa_cluster_run * r0 = (const struct htp_fa_cluster_run *) factx->cl_runs_tab;
+            hvx_fa_cl_inval(r0, sizeof(*r0));
+            const uint32_t forced_rows = (n_cand > 0 && (r0->flags & HTP_FA_CLUSTER_RUN_FORCED)) ? r0->n_rows : 0;
+            const uint32_t cand_rows   = dense_start > forced_rows ? dense_start - forced_rows : 0;
+            factx->cl_budget_rows = (uint32_t) (((uint64_t) cand_rows * factx->cl_density + 999) / 1000);
+            uint32_t ub = factx->cl_budget_rows / FLASH_ATTN_BLOCK_SIZE + n_cand + 1;
+            if (ub > factx->cl_max_blk) ub = factx->cl_max_blk;
+            factx->cl_budget = ub;
+            for (uint32_t h = 0; h < nek2; ++h) {
+                factx->cl_sel_n[h]      = ub;
+                factx->cl_head_order[h] = (uint8_t) h;
+            }
+            s->max_total = ub + factx->cl_n_dense_blocks;
+            return true;
+        }
         uint32_t b = (uint32_t) (((uint64_t) n_cand * factx->cl_density + 999) / 1000);
         const uint32_t min_pages = HTP_FA_CLUSTER_FLAG_MINPAGES(factx->cl_flags);
         if (b < min_pages) b = min_pages;
@@ -3749,6 +3800,9 @@ static bool hvx_fa_cl_setup(struct htp_fa_context * factx, const struct htp_ops_
         }
         s->max_total = b + factx->cl_n_dense_blocks;
         return true;
+    }
+    if (runs) {
+        return false;   // host-written lists are not defined for runs; density 0 falls back to dense
     }
     // Host-written lists: lengths now (the split pick needs them), pages after the VTCM alloc.
     s->host_sel = layer_base + hdr->off_host_sel;
@@ -3802,7 +3856,11 @@ static void hvx_fa_cl_copy_lists(struct htp_fa_context * factx, const struct hvx
         for (uint32_t h = 0; h < nek2; ++h) {
             uint8_t * e = echo + (size_t) h * stride;
             *(uint32_t *) e = factx->cl_sel_n[h];
-            memcpy(e + 128, factx->cl_sel_pages + (size_t) h * factx->cl_n_pages_max, (size_t) factx->cl_sel_n[h] * 2);
+            if (factx->cl_runs) {
+                memcpy(e + 128, factx->cl_sel_blk + (size_t) h * factx->cl_max_blk, (size_t) factx->cl_sel_n[h] * sizeof(struct htp_fa_cluster_blk));
+            } else {
+                memcpy(e + 128, factx->cl_sel_pages + (size_t) h * factx->cl_n_pages_max, (size_t) factx->cl_sel_n[h] * 2);
+            }
         }
         qurt_mem_cache_clean((qurt_addr_t) echo, (size_t) nek2 * stride, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
     }
@@ -3848,12 +3906,21 @@ static void flash_attn_ext_f16_select_thread(unsigned int nth, unsigned int ith,
             const uint32_t nr = MIN(128u, n_cand - r0);
             dma_queue_push(dma, dma_make_ptr(spad_c + (size_t) r0 * cbytes, cent + (size_t) r0 * cbytes), cbytes, cbytes, cbytes, nr);
         }
+        struct htp_fa_cluster_run * runs = NULL;
+        if (factx->cl_runs) {
+            runs = (struct htp_fa_cluster_run *) (factx->cl_sel_r + factx->cl_sel_r_stride * ith);
+            const uint8_t * src = factx->cl_runs_tab + (size_t) kvh * factx->cl_n_pages_max * sizeof(struct htp_fa_cluster_run);
+            dma_queue_push_single_1d(dma, dma_make_ptr((uint8_t *) runs, src), hex_round_up((size_t) n_cand * sizeof(struct htp_fa_cluster_run), 128));
+        }
         // the G query rows of this KV head (decode: neq1 == 1, so row g is head kvh*G + g)
         for (uint32_t g = 0; g < G; ++g) {
             const uint8_t * q_row = (const uint8_t *) q->data + (size_t) (kvh * G + g) * nbq2;
             dma_queue_push(dma, dma_make_ptr(spad_q + g * factx->size_q_block, q_row), factx->size_q_row_padded, nbq1, size_q_row, 1);
         }
         for (uint32_t r0 = 0; r0 < n_cand; r0 += 128) {
+            dma_queue_pop(dma);
+        }
+        if (factx->cl_runs) {
             dma_queue_pop(dma);
         }
         for (uint32_t g = 0; g < G; ++g) {
@@ -3876,6 +3943,62 @@ static void flash_attn_ext_f16_select_thread(unsigned int nth, unsigned int ith,
                 s = Q6_V_vmux_QVV(Q6_Q_vsetq_R(valid * 4), s, neg_inf);
             }
             scores[i] = s;
+        }
+
+        if (factx->cl_runs) {
+            // Whole clusters: forced runs (the sinks) score +inf and are free; empty runs never score;
+            // take runs in score order while they fit the row budget (the first non-forced run always
+            // fits), expanding each into 64-row DMA blocks.
+            float * sf = (float *) scores;
+            for (uint32_t r = 0; r < n_cand; ++r) {
+                if (runs[r].flags & HTP_FA_CLUSTER_RUN_FORCED) sf[r] = INFINITY;
+                else if (runs[r].n_rows == 0)                   sf[r] = -INFINITY;
+            }
+            struct htp_fa_cluster_blk * out = factx->cl_sel_blk + (size_t) kvh * factx->cl_max_blk;
+            uint32_t nb = 0, cum = 0, taken = 0;
+            const uint32_t budget = factx->cl_budget_rows;
+            for (;;) {
+                HVX_Vector m = scores[0];
+                for (uint32_t i = 1; i < n_vec; ++i) {
+                    m = Q6_Vsf_vmax_VsfVsf(m, scores[i]);
+                }
+                const HVX_Vector mx = hvx_vec_reduce_max_f32(m);
+                if (hvx_vec_get_f32(mx) == -INFINITY) {
+                    break;
+                }
+                HVX_Vector best = Q6_V_vzero();
+                for (uint32_t i = 0; i < n_vec; ++i) {
+                    const HVX_VectorPred eq = Q6_Q_vcmp_eq_VwVw(scores[i], mx);
+                    const HVX_Vector cand = Q6_Vw_vsub_VwVw(Q6_V_vsplat_R(BIG), Q6_Vw_vadd_VwVw(iota, Q6_V_vsplat_R((int32_t) (i * 32))));
+                    best = Q6_Vw_vmax_VwVw(best, Q6_V_vmux_QVV(eq, cand, Q6_V_vzero()));
+                }
+                const int32_t  idx = BIG - hvx_vec_get_i32(hvx_vec_reduce_max_i32(best));
+                const uint32_t vi = (uint32_t) idx / 32, li = (uint32_t) idx % 32;
+                scores[vi] = Q6_V_vmux_QVV(Q6_Q_vcmp_eq_VwVw(iota, Q6_V_vsplat_R((int32_t) li)), neg_inf, scores[vi]);
+                if ((uint32_t) idx >= n_cand) {
+                    break;
+                }
+                const struct htp_fa_cluster_run rr = runs[idx];
+                const bool forced = (rr.flags & HTP_FA_CLUSTER_RUN_FORCED) != 0;
+                if (!forced) {
+                    if (cum + rr.n_rows > budget && taken > 0) {
+                        break;
+                    }
+                    cum += rr.n_rows;
+                    taken++;
+                }
+                for (uint32_t r0 = 0; r0 < rr.n_rows && nb < factx->cl_max_blk; r0 += FLASH_ATTN_BLOCK_SIZE) {
+                    out[nb].row = rr.row_first + r0;
+                    out[nb].bsz = (uint16_t) MIN(FLASH_ATTN_BLOCK_SIZE, rr.n_rows - r0);
+                    out[nb].pad = 0;
+                    nb++;
+                }
+                if (nb >= factx->cl_max_blk || (!forced && cum >= budget)) {
+                    break;
+                }
+            }
+            factx->cl_sel_n[kvh] = nb;
+            continue;
         }
 
         // forced pages: the first F candidate pages of the layer (the sink tokens live in page 0)
@@ -4024,6 +4147,7 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     factx.dec_nslots = 2;
     factx.cl_on      = false;
     factx.cl_inplace = false;
+    factx.cl_runs    = false;
     factx.cl_flags   = 0;
     struct hvx_fa_cl_setup cls;
     if (dec && !het_base && octx->src[7] && octx->src[7]->data &&
@@ -4049,10 +4173,13 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
         factx.dec_n_mseg = (mask && mask->ne[2] != 1) ? R : neq1;
         factx.dec_stride_part = HVX_FA_DEC_PART_HDR + size_vkq_acc;
         factx.dec_n_split = hvx_fa_dec_pick_split(neq3 * nek2, factx.cl_on ? cls.max_total : n_blocks_htp, octx->n_threads, 8);
-        const size_t lists_bytes = factx.cl_on ? hex_round_up((size_t) nek2 * factx.cl_n_pages_max * sizeof(uint16_t), 128) : 0;
+        const size_t lists_bytes = !factx.cl_on ? 0
+                                 : factx.cl_runs ? hex_round_up((size_t) nek2 * factx.cl_max_blk * sizeof(struct htp_fa_cluster_blk), 128)
+                                 : hex_round_up((size_t) nek2 * factx.cl_n_pages_max * sizeof(uint16_t), 128);
         const bool   cl_select   = factx.cl_on && factx.cl_density != 0;
         factx.cl_sel_c_stride = cl_select ? (size_t) factx.cl_sel_rows * factx.cl_cent_bytes : 0;
         factx.cl_sel_s_stride = cl_select ? (size_t) (factx.cl_sel_rows / 32) * VLEN : 0;
+        factx.cl_sel_r_stride = (cl_select && factx.cl_runs) ? hex_round_up((size_t) factx.cl_n_pages_max * sizeof(struct htp_fa_cluster_run), 128) : 0;
         for (;;) {
             factx.dec_bps     = (n_blocks_htp + factx.dec_n_split - 1) / factx.dec_n_split;
             factx.dec_n_units = neq3 * nek2 * factx.dec_n_split;
@@ -4064,8 +4191,10 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
             factx.spad_a = vtcm_seq_alloc(&vtcm_cur, size_vkq_acc * R * octx->n_threads);
             factx.dec_partials = vtcm_seq_alloc(&vtcm_cur, factx.dec_stride_part * rows_total * factx.dec_n_split);
             factx.cl_sel_pages = (uint16_t *) vtcm_seq_alloc(&vtcm_cur, lists_bytes);
+            factx.cl_sel_blk   = (struct htp_fa_cluster_blk *) factx.cl_sel_pages;
             factx.cl_sel_c     = vtcm_seq_alloc(&vtcm_cur, factx.cl_sel_c_stride * octx->n_threads);
             factx.cl_sel_s     = vtcm_seq_alloc(&vtcm_cur, factx.cl_sel_s_stride * octx->n_threads);
+            factx.cl_sel_r     = vtcm_seq_alloc(&vtcm_cur, factx.cl_sel_r_stride * octx->n_threads);
             if ((size_t) (vtcm_cur - octx->ctx->vtcm_base) <= octx->ctx->vtcm_size) {
                 break;
             }

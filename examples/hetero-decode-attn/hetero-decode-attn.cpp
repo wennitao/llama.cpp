@@ -25,6 +25,7 @@
 #include <CL/cl_ext.h>
 
 #include <algorithm>
+#include <set>
 #include <iterator>
 #include <cinttypes>
 #include <cmath>
@@ -111,6 +112,8 @@ struct options {
     int    page_keys = 64;     // keys per shadow page: 16, 32 or 64
     int    inplace = 0;        // 1 = in-place pages (rows of the positional cache; shadow holds descriptors only)
     int    chunk = 1024;       // keys per chunk-table entry (shadow mode)
+    int    runs = 0;           // 1 = whole-cluster runs mode (variable-size clusters, sink run forced)
+    int    csize = 32;         // runs mode: average cluster size
     int    seed      = 1234;
 };
 
@@ -148,6 +151,8 @@ static bool parse(int argc, char ** argv, options & o) {
         else if (a == "--page-keys") { if (!next_i(o.page_keys)) return false; }
         else if (a == "--inplace")   { o.inplace = 1; o.perm_identity = 1; }
         else if (a == "--chunk")     { if (!next_i(o.chunk)) return false; }
+        else if (a == "--runs")      { o.runs = 1; }
+        else if (a == "--csize")     { if (!next_i(o.csize)) return false; }
         else if (a == "--sel")      { if (i + 1 >= argc) return false; o.sel_scatter = std::string(argv[++i]) != "contig"; }
         else if (a == "--desc")     { if (i + 1 >= argc) return false; o.desc1d = std::string(argv[++i]) == "1d"; }
         else if (a == "--perm")     { if (i + 1 >= argc) return false; o.perm_identity = std::string(argv[++i]) == "identity"; }
@@ -469,6 +474,193 @@ static void ref_attn_keys(const options & o, const uint8_t * base, const layout 
     for (int d = 0; d < o.d; ++d) out[d] = S > 0 ? out[d] / S : 0.0;
 }
 
+// Runs mode (whole clusters): a synthetic cluster-ordered shadow with variable-size runs, the sink keys as a
+// forced run, one centroid per run; the kernel selects runs to a row budget (device selection) and echoes the
+// DMA blocks it attended; the reference attends exactly those rows (via pos_map) plus the dense tail.
+static int run_cluster_runs(const options & o, ggml_backend_t be, ggml_backend_buffer_t buf, uint8_t * base, const layout & L,
+                            const htp_fa_cluster_header & hdr, size_t shadow_bytes) {
+    const int W = o.window, n_sink = 4;
+    const int covered_end = o.kv - W;
+    if (W % 64 || covered_end <= n_sink + 2 * o.csize) { fprintf(stderr, "--window must be a multiple of 64 and leave room for clusters\n"); return 1; }
+    const int G = o.nh / o.nkvh;
+    uint8_t * lb = base + hdr.layer0_off;
+    const uint32_t rows_max = hdr.n_pages_max * hdr.page_keys;
+    const size_t head_stride = (size_t) hdr.n_pages_max * hdr.page_bytes;
+    const size_t row_bytes = (size_t) o.d * 2;
+
+    memcpy(base, &hdr, sizeof(hdr));
+    auto * dir = (htp_fa_cluster_dir *) (base + HTP_FA_CLUSTER_DIR_OFF);
+    memset(dir, 0, sizeof(*dir));
+    auto * hdir = (htp_fa_cluster_hdir *) (base + HTP_FA_CLUSTER_HDIR_OFF);
+    memset(hdir, 0, sizeof(*hdir));
+    hdir->rows_valid = (uint32_t) covered_end;
+
+    // middle positions in a (random or identity) order, cut into runs of csize/2 .. 3*csize/2 keys
+    std::mt19937 rng(o.seed);
+    std::vector<int> perm(covered_end - n_sink);
+    for (int i = 0; i < (int) perm.size(); ++i) perm[i] = n_sink + i;
+    if (!o.perm_identity) std::shuffle(perm.begin(), perm.end(), rng);
+    std::vector<std::pair<int, int>> runs;   // (row_first, n_rows) incl. the forced sink run
+    runs.push_back({ 0, n_sink });
+    {
+        std::uniform_int_distribution<int> sz(std::max(1, o.csize / 2), 3 * o.csize / 2);
+        int row = n_sink;
+        while (row < covered_end) {
+            int n = std::min(sz(rng), covered_end - row);
+            if (covered_end - (row + n) < o.csize / 2) n = covered_end - row;   // absorb a short tail
+            runs.push_back({ row, n });
+            row += n;
+        }
+    }
+    const int n_runs = (int) runs.size();
+    if ((uint32_t) n_runs > hdr.n_runs_max) { fprintf(stderr, "too many runs (%d > %u)\n", n_runs, hdr.n_runs_max); return 1; }
+    auto * pos_map = (uint32_t *) (lb + hdr.off_pos_map);
+    for (int h = 0; h < o.nkvh; ++h) {
+        uint8_t * kp = lb + hdr.off_k_pages + (size_t) h * head_stride;
+        uint8_t * vp = lb + hdr.off_v_pages + (size_t) h * head_stride;
+        for (int r = 0; r < covered_end; ++r) {
+            const int pos = r < n_sink ? r : perm[r - n_sink];
+            memcpy(kp + (size_t) r * row_bytes, base + L.k + (size_t) pos * L.nbk1 + (size_t) h * L.nbk2, row_bytes);
+            memcpy(vp + (size_t) r * row_bytes, base + L.v + (size_t) pos * L.nbk1 + (size_t) h * L.nbk2, row_bytes);
+            pos_map[(size_t) h * rows_max + r] = (uint32_t) pos;
+        }
+        auto * rt = (htp_fa_cluster_run *) (lb + hdr.off_runs) + (size_t) h * hdr.n_runs_max;
+        for (int i = 0; i < n_runs; ++i) {
+            rt[i] = { (uint32_t) runs[i].first, (uint16_t) runs[i].second, (uint16_t) (i == 0 ? HTP_FA_CLUSTER_RUN_FORCED : 0) };
+            std::vector<float> acc(o.d, 0.0f);
+            for (int r = runs[i].first; r < runs[i].first + runs[i].second; ++r) {
+                const ggml_fp16_t * kr = (const ggml_fp16_t *) (kp + (size_t) r * row_bytes);
+                for (int d = 0; d < o.d; ++d) acc[d] += ggml_fp16_to_fp32(kr[d]);
+            }
+            ggml_fp16_t * c = (ggml_fp16_t *) (lb + hdr.off_centroids + ((size_t) h * hdr.n_runs_max + i) * hdr.centroid_bytes);
+            for (int d = 0; d < o.d; ++d) c[d] = ggml_fp32_to_fp16(acc[d] / (float) runs[i].second);
+        }
+    }
+    auto * chunks = (htp_fa_cluster_chunk *) (lb + hdr.off_chunks);
+    chunks[0] = { 0u, (uint32_t) covered_end, 0u, (uint32_t) n_runs };
+    dc_cvac(base, shadow_bytes);
+    dir->n_chunks = 1; dir->n_pages_pub = (uint32_t) n_runs; dir->covered_end = (uint32_t) covered_end;
+    dc_cvac(dir, sizeof(*dir));
+    dc_cvac(hdir, sizeof(*hdir));
+
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead_custom(8, false), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    const size_t kv_bytes = (size_t) o.kv * L.nbk1;
+    ggml_tensor * shadow = place(buf, base, 0, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) (shadow_bytes / 4)), "shadow");
+    ggml_tensor * q  = place(buf, base, L.q, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, o.d, 1, o.nh, 1), "q");
+    ggml_tensor * kb = place(buf, base, L.k, ggml_new_tensor_1d(ctx, GGML_TYPE_F16, (int64_t) (kv_bytes / 2)), "kbase");
+    ggml_tensor * vb = place(buf, base, L.v, ggml_new_tensor_1d(ctx, GGML_TYPE_F16, (int64_t) (kv_bytes / 2)), "vbase");
+    ggml_tensor * mb = place(buf, base, L.mask, ggml_new_tensor_1d(ctx, GGML_TYPE_F16, o.kv), "mbase");
+    ggml_tensor * kf = ggml_view_4d(ctx, kb, o.d, o.kv, o.nkvh, 1, L.nbk1, L.nbk2, kv_bytes, 0);
+    ggml_tensor * vf = ggml_view_4d(ctx, vb, o.d, o.kv, o.nkvh, 1, L.nbk1, L.nbk2, kv_bytes, 0);
+    ggml_tensor * mf = ggml_view_2d(ctx, mb, o.kv, 1, (size_t) o.kv * 2, 0);
+    kf->buffer = vf->buffer = mf->buffer = buf;
+    ggml_tensor * fa = ggml_flash_attn_ext(ctx, q, kf, vf, mf, 1.0f / sqrtf((float) o.d), 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+    place(buf, base, L.dst, fa, "fa_runs");
+    ggml_cgraph * g = ggml_new_graph_custom(ctx, 8, false);
+    ggml_build_forward_expand(g, fa);
+    if (!ggml_backend_supports_op(be, fa)) { fprintf(stderr, "HTP0 rejects the FA op\n"); return 1; }
+    uint32_t flags = HTP_FA_CLUSTER_FLAG_ECHO;
+    { int lg = 0; while ((1 << lg) < o.nslots) lg++; flags |= (uint32_t) lg << 1; }
+    auto set_mode = [&](bool on) {
+        fa->op_params[HTP_FA_CLUSTER_OPP_MAGIC]   = on ? (int32_t) HTP_FA_CLUSTER_MAGIC : 0;
+        fa->op_params[HTP_FA_CLUSTER_OPP_LAYER]   = 0;
+        fa->op_params[HTP_FA_CLUSTER_OPP_DENSITY] = o.density * 10;
+        fa->op_params[HTP_FA_CLUSTER_OPP_WINDOW]  = W;
+        fa->op_params[HTP_FA_CLUSTER_OPP_FLAGS]   = (int32_t) flags;
+        fa->src[7] = on ? shadow : nullptr;
+    };
+    const uint32_t budget_rows = (uint32_t) (((uint64_t) (covered_end - n_sink) * o.density * 10 + 999) / 1000);
+    printf("runs mode: kv %d, window %d, %d runs (avg %d keys, sink run of %d), row budget %u/head (%d%%), perm %s\n",
+           o.kv, W, n_runs, o.csize, n_sink, budget_rows, o.density, o.perm_identity ? "identity" : "random");
+
+    // host greedy selection per KV head: forced first, then runs by descending max-over-group q.centroid until the budget
+    auto host_select = [&](int kvh) {
+        std::vector<std::pair<double, int>> sc;
+        for (int i = 1; i < n_runs; ++i) {
+            double best = -INFINITY;
+            const ggml_fp16_t * c = (const ggml_fp16_t *) (lb + hdr.off_centroids + ((size_t) kvh * hdr.n_runs_max + i) * hdr.centroid_bytes);
+            for (int gq = 0; gq < G; ++gq) {
+                const float * qg = (const float *) (base + L.q + (size_t) (kvh * G + gq) * o.d * 4);
+                double dot = 0; for (int d = 0; d < o.d; ++d) dot += (double) qg[d] * ggml_fp16_to_fp32(c[d]);
+                best = std::max(best, dot);
+            }
+            sc.push_back({ best, i });
+        }
+        std::sort(sc.begin(), sc.end(), [](auto & a, auto & b) { return a.first > b.first; });
+        std::vector<int> sel = { 0 }; uint32_t cum = 0; int taken = 0;
+        for (auto & p : sc) {
+            const uint32_t n = (uint32_t) runs[p.second].second;
+            if (cum + n > budget_rows && taken > 0) break;
+            cum += n; taken++; sel.push_back(p.second);
+            if (cum >= budget_rows) break;
+        }
+        return sel;
+    };
+    auto read_echo_blocks = [&](int kvh) {
+        dc_civac(lb + hdr.off_echo_sel, (size_t) o.nkvh * hdr.host_sel_stride);
+        const uint8_t * e = lb + hdr.off_echo_sel + (size_t) kvh * hdr.host_sel_stride;
+        const uint32_t n = *(const uint32_t *) e;
+        std::vector<htp_fa_cluster_blk> b((const htp_fa_cluster_blk *) (e + 128), (const htp_fa_cluster_blk *) (e + 128) + std::min<uint32_t>(n, hdr.n_pages_max + hdr.n_runs_max));
+        return b;
+    };
+
+    struct arm_res { stat_acc wall, usec, axi; double worst = 0; };
+    auto run_arm = [&](const char * name, bool on, arm_res & r) {
+        set_mode(on);
+        for (int it = -1; it < o.iters; ++it) {
+            memset(base + L.dst, 0, (size_t) o.nh * o.d * 4);
+            g_prof_lines.clear();
+            const uint64_t t0 = cnt_now();
+            ggml_backend_graph_compute(be, g);
+            const uint64_t t1 = cnt_now();
+            dc_civac(base + L.dst, (size_t) o.nh * o.d * 4);
+            if (it < 0) continue;
+            r.wall.add(ticks_us((double) (t1 - t0)));
+            double us = 0, ax = 0;
+            if (prof_last(&us, &ax)) { r.usec.add(us); r.axi.add(ax); }
+        }
+        double worst = 0; size_t rows_att = 0; int sym = 0;
+        for (int h = 0; h < o.nh; ++h) {
+            const int kvh = h / G;
+            std::vector<std::pair<int, bool>> keys;
+            if (on) {
+                auto blocks = read_echo_blocks(kvh);
+                std::set<int> dev_runs;
+                for (auto & b : blocks) {
+                    for (uint32_t r = b.row; r < (uint32_t) b.row + b.bsz; ++r) keys.push_back({ (int) pos_map[(size_t) kvh * rows_max + r], false });
+                    for (int i = 0; i < n_runs; ++i) if ((int) b.row >= runs[i].first && (int) b.row < runs[i].first + runs[i].second) dev_runs.insert(i);
+                }
+                for (int p = covered_end; p < o.kv; ++p) keys.push_back({ p, true });
+                if (h % G == 0) {
+                    rows_att += keys.size();
+                    std::vector<int> hs = host_select(kvh); std::set<int> host_runs(hs.begin(), hs.end());
+                    std::vector<int> diff; std::set_symmetric_difference(host_runs.begin(), host_runs.end(), dev_runs.begin(), dev_runs.end(), std::back_inserter(diff));
+                    sym += (int) diff.size();
+                }
+            } else {
+                for (int p = 0; p < o.kv; ++p) keys.push_back({ p, true });
+            }
+            std::vector<double> ref;
+            ref_attn_keys(o, base, L, h, keys, ref);
+            const float * out = (const float *) (base + L.dst + (size_t) h * o.d * 4);
+            for (int dd = 0; dd < o.d; ++dd) worst = std::max(worst, fabs((double) out[dd] - ref[dd]));
+        }
+        r.worst = worst;
+        const size_t bytes = on ? rows_att * 2 * row_bytes : (size_t) o.kv * o.nkvh * 2 * row_bytes;
+        const double gbs = r.usec.empty() ? 0.0 : bytes / (r.usec.med() * 1e-6) / 1e9;
+        printf("  %-10s graph_compute med %7.1f us | FA op med %7.1f us | %6.2f MB -> %5.1f GB/s | max|err| %.2e %s%s\n",
+               name, r.wall.med(), r.usec.med(), bytes / 1048576.0, gbs, worst, worst < 2e-2 ? "OK" : "MISMATCH",
+               on ? (std::string(" | rows attended ") + std::to_string(rows_att / o.nkvh) + "/head, run set vs host greedy: sym diff " + std::to_string(sym)).c_str() : "");
+    };
+    arm_res dense, sel;
+    run_arm("dense", false, dense);
+    run_arm("runs", true, sel);
+    ggml_free(ctx);
+    return (dense.worst < 2e-2 && sel.worst < 2e-2) ? 0 : 2;
+}
+
 static int run_cluster(const options & o, ggml_backend_t be, ggml_backend_buffer_t buf, uint8_t * base, const layout & L,
                        const htp_fa_cluster_header & hdr, size_t shadow_bytes) {
     const int W = o.window;
@@ -730,7 +922,8 @@ int main(int argc, char ** argv) {
     size_t shadow_bytes = 0;
     if (o.cluster) {
         // one layer's shadow at the front of the buffer; the positional data moves up behind it
-        shadow_bytes = (size_t) htp_fa_cluster_layout_ex(&shadow_hdr, 1, (uint32_t) o.kv, (uint32_t) o.nkvh, (uint32_t) o.d, (uint32_t) o.page_keys, HTP_FA_CLUSTER_HDR_HOST_ROWS | (o.inplace ? HTP_FA_CLUSTER_HDR_INPLACE : 0u));
+        shadow_bytes = (size_t) htp_fa_cluster_layout_v2(&shadow_hdr, 1, (uint32_t) o.kv, (uint32_t) o.nkvh, (uint32_t) o.d, (uint32_t) o.page_keys, (uint32_t) o.csize,
+                                                         HTP_FA_CLUSTER_HDR_HOST_ROWS | (o.inplace ? HTP_FA_CLUSTER_HDR_INPLACE : 0u) | (o.runs ? HTP_FA_CLUSTER_HDR_RUNS : 0u));
         shadow_bytes = ((shadow_bytes + (1 << 20) - 1) >> 20) << 20;
         L.q += shadow_bytes; L.mask += shadow_bytes; L.dst += shadow_bytes; L.parts += shadow_bytes; L.k += shadow_bytes;
     }
@@ -768,7 +961,7 @@ int main(int argc, char ** argv) {
     }
 
     if (o.cluster) {
-        const int rc = run_cluster(o, be, buf, base, L, shadow_hdr, shadow_bytes);
+        const int rc = o.runs ? run_cluster_runs(o, be, buf, base, L, shadow_hdr, shadow_bytes) : run_cluster(o, be, buf, base, L, shadow_hdr, shadow_bytes);
         ggml_backend_buffer_free(buf); ggml_backend_free(be);
         return rc;
     }

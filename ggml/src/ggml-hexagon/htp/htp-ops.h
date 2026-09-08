@@ -177,7 +177,7 @@ enum htp_sync_probe_rec {
 #define HTP_FA_CLUSTER_OPP_WINDOW   14     // op_params[14]: recent window W (keys) always attended densely
 #define HTP_FA_CLUSTER_OPP_FLAGS    15     // op_params[15]: HTP_FA_CLUSTER_FLAG_*
 #define HTP_FA_CLUSTER_MAGIC        0x434c4b56u
-#define HTP_FA_CLUSTER_VERSION      1u
+#define HTP_FA_CLUSTER_VERSION      2u
 #define HTP_FA_CLUSTER_FLAG_DESC1D      (1u << 0)              // fetch shadow pages with one 1D descriptor (else 64 x 256 B rows)
 #define HTP_FA_CLUSTER_FLAG_NSLOTS(f)   (((f) >> 1) & 7u)      // log2 of the staging slots per thread; 0 = default (2)
 #define HTP_FA_CLUSTER_FLAG_ECHO        (1u << 4)              // write the lists the kernel used into echo_sel
@@ -192,7 +192,24 @@ enum htp_sync_probe_rec {
                                                // (host writes hdir only; the DSP owns the directory)
 #define HTP_FA_CLUSTER_HDR_HOST_ROWS (1u << 2) // header.flags: the kernel never uses pages beyond hdir.rows_valid (host-written before
                                                // each graph; a reset or rewind lowers it synchronously while the sidecar catches up)
+#define HTP_FA_CLUSTER_HDR_RUNS     (1u << 3)  // header.flags: the selection unit is a whole variable-size cluster -- a run of rows in
+                                               // cluster order (off_runs table); the kernel takes runs whole until a row budget
+#define HTP_FA_CLUSTER_RUN_FORCED   (1u << 0)  // run.flags: always attended (the sink tokens), not charged to the budget
 #define HTP_FA_CLUSTER_MAX_LAYERS   128
+
+// One cluster of one KV head (runs mode): rows [row_first, row_first + n_rows) of the head's shadow rows.
+struct htp_fa_cluster_run {
+    uint32_t row_first;
+    uint16_t n_rows;
+    uint16_t flags;
+};
+
+// One DMA block of a selected run (the kernel's per-head list in runs mode; also the echo format).
+struct htp_fa_cluster_blk {
+    uint32_t row;
+    uint16_t bsz;
+    uint16_t pad;
+};
 #define HTP_FA_CLUSTER_MAX_CHUNKS   256
 #define HTP_FA_CLUSTER_MAX_HEADS    64
 #define HTP_FA_CLUSTER_MAX_SLOTS    8      // staging ring depth cap (per thread)
@@ -204,7 +221,7 @@ struct htp_fa_cluster_header {
     uint32_t magic, version, n_layers, kv_size;
     uint32_t n_kv_heads, D, page_keys, page_bytes;      // page_bytes = page_keys * D * 2
     uint32_t n_pages_max, chunk_keys, max_chunks, flags;
-    uint32_t centroid_bytes, host_sel_stride, pad0, pad1;
+    uint32_t centroid_bytes, host_sel_stride, avg_cluster, n_runs_max;   // runs mode: average cluster size, run-table entries per head
     uint64_t layer0_off, layer_stride, hetero_off;      // hetero_off: 0 = no hetero control region
     // per-layer sub-region offsets, bytes from the layer base (all 128-B aligned, pages 16 KB aligned)
     uint64_t off_chunks;      // [max_chunks] x struct htp_fa_cluster_chunk
@@ -213,8 +230,9 @@ struct htp_fa_cluster_header {
     uint64_t off_centroids;   // [n_kv_heads][n_pages_max] x f16[D] (centroid_bytes rows)
     uint64_t off_pos_map;     // [n_kv_heads][n_pages_max] x uint32_t[page_keys]: positional row of each key
     uint64_t off_n_valid;     // [n_pages_max] x uint16_t (reserved: pages are full in v1)
-    uint64_t off_k_pages;     // [n_kv_heads][n_pages_max] x [page_keys][D] f16
+    uint64_t off_k_pages;     // [n_kv_heads][n_pages_max] x [page_keys][D] f16  (runs mode: [n_kv_heads][kv_size] rows in cluster order)
     uint64_t off_v_pages;     // same
+    uint64_t off_runs;        // runs mode: [n_kv_heads][n_runs_max] x struct htp_fa_cluster_run (centroids are per run in that mode)
 };
 
 // Per-layer directory entry @ HTP_FA_CLUSTER_DIR_OFF + il * HTP_FA_CLUSTER_DIR_STRIDE.
@@ -245,13 +263,20 @@ struct htp_fa_cluster_chunk {
 // aligned, page regions 16 KB aligned, layers 64 KB aligned.
 static inline uint64_t htp_fa_cluster_align(uint64_t x, uint64_t a) { return (x + a - 1) / a * a; }
 
-static inline uint64_t htp_fa_cluster_layout_ex(struct htp_fa_cluster_header * h, uint32_t n_layers, uint32_t kv_size,
-                                                uint32_t n_kv_heads, uint32_t D, uint32_t page_keys, uint32_t hdr_flags) {
+static inline uint64_t htp_fa_cluster_layout_v2(struct htp_fa_cluster_header * h, uint32_t n_layers, uint32_t kv_size,
+                                                uint32_t n_kv_heads, uint32_t D, uint32_t page_keys, uint32_t avg_cluster, uint32_t hdr_flags) {
     memset(h, 0, sizeof(*h));
     const int inplace = (hdr_flags & HTP_FA_CLUSTER_HDR_INPLACE) != 0;
+    const int runs    = (hdr_flags & HTP_FA_CLUSTER_HDR_RUNS) != 0;
     h->flags       = hdr_flags;
+    if (runs) {
+        page_keys = HTP_FA_CLUSTER_PAGE_KEYS;   // rows are addressed individually; 64 keeps the row region 16 KB aligned
+    }
     if (page_keys != 16 && page_keys != 32 && page_keys != 64) {
         page_keys = HTP_FA_CLUSTER_PAGE_KEYS;
+    }
+    if (avg_cluster < 4) {
+        avg_cluster = 4;
     }
     h->magic       = HTP_FA_CLUSTER_MAGIC;
     h->version     = HTP_FA_CLUSTER_VERSION;
@@ -264,20 +289,31 @@ static inline uint64_t htp_fa_cluster_layout_ex(struct htp_fa_cluster_header * h
     h->n_pages_max = (kv_size + page_keys - 1) / page_keys;
     h->chunk_keys  = 1024;
     h->max_chunks  = HTP_FA_CLUSTER_MAX_CHUNKS;
+    h->avg_cluster = runs ? avg_cluster : page_keys;
+    // runs: one entry per cluster plus slack for the forced sink run and a short tail run per chunk; multiple of 16 keeps
+    // every head's table 128-B aligned
+    h->n_runs_max  = runs ? (uint32_t) htp_fa_cluster_align((kv_size + avg_cluster - 1) / avg_cluster + 2ull * HTP_FA_CLUSTER_MAX_CHUNKS, 16) : 0;
+    const uint64_t n_units = runs ? h->n_runs_max : h->n_pages_max;   // descriptor rows per head
     h->centroid_bytes  = (uint32_t) htp_fa_cluster_align((uint64_t) D * 2, 128);
-    h->host_sel_stride = (uint32_t) htp_fa_cluster_align(128 + 2ull * h->n_pages_max, 128);
+    h->host_sel_stride = (uint32_t) htp_fa_cluster_align(128 + (runs ? 8ull * (h->n_pages_max + h->n_runs_max) : 2ull * h->n_pages_max), 128);
     uint64_t off = 0;
     h->off_chunks    = off;                            off += (uint64_t) h->max_chunks * sizeof(struct htp_fa_cluster_chunk);
     h->off_host_sel  = htp_fa_cluster_align(off, 128); off  = h->off_host_sel  + (uint64_t) n_kv_heads * h->host_sel_stride;
     h->off_echo_sel  = htp_fa_cluster_align(off, 128); off  = h->off_echo_sel  + (uint64_t) n_kv_heads * h->host_sel_stride;
-    h->off_centroids = htp_fa_cluster_align(off, 128); off  = h->off_centroids + (uint64_t) n_kv_heads * h->n_pages_max * h->centroid_bytes;
+    h->off_centroids = htp_fa_cluster_align(off, 128); off  = h->off_centroids + (uint64_t) n_kv_heads * n_units * h->centroid_bytes;
     h->off_pos_map   = htp_fa_cluster_align(off, 128); off  = h->off_pos_map   + (inplace ? 0 : (uint64_t) n_kv_heads * h->n_pages_max * page_keys * 4);
     h->off_n_valid   = htp_fa_cluster_align(off, 128); off  = h->off_n_valid   + (inplace ? 0 : htp_fa_cluster_align((uint64_t) h->n_pages_max * 2, 128));
     h->off_k_pages   = htp_fa_cluster_align(off, inplace ? 128 : 16384); off = h->off_k_pages + (inplace ? 0 : (uint64_t) n_kv_heads * h->n_pages_max * h->page_bytes);
     h->off_v_pages   = htp_fa_cluster_align(off, inplace ? 128 : 16384); off = h->off_v_pages + (inplace ? 0 : (uint64_t) n_kv_heads * h->n_pages_max * h->page_bytes);
+    h->off_runs      = htp_fa_cluster_align(off, 128); off  = h->off_runs + (runs ? (uint64_t) n_kv_heads * h->n_runs_max * sizeof(struct htp_fa_cluster_run) : 0);
     h->layer_stride  = htp_fa_cluster_align(off, 65536);
     h->layer0_off    = htp_fa_cluster_align(HTP_FA_CLUSTER_DIR_OFF + (uint64_t) n_layers * HTP_FA_CLUSTER_DIR_STRIDE, 65536);
     return h->layer0_off + (uint64_t) n_layers * h->layer_stride;
+}
+
+static inline uint64_t htp_fa_cluster_layout_ex(struct htp_fa_cluster_header * h, uint32_t n_layers, uint32_t kv_size,
+                                                uint32_t n_kv_heads, uint32_t D, uint32_t page_keys, uint32_t hdr_flags) {
+    return htp_fa_cluster_layout_v2(h, n_layers, kv_size, n_kv_heads, D, page_keys, page_keys, hdr_flags);
 }
 
 static inline uint64_t htp_fa_cluster_layout(struct htp_fa_cluster_header * h, uint32_t n_layers, uint32_t kv_size,
