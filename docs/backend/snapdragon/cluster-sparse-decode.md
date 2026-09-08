@@ -542,7 +542,9 @@ unchanged (1751-1767 vs 1754-1762 t/s). In-place pages cost the same as shadow p
 (d4096, 64-key 25%: 26.1-26.2 vs 25.6-26.0).
 
 At 16k, decode-mode perplexity over one 16384-token context of `corpus16k.txt` (a concatenation, so
-the absolute value is low): 16-key pages at 6.2% = 3.794; dense and 64-key 25% = PPL16K_PENDING.
+the absolute value is low): dense 3.781, 16-key pages at 6.2% 3.794 (+0.3%, reading ~7% of the
+context, decoding 1.95x faster), 64-key pages at 25% 3.812 (+0.8%). The budget that holds at 4k
+holds at 16k.
 
 ### Status
 
