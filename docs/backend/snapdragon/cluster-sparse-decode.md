@@ -686,6 +686,24 @@ bounds (16-key) > positional pages with means > page-cut clusters, and the earli
 "positional pages are good enough" holds for perplexity and for retrieval at 25%, but not for
 retrieval at the budgets where the speedup lives.
 
+Cluster size and descriptor for whole clusters, all at the 12.5% budget (14.9% of keys read):
+
+| task | dense | avg cluster 16 | avg cluster 32 | avg cluster 64 | avg cluster 32, min/max bounds |
+|---|--:|--:|--:|--:|--:|
+| niah_single_1 / 2 / 3 | 100 / 100 / 98 | 100 / 100 / 100 | 100 / 100 / 100 | 100 / 99 / 100 | 100 / 91 / 53 |
+| niah_multikey_1 / 2 / 3 | 100 / 99 / 98 | 100 / 99 / 97 | 100 / 99 / 98 | 100 / 96 / 96 | 89 / 97 / 78 |
+| niah_multivalue / multiquery | 99.2 / 100 | 99.2 / 100 | 99.2 / 99.8 | 99.2 / 99.5 | 75.5 / 79.8 |
+| vt | 93.4 | 94.0 | 93.0 | 95.0 | 92.2 |
+| cwe / fwe | 96.0 / 63.7 | 96.3 / 63.3 | 96.1 / 62.7 | 94.2 / 62.3 | 71.8 / 54.0 |
+| qa_1 / qa_2 | 49 / 37 | 49 / 37 | 49 / 38 | 47 / 36 | CVAR_MM_QA |
+| **average** | **87.2** | **87.3** | **87.3** | **86.5** | CVAR_MM_AVG |
+
+Cluster sizes 16 and 32 are equivalent and at dense level; 64 costs about a point (a few clusters
+too coarse for the budget). Per-cluster min/max bounds are the wrong descriptor for semantic
+clusters (80): a cluster's envelope is tight in the dimensions that define it and wide in the rest,
+so the bound over-estimates almost every cluster and the ranking degrades. The centroid is the
+descriptor for clusters, the bound is the descriptor for positional pages.
+
 **What this means for the device.** Whole-cluster selection needs the keys of a cluster to be
 fetchable as one unit, and that is exactly what the cluster-ordered **shadow** layout provides: a
 cluster is a contiguous run of rows in cluster order, one variable-length 2D descriptor fetches it,
