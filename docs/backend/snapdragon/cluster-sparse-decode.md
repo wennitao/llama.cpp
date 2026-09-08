@@ -695,12 +695,12 @@ Cluster size and descriptor for whole clusters, all at the 12.5% budget (14.9% o
 | niah_multivalue / multiquery | 99.2 / 100 | 99.2 / 100 | 99.2 / 99.8 | 99.2 / 99.5 | 75.5 / 79.8 |
 | vt | 93.4 | 94.0 | 93.0 | 95.0 | 92.2 |
 | cwe / fwe | 96.0 / 63.7 | 96.3 / 63.3 | 96.1 / 62.7 | 94.2 / 62.3 | 71.8 / 54.0 |
-| qa_1 / qa_2 | 49 / 37 | 49 / 37 | 49 / 38 | 47 / 36 | CVAR_MM_QA |
-| **average** | **87.2** | **87.3** | **87.3** | **86.5** | CVAR_MM_AVG |
+| qa_1 / qa_2 | 49 / 37 | 49 / 37 | 49 / 38 | 47 / 36 | 44 / 32 |
+| **average** | **87.2** | **87.3** | **87.3** | **86.5** | **73.6** |
 
 Cluster sizes 16 and 32 are equivalent and at dense level; 64 costs about a point (a few clusters
 too coarse for the budget). Per-cluster min/max bounds are the wrong descriptor for semantic
-clusters (80): a cluster's envelope is tight in the dimensions that define it and wide in the rest,
+clusters (73.6): a cluster's envelope is tight in the dimensions that define it and wide in the rest,
 so the bound over-estimates almost every cluster and the ranking degrades. The centroid is the
 descriptor for clusters, the bound is the descriptor for positional pages.
 
