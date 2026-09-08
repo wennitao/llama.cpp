@@ -719,6 +719,43 @@ or clamped synchronously, and the memory problem (a second copy of the K/V of th
 to be paid for with Q8 pages or a partial shadow of the oldest context. The GPU sidecar that
 clusters during prefill is the piece that already exists.
 
+## Stage 8 -- whole-cluster selection on the HTP (built 2026-09-08)
+
+`GGML_HEXAGON_CLUSTER_RUNS=1` (with `GGML_HEXAGON_CLUSTER_AVG=32`, `_ATTN=<permille>,64`, sinks default
+4): the device implementation of the policy that won on RULER. Three things are fixed by
+construction: the sink keys (positions 0-3) are always attended, the recent window (64..127 keys
+plus the not-yet-clustered tail) is attended densely from llama's cache, and only the keys in
+between are ever clustered or skipped.
+
+- **Layout** (`HTP_FA_CLUSTER_HDR_RUNS`, header v2). The shadow keeps each head's K and V rows in
+  cluster order, one row per position of the covered range (rows [pos_begin, pos_end) of a chunk),
+  plus a **run table** per head (`struct htp_fa_cluster_run {row_first, n_rows, flags}`, one entry
+  per cluster, in cluster order) and one f16 **centroid per run**. The chunk table's unit fields
+  count runs. No fixed pages: a cluster is a contiguous run of rows and is fetched as such.
+- **Sidecar** (`cluster_run_chunk_runs`). Per prefill chunk of 1024 keys and per KV head: the sink
+  keys of chunk 0 are copied first as a *forced* run (`HTP_FA_CLUSTER_RUN_FORCED`) and never enter
+  the k-means; the remaining keys are clustered on the GPU (k-means++ init on a subsample, 8 Lloyd
+  iterations, C = keys / 32 clusters), sorted by (cluster, distance), gathered into the rows in
+  that order; run entries and centroids (mean of each run's keys) follow; publish order is rows,
+  pos_map, runs, centroids, chunk entry, unit count, covered_end. Positional mode (`_POSITIONAL=1`)
+  gives runs of 32 consecutive keys for A/B.
+- **Kernel.** The setup accepts chunks whose runs are published and clamped by `rows_valid`;
+  the budget is `density x (candidate rows - forced rows)`. The select pass stages the head's
+  centroids and its run table, scores centroids as before (rx32 dot, max over the GQA group), then
+  runs a greedy fill: forced runs score +inf and are free, empty runs never score, runs are taken
+  in score order while they fit the row budget (the first non-forced run always does), and each
+  taken run is expanded into 64-row DMA blocks `(row, bsz)`. The dec pass walks the block list
+  (contiguous shadow rows, no mask) followed by the dense tail; the staging ring and merge are
+  unchanged. Echo writes the block list for the tool.
+- **Op-level exactness** (`llama-hetero-decode-attn --cluster --runs`, synthetic variable-size runs
+  over a random permutation, sink run forced): max|err| 2.5e-5 .. 4.7e-5 for avg 16/32, budgets
+  6-100%, kv 4k and 16k; the kernel's greedy run set equals the host's f32 greedy set exactly.
+  FA op at kv 4096: 178 us at 12% (535 rows/head attended), 136 us at 6% (295 rows), 274 us at 25%,
+  against 571 us dense; at kv 16384, 6%: 381 us against 2108 us. The 100% arm costs 800 us (every
+  run a separate partial block: the price of variable units when nothing is skipped).
+
+RUNS_MODEL_RESULTS
+
 ### Status
 
 Built and measured end to end: page-list HVX decode kernel (Stage 1), GPU chunk-local k-means

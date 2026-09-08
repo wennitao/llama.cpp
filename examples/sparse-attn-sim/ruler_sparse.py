@@ -18,7 +18,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, 
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, sdpa_mask
 
-CFG = dict(mode="dense", page=64, density=0.25, window=64, sink=4, iters=8, desc="mean", csize=32, kiters=20)
+CFG = dict(mode="dense", page=64, density=0.25, window=64, sink=4, iters=8, desc="mean", csize=32, kiters=20, cchunk=0)
 STATE = {}       # layer_idx -> dict(perm=[Hkv, n0] LongTensor or None, n0=int)
 STATS = dict(steps=0, keys_attended=0, keys_total=0)
 
@@ -90,11 +90,25 @@ def sparse_attention_forward(module, query, key, value, attention_mask, scaling=
             # recent window are never clustered -- variable-size clusters, centroid + per-cluster bounds
             W, sink = CFG["window"], CFG["sink"]
             ds0 = ((n - W) // 64) * 64 if n > W else 0
+            if CFG["cchunk"] > 0:
+                ds0 = (ds0 // CFG["cchunk"]) * CFG["cchunk"]                         # complete chunks only (device: chunk-local clustering)
             n_mid = ds0 - sink
             if n_mid >= 2 * CFG["csize"]:
                 Km = key[0, :, sink:ds0].float()                                        # [Hkv, n_mid, D]
-                C = max(2, round(n_mid / CFG["csize"]))
-                labels, cent = kmeans_labels(Km, C, CFG["kiters"], seed=1234 + li)
+                if CFG["cchunk"] > 0:
+                    # cluster each chunk separately (the first chunk is short by the sink keys), concatenate labels/centroids
+                    labs, cents, base = [], [], 0
+                    b0 = 0
+                    while b0 < n_mid:
+                        b1 = min(n_mid, (b0 + sink) // CFG["cchunk"] * CFG["cchunk"] + CFG["cchunk"] - sink) if b0 == 0 else min(n_mid, b0 + CFG["cchunk"])
+                        Kc = Km[:, b0:b1]
+                        Cc = max(1, round((b1 - b0) / CFG["csize"]))
+                        lc, cc = kmeans_labels(Kc, Cc, CFG["kiters"], seed=1234 + li + b0)
+                        labs.append(lc + base); cents.append(cc); base += Cc; b0 = b1
+                    labels, cent, C = torch.cat(labs, 1), torch.cat(cents, 1), base
+                else:
+                    C = max(2, round(n_mid / CFG["csize"]))
+                    labels, cent = kmeans_labels(Km, C, CFG["kiters"], seed=1234 + li)
                 sizes = F.one_hot(labels, C).sum(1)                                   # [Hkv, C]
                 idx = labels[..., None].expand(-1, -1, D)
                 cmin = torch.full_like(cent, float("inf")).scatter_reduce(1, idx, Km, reduce="amin")
@@ -209,6 +223,7 @@ def main():
     ap.add_argument("--mode", default="dense", choices=["dense", "positional", "cluster", "cluster_var"])
     ap.add_argument("--csize", type=int, default=32, help="cluster_var: average cluster size (clusters = middle keys / csize)")
     ap.add_argument("--kiters", type=int, default=20, help="cluster_var: k-means iterations")
+    ap.add_argument("--cchunk", type=int, default=0, help="cluster_var: chunk-local clustering with this chunk size (0 = whole prompt)")
     ap.add_argument("--page", type=int, default=64)
     ap.add_argument("--density", type=float, default=0.25)
     ap.add_argument("--window", type=int, default=64)
@@ -219,7 +234,7 @@ def main():
     ap.add_argument("--chat", action="store_true", help="wrap the prompt in the chat template (thinking off)")
     ap.add_argument("--full_gen", action="store_true", help="generate the full token budget (RULER default) instead of stopping after the first answer line")
     a = ap.parse_args()
-    CFG.update(mode=a.mode, page=a.page, density=a.density, window=a.window, sink=a.sink, desc=a.desc, csize=a.csize, kiters=a.kiters)
+    CFG.update(mode=a.mode, page=a.page, density=a.density, window=a.window, sink=a.sink, desc=a.desc, csize=a.csize, kiters=a.kiters, cchunk=a.cchunk)
     os.makedirs(a.out_dir, exist_ok=True)
 
     tok = AutoTokenizer.from_pretrained(a.model)
