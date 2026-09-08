@@ -18,7 +18,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, 
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, sdpa_mask
 
-CFG = dict(mode="dense", page=64, density=0.25, window=64, sink=4, iters=8, desc="mean")
+CFG = dict(mode="dense", page=64, density=0.25, window=64, sink=4, iters=8, desc="mean", csize=32, kiters=20)
 STATE = {}       # layer_idx -> dict(perm=[Hkv, n0] LongTensor or None, n0=int)
 STATS = dict(steps=0, keys_attended=0, keys_total=0)
 
@@ -26,6 +26,25 @@ STATS = dict(steps=0, keys_attended=0, keys_total=0)
 def repeat_kv(x, G):
     B, H, n, D = x.shape
     return x[:, :, None].expand(B, H, G, n, D).reshape(B, H * G, n, D)
+
+
+@torch.no_grad()
+def kmeans_labels(K, C, iters, seed):
+    """Plain k-means on K [Hkv, n, D] (f32). Returns labels [Hkv, n], centroids [Hkv, C, D]."""
+    Hkv, n, D = K.shape
+    g = torch.Generator(device=K.device).manual_seed(seed)
+    init = torch.stack([torch.randperm(n, generator=g, device=K.device)[:C] for _ in range(Hkv)])
+    mu = torch.gather(K, 1, init[..., None].expand(-1, -1, D)).clone()
+    k2 = (K * K).sum(-1, keepdim=True)
+    labels = None
+    for _ in range(iters):
+        d = k2 - 2 * K @ mu.transpose(1, 2) + (mu * mu).sum(-1)[:, None, :]
+        labels = d.argmin(-1)
+        onehot = F.one_hot(labels, C).to(K.dtype)
+        cnt = onehot.sum(1)
+        new_mu = onehot.transpose(1, 2) @ K
+        mu = torch.where((cnt > 0)[..., None], new_mu / cnt.clamp(min=1)[..., None], mu)
+    return labels, mu
 
 
 @torch.no_grad()
@@ -66,6 +85,23 @@ def sparse_attention_forward(module, query, key, value, attention_mask, scaling=
             n0 = (ds0 // PK) * PK
             perm = kmeans_order(key[0, :, :n0].float(), PK, CFG["iters"], CFG["sink"], seed=1234 + li) if n0 >= 2 * PK else None
             STATE[li] = dict(perm=perm, n0=n0 if perm is not None else 0)
+        elif q_len > 1 and CFG["mode"] == "cluster_var":
+            # whole-cluster selection (ClusterKV-style): k-means over the middle keys only -- sinks and the
+            # recent window are never clustered -- variable-size clusters, centroid + per-cluster bounds
+            W, sink = CFG["window"], CFG["sink"]
+            ds0 = ((n - W) // 64) * 64 if n > W else 0
+            n_mid = ds0 - sink
+            if n_mid >= 2 * CFG["csize"]:
+                Km = key[0, :, sink:ds0].float()                                        # [Hkv, n_mid, D]
+                C = max(2, round(n_mid / CFG["csize"]))
+                labels, cent = kmeans_labels(Km, C, CFG["kiters"], seed=1234 + li)
+                sizes = F.one_hot(labels, C).sum(1)                                   # [Hkv, C]
+                idx = labels[..., None].expand(-1, -1, D)
+                cmin = torch.full_like(cent, float("inf")).scatter_reduce(1, idx, Km, reduce="amin")
+                cmax = torch.full_like(cent, float("-inf")).scatter_reduce(1, idx, Km, reduce="amax")
+                STATE[li] = dict(perm=None, n0=ds0, labels=labels, cent=cent, cmin=cmin, cmax=cmax, sizes=sizes)
+            else:
+                STATE[li] = dict(perm=None, n0=0)
         elif q_len > 1:
             STATE[li] = dict(perm=None, n0=0)
         return out.transpose(1, 2).contiguous(), None
@@ -79,6 +115,33 @@ def sparse_attention_forward(module, query, key, value, attention_mask, scaling=
         STATS["steps"] += 1; STATS["keys_attended"] += n * Hkv; STATS["keys_total"] += n * Hkv
         return out.transpose(1, 2).contiguous(), None
     st = STATE.get(li, dict(perm=None, n0=0))
+    if CFG["mode"] == "cluster_var":
+        sink = CFG["sink"]
+        if "labels" not in st:
+            out = F.scaled_dot_product_attention(query, repeat_kv(key, G), repeat_kv(value, G), scale=scaling)
+            STATS["steps"] += 1; STATS["keys_attended"] += n * Hkv; STATS["keys_total"] += n * Hkv
+            return out.transpose(1, 2).contiguous(), None
+        n0 = st["n0"]
+        q = query[0, :, 0].float().view(Hkv, G, D)
+        if CFG["desc"] == "minmax":
+            sc = torch.maximum(q[:, :, None, :] * st["cmin"][:, None], q[:, :, None, :] * st["cmax"][:, None]).sum(-1).amax(1)
+        else:
+            sc = torch.einsum("hgd,hcd->hgc", q, st["cent"]).amax(1)                    # [Hkv, C]
+        order = sc.argsort(dim=1, descending=True)
+        sizes_sorted = st["sizes"].gather(1, order)
+        cum = sizes_sorted.cumsum(1)
+        budget = dens * (n0 - sink)
+        take = cum <= budget
+        take[:, 0] = True                                                              # at least the best cluster
+        sel_c = torch.zeros_like(take).scatter(1, order, take)                          # [Hkv, C]
+        mask = torch.zeros(Hkv, n, dtype=torch.bool, device=k.device if False else key.device)
+        mask[:, :sink] = True                                                          # sinks, always
+        mask[:, sink:n0] = sel_c.gather(1, st["labels"])                                # whole clusters
+        mask[:, n0:] = True                                                            # unclustered tail + window
+        STATS["steps"] += 1; STATS["keys_attended"] += int(mask.sum()); STATS["keys_total"] += n * Hkv
+        am = mask[:, None, :].expand(Hkv, G, n).reshape(1, H, 1, n)
+        out = F.scaled_dot_product_attention(query, repeat_kv(key, G), repeat_kv(value, G), attn_mask=am, scale=scaling)
+        return out.transpose(1, 2).contiguous(), None
     k = key[0]                                                                         # [Hkv, n, D]
     if st["perm"] is not None:
         n0 = min(st["n0"], ds)
@@ -143,7 +206,9 @@ def main():
     ap.add_argument("--data_dir", required=True, help="RULER data dir: <data_dir>/<task>/validation.jsonl")
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--tasks", default="niah_single_1,niah_single_2,niah_single_3,niah_multikey_1,niah_multikey_2,niah_multikey_3,niah_multivalue,niah_multiquery,vt,cwe,fwe,qa_1,qa_2")
-    ap.add_argument("--mode", default="dense", choices=["dense", "positional", "cluster"])
+    ap.add_argument("--mode", default="dense", choices=["dense", "positional", "cluster", "cluster_var"])
+    ap.add_argument("--csize", type=int, default=32, help="cluster_var: average cluster size (clusters = middle keys / csize)")
+    ap.add_argument("--kiters", type=int, default=20, help="cluster_var: k-means iterations")
     ap.add_argument("--page", type=int, default=64)
     ap.add_argument("--density", type=float, default=0.25)
     ap.add_argument("--window", type=int, default=64)
@@ -154,14 +219,14 @@ def main():
     ap.add_argument("--chat", action="store_true", help="wrap the prompt in the chat template (thinking off)")
     ap.add_argument("--full_gen", action="store_true", help="generate the full token budget (RULER default) instead of stopping after the first answer line")
     a = ap.parse_args()
-    CFG.update(mode=a.mode, page=a.page, density=a.density, window=a.window, sink=a.sink, desc=a.desc)
+    CFG.update(mode=a.mode, page=a.page, density=a.density, window=a.window, sink=a.sink, desc=a.desc, csize=a.csize, kiters=a.kiters)
     os.makedirs(a.out_dir, exist_ok=True)
 
     tok = AutoTokenizer.from_pretrained(a.model)
     model = AutoModelForCausalLM.from_pretrained(a.model, torch_dtype=torch.bfloat16, attn_implementation="sparse_sim").cuda().eval()
     eos = [tok.eos_token_id] + ([tok.convert_tokens_to_ids("<|im_end|>")] if "<|im_end|>" in tok.get_vocab() else [])
     eos = sorted(set(e for e in eos if e is not None))
-    print(f"mode {a.mode} page {a.page} density {a.density} window {a.window} sink {a.sink} desc {a.desc}; eos {eos}", flush=True)
+    print(f"mode {a.mode} page {a.page} csize {a.csize} density {a.density} window {a.window} sink {a.sink} desc {a.desc}; eos {eos}", flush=True)
 
     for task in a.tasks.split(","):
         path = os.path.join(a.data_dir, task, "validation.jsonl")
