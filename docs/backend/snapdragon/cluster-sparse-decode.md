@@ -795,15 +795,34 @@ RULER emulation clustered the whole prompt. Re-running the emulator with chunk-l
 because chunk-local clustering multiplies the number of "digit clusters" by the number of chunks and
 a fixed budget then cannot take them all. On the device (20 prompts, 64 generated tokens, hot unit)
 the same pattern with a smaller budget: `niah_single_3` 100 for dense and every runs arm;
-`niah_multikey_3` dense 95, runs 12.5% chunk 1024 **85**, runs 6.2% chunk 256 **15**. A 40-prompt
-sweep over budgets and chunk sizes was interrupted by a device swap and is queued.
+`niah_multikey_3` dense 95, runs 12.5% chunk 1024 **85**, runs 6.2% chunk 256 **15**. The 40-prompt sweep over budgets and chunk sizes (unit eb49fb9d, 64 generated tokens, arms run
+back to back on a cool device) separates the two effects:
+
+| arm | score | exact answers |
+|---|--:|--:|
+| dense | 97.5 | 39/40 |
+| whole clusters, 25%, chunk 1024 | **97.5** | 39/40 |
+| whole clusters, 12.5%, chunk 1024 | **97.5** | 39/40 |
+| whole clusters, 6.2%, chunk 1024 | 80.0 | 32/40 |
+| whole clusters, 12.5%, chunk 256 | 70.0 | 28/40 |
+| whole clusters, 6.2%, chunk 256 | 27.5 | 11/40 |
+| in-place positional 16-key pages, 12.5% | 45.0 | 18/40 |
+
+This is the RULER result reproduced on the phone: at a 12.5% budget with 1024-key chunks the device
+retrieves UUIDs exactly as well as dense attention (97.5, 39 of 40 answers exact), while positional
+pages at the same budget reach 45. Both knobs cost quality when tightened, and they compound: 6.2%
+costs 17.5 points, 256-key chunks cost 27.5 points, and together they collapse to 27.5. The dense
+arm is reproducible run to run (95.0 on the same 20 prompts in two sessions on different units);
+the sparse arms move by about 10 points on 20 prompts between sessions because how much of the
+context the sidecar has clustered by the time decoding starts depends on timing, which is why these
+numbers are reported over 40 prompts.
 
 **Recommendation for the device**: whole clusters of 32 keys, centroid scoring, sinks and window
 outside the clustering, 1024-key chunks with the end-of-prefill tail clustered, 12.5% budget, the
-parallel sidecar: at dense perplexity, 1.26x at 4k and 1.24x at 8k on tg64 with retrieval within a
-few points of dense; 6.2% buys another 4-6% of speed and keeps single-needle retrieval but not the
-hardest multi-key case. The chunk size trades retrieval for nothing at d = 4096 (the tail is
-clustered at the end of prefill either way), so keep 1024.
+parallel sidecar. That is dense perplexity (9.06 vs 9.13), dense UUID retrieval (97.5 vs 97.5) and
+1.26x at 4k / 1.24x at 8k on tg64. Neither knob is worth tightening: 6.2% buys 4-6% more speed and
+costs 17.5 points of retrieval, and 256-key chunks buy nothing at all (the end-of-prefill tail is
+clustered either way) while costing 27.5 points.
 
 ### Status
 

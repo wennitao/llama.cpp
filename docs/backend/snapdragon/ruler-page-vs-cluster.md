@@ -149,6 +149,24 @@ Score = max over the GQA group (2 query heads per KV head) of the descriptor sco
   of the shadow (a second copy of the clustered range) to be paid with Q8 pages or a partial
   shadow of the oldest context.
 
+## On the device
+
+The policy was then implemented on the HTP (`GGML_HEXAGON_CLUSTER_RUNS=1`; see
+[cluster-sparse-decode.md](cluster-sparse-decode.md) Stage 8) and the hardest task of this study was
+re-run on the phone: `niah_multikey_3`, 40 prompts, 64 generated tokens, Qwen3-1.7B Q4_0, greedy.
+
+| arm | score | exact answers |
+|---|--:|--:|
+| dense | 97.5 | 39/40 |
+| whole clusters, 12.5% budget, 1024-key chunks | **97.5** | 39/40 |
+| whole clusters, 6.2% budget, 1024-key chunks | 80.0 | 32/40 |
+| whole clusters, 12.5% budget, 256-key chunks | 70.0 | 28/40 |
+| in-place positional 16-key pages, 12.5% budget | 45.0 | 18/40 |
+
+The emulation's central claim holds on the hardware: whole-cluster selection retrieves UUIDs as well
+as dense attention at an eighth of the key budget, where positional pages of the same budget lose
+more than half the answers.
+
 ## Caveats
 
 One model (1.7B, 8 KV heads), one length (4k), 100 samples per task, an emulation rather than
