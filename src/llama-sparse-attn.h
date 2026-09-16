@@ -58,6 +58,82 @@ static inline float llama_sparse_attn_thr() {
     return (c > 0.0f && c < 100.0f) ? c : 0.0f;
 }
 
+// Heterogeneous split: LLAMA_SPARSE_ATTN_CSTAR=<c>, 0 (the default) = off.
+//
+// One 256-query tile is R = BQ/BS fine 64-query sub-blocks, and c(b) counts how many of
+// them picked KV block b. The tile today runs the UNION, i.e. every b with c(b) >= 1.
+// With the split on, only c(b) >= c_star stays on the NPU; a block that just one or two
+// sub-blocks wanted is an EXCEPTION of those sub-blocks and goes to the GPU, which
+// returns its partial through the FLASH_ATTN_EXT fold buffer (src[7]).
+//
+// c_star = 1 is the control arm, not a no-op: the shared list is the whole union again
+// and every exception list is empty, so the GPU side must measure as a no-op. c_star > R
+// would leave nothing shared, so it is rejected here.
+//
+// WHAT THE SPLIT CHANGES NUMERICALLY, because it is easy to assert the wrong thing here.
+// Under the union every row of a tile attends to {b : c(b) >= 1}. Under the split, row j
+// attends to {b : c(b) >= c_star} together with its own exceptions, which is sel_j union
+// {c >= c_star} -- a strict SUBSET of the union whenever some block was wanted by another
+// sub-block and not by j. So c_star > 0 is NOT bit-equal to c_star = 0 and must not be
+// tested as if it were: it moves the policy from the union toward the exact per-sub-block
+// selection, which is a quality change to measure (perplexity, RULER), not a regression.
+// The invariant that DOES hold exactly is c_star = 0: node for node, bit for bit, today.
+//
+// Only threshold mode (LLAMA_SPARSE_ATTN=thr:<c>) has the per-sub-block memberships the
+// split is cut from; fixed-u mode never forms c(b) and ignores this.
+static inline uint32_t llama_sparse_attn_cstar() {
+    const char * s = getenv("LLAMA_SPARSE_ATTN_CSTAR");
+    if (!s) {
+        return 0;
+    }
+    const int v = atoi(s);
+    const int r = LLAMA_SPARSE_ATTN_BQ / LLAMA_SPARSE_ATTN_BS;
+    return (v >= 1 && v <= r) ? (uint32_t) v : 0;   // caller warns on a set-but-rejected value
+}
+
+// Head start for the split: LLAMA_SPARSE_ATTN_HEADSTART=K tiles (256-query block x KV head, KV
+// head 0's tiles first) run the union on the NPU with no GPU work, so the GPU's launch latency
+// lands in their shadow. Measured on device: 6 tiles (~0.6 ms of NPU work) hide the ~0.5 ms
+// transient completely at the deployed operating point. 0 = off.
+static inline uint32_t llama_sparse_attn_headstart() {
+    const char * s = getenv("LLAMA_SPARSE_ATTN_HEADSTART");
+    if (!s) {
+        return 0;
+    }
+    const int v = atoi(s);
+    return v > 0 ? (uint32_t) v : 0;
+}
+
+// Per-(tile, KV head) cap on the exception pairs handed to the GPU (LLAMA_SPARSE_ATTN_GPU_CAP=B,
+// 0 = off). Pairs past the cap rejoin that tile's shared list. Each pair costs the GPU ~12 us and
+// saves the NPU ~3 us per op-tile, so beyond ~4 the GPU falls behind the NPU's pool pass and the
+// NPU waits; the cap keeps every stage's GPU work inside the NPU's shadow with a small head start.
+// Exact-mask experiment: LLAMA_SPARSE_ATTN_EXACT=1 (threshold mode, CSTAR unset) hands the FA op
+// the FULL per-sub-block membership as src[8]; the HMX kernel keeps the 256-query tile and its
+// union list but masks every (32-row group, KV block) the group's sub-block did not select, so the
+// large tile computes exactly the per-64-block policy. The NPU-only arm of the "same pairs" A/B
+// against the bq=64 build and the NPU/GPU split.
+static inline bool llama_sparse_attn_exact() {
+    const char * s = getenv("LLAMA_SPARSE_ATTN_EXACT");
+    return s && atoi(s) > 0;
+}
+
+static inline uint32_t llama_sparse_attn_gpu_cap() {
+    const char * s = getenv("LLAMA_SPARSE_ATTN_GPU_CAP");
+    if (!s) {
+        return 0;
+    }
+    const int v = atoi(s);
+    return v > 0 ? (uint32_t) v : 0;
+}
+
+// Extra in-graph invariant checks for the split. Off by default because each one is a
+// real node in every layer.
+static inline bool llama_sparse_attn_debug() {
+    const char * s = getenv("LLAMA_SPARSE_ATTN_DEBUG");
+    return s && atoi(s) != 0;
+}
+
 // n_kv_blocks the HMX kernel will choose for a given u. Transcribed from
 // hmx_fa_find_chunk_size (ggml/src/ggml-hexagon/htp/flash-attn-ops.h:370+) and checked
 // against the device's own fa-params line at 20 values of u: 20/20 exact.

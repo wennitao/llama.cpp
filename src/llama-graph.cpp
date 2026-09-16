@@ -2717,7 +2717,8 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
         ggml_tensor * bias,
         const llama_kv_cache_context * mctx_cur,
         int il,
-        ggml_tensor ** cnt_out) const {
+        ggml_tensor ** cnt_out,
+        ggml_tensor ** exc_out) const {
     const int64_t bs   = LLAMA_SPARSE_ATTN_BS;
     const int64_t qsub = LLAMA_SPARSE_ATTN_QSUB;
     const int64_t ksub = LLAMA_SPARSE_ATTN_KSUB;
@@ -2727,6 +2728,19 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
     // attention query block and smuggle u in ne[2].
     const bool    thr = bias->ne[3] == 2;
     const int64_t bq  = thr ? bs : LLAMA_SPARSE_ATTN_BQ;
+
+    // The NPU/GPU split is cut from the per-sub-block memberships that only threshold mode
+    // forms, so a misspelled pair of knobs runs the NPU-only path. Say so: a quiet decline
+    // reads exactly like a split that ran and did not pay.
+    if (const char * cs = getenv("LLAMA_SPARSE_ATTN_CSTAR")) {
+        static bool once = false;
+        if (!once && (!thr || llama_sparse_attn_cstar() == 0)) {
+            once = true;
+            LLAMA_LOG_ERROR("sparse-attn: split OFF, LLAMA_SPARSE_ATTN_CSTAR=%s %s (want 1..%d)\n", cs,
+                            !thr ? "needs LLAMA_SPARSE_ATTN=thr:<c>" : "out of range",
+                            LLAMA_SPARSE_ATTN_BQ / LLAMA_SPARSE_ATTN_BS);
+        }
+    }
 
     const int64_t d   = q_cur->ne[0];
     const int64_t Hq  = q_cur->ne[1];
@@ -2796,14 +2810,137 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
         pm = ggml_clamp(ctx0, ggml_add(ctx0, pm, fr), 0.0f, 1.0f);
         cb(pm, "sparse_mem", il);
 
+        // The R fine rows of one attention query block are strided in pm, so this sum IS
+        // c(b): how many of the R 64-query sub-blocks picked block b, f32 integers 0..R.
+        // A tile that straddled the ubatch tail would drop rows here without a word.
+        GGML_ASSERT(NBq % R == 0 && "query tile straddles the ubatch tail");
         ggml_tensor * us = nullptr;
         for (int64_t r = 0; r < R; ++r) {
             ggml_tensor * vr = ggml_view_3d(ctx0, pm, NBk, NBq / R, Hkv,
                                             pm->nb[1] * R, pm->nb[2], (size_t) r * pm->nb[1]);
             us = us ? ggml_add(ctx0, us, vr) : vr;
         }
-        ggml_tensor * um = ggml_clamp(ctx0, us, 0.0f, 1.0f);  // [NBk, NBq/R, Hkv]
+
+        const uint32_t c_star = llama_sparse_attn_cstar();
+
+        // Membership of the list the NPU runs, [NBk, NBq/R, Hkv]. c_star == 0 is the
+        // deployed union, node for node. Otherwise the shared list is c(b) >= c_star, cut
+        // at c_star - 0.5: us is an f32 sum of terms that a 1e-9 wide band of the clamp
+        // above can leave just off 0 or 1, and a midpoint keeps the compare away from
+        // every value the sum can take.
+        ggml_tensor * um = c_star ?
+            ggml_clamp(ctx0, ggml_scale_bias(ctx0, us, BIGF, -((float) c_star - 0.5f) * BIGF), 0.0f, 1.0f) :
+            ggml_clamp(ctx0, us, 0.0f, 1.0f);
+
+        // Head start (LLAMA_SPARSE_ATTN_HEADSTART=K): the first K tiles in the NPU's staged order
+        // (KV head 0's tiles first, then head 1's, ...) run the whole union on the NPU and hand the
+        // GPU nothing, so the GPU's launch and first head land in their shadow. hs[t, h] = 1 for
+        // h * (NBq/R) + t < K; um becomes the union there and the exceptions below vanish.
+        const uint32_t head_start = c_star ? llama_sparse_attn_headstart() : 0;
+        ggml_tensor * hs = nullptr;
+        if (head_start) {
+            // The tile index without ARANGE (which the HTP rejects, and one CPU node per layer splits
+            // the graph): ones from any tensor of the right shape, cumsum -> 1..N, threshold at K.
+            ggml_tensor * ones = ggml_scale_bias(ctx0, ggml_sum_rows(ctx0, us), 0.0f, 1.0f);            // [1, NBq/R, Hkv]
+            ggml_tensor * tid  = ggml_cumsum(ctx0, ggml_reshape_1d(ctx0, ones, (NBq / R) * Hkv));        // 1..N
+            hs = ggml_clamp(ctx0, ggml_scale_bias(ctx0, tid, -BIGF, ((float) head_start + 0.5f) * BIGF), 0.0f, 1.0f);   // tid <= K
+            hs = ggml_reshape_3d(ctx0, hs, 1, NBq / R, Hkv);
+            um = ggml_clamp(ctx0, ggml_add(ctx0, um, ggml_mul(ctx0, ggml_clamp(ctx0, us, 0.0f, 1.0f), hs)), 0.0f, 1.0f);
+        }
         cb(um, "sparse_union", il);
+
+        if (c_star) {
+            // The GPU's half of the split, one list per FINE sub-block:
+            //   em[b, j, t, h] = pm[b, t*R + j, h] AND NOT um[b, t, h]
+            // the blocks sub-block j wanted that the shared list dropped. Cut from the SAME
+            // us as um, so the two are disjoint by construction -- the LSE merge SUMS, so a
+            // block in both lists shifts its own logit by +ln2 and nothing raises a word.
+            //
+            // pm is contiguous [NBk, NBq, Hkv] with fine row t*R + j, so reshaping it to
+            // [NBk, R, NBq/R, Hkv] puts j on dim 1 and the tile on dim 2 -- which is exactly
+            // the axis ggml_mul broadcasts (ne[1] == 1 repeats one shared row over the R
+            // sub-blocks). No gather and no new op.
+            //
+            // pm is re-binarised first: the same 1e-9 band would otherwise let a member
+            // weigh 0.3 and make the count below fractional.
+            ggml_tensor * pmb = ggml_clamp(ctx0, ggml_scale_bias(ctx0, pm, BIGF, -0.5f * BIGF), 0.0f, 1.0f);
+            ggml_tensor * em  = ggml_mul(ctx0,
+                                         ggml_reshape_4d(ctx0, pmb, NBk, R, NBq / R, Hkv),
+                                         ggml_reshape_4d(ctx0, ggml_scale_bias(ctx0, um, -1.0f, 1.0f),
+                                                         NBk, 1, NBq / R, Hkv));
+            if (hs) {
+                em = ggml_mul(ctx0, em, ggml_reshape_4d(ctx0, ggml_scale_bias(ctx0, hs, -1.0f, 1.0f), 1, 1, NBq / R, Hkv));
+            }
+
+            // GPU cap: at most B exception pairs per (tile, KV head). A cumsum over the (block, sub-
+            // block) axis ranks a tile's pairs; those ranked past B leave the GPU and rejoin the
+            // tile's shared list -- for every sub-block, so um and em stay disjoint by construction.
+            const uint32_t gpu_cap = llama_sparse_attn_gpu_cap();
+            if (gpu_cap) {
+                ggml_tensor * em2  = ggml_reshape_3d(ctx0, em, NBk * R, NBq / R, Hkv);                   // pairs of one tile in one row
+                ggml_tensor * rank = ggml_cumsum(ctx0, em2);                                              // 1..n over the members
+                ggml_tensor * within = ggml_clamp(ctx0, ggml_scale_bias(ctx0, rank, -BIGF, ((float) gpu_cap + 0.5f) * BIGF), 0.0f, 1.0f);
+                ggml_tensor * keep = ggml_mul(ctx0, em2, within);
+                // pairs past the cap: em2 * (1 - within). MUL and SCALE run on the HTP; SUB would not
+                // and one CPU node per layer splits the graph.
+                ggml_tensor * over = ggml_reshape_4d(ctx0, ggml_mul(ctx0, em2, ggml_scale_bias(ctx0, within, -1.0f, 1.0f)), NBk, R, NBq / R, Hkv);
+                ggml_tensor * back = nullptr;                                                              // any sub-block over -> shared
+                for (int64_t r = 0; r < R; ++r) {
+                    ggml_tensor * vr = ggml_view_3d(ctx0, over, NBk, NBq / R, Hkv, over->nb[2], over->nb[3], (size_t) r * over->nb[1]);
+                    back = back ? ggml_add(ctx0, back, vr) : vr;
+                }
+                um = ggml_clamp(ctx0, ggml_add(ctx0, um, back), 0.0f, 1.0f);
+                cb(um, "sparse_union", il);
+                em = ggml_mul(ctx0, ggml_reshape_4d(ctx0, keep, NBk, R, NBq / R, Hkv),
+                              ggml_reshape_4d(ctx0, ggml_scale_bias(ctx0, um, -1.0f, 1.0f), NBk, 1, NBq / R, Hkv));
+            }
+            cb(em, "sparse_exc_mem", il);
+
+            // What the GPU gets is the MEMBERSHIP itself, F32 0/1, contiguous, named
+            // sparse_exc_mem-<il>: entry (b, j, t, h) at ((h*(NBq/R) + t)*R + j)*NBk + b, so
+            // row (h*NBq + sb) is sub-block sb's 64-block bitmap for KV head h. The consumer
+            // scans the row for nonzero entries -- 64 floats per sub-block, trivial for a GPU
+            // work-group or for the HTP's per-tile "any exception" test (hdr.exc_nbk != 0).
+            //
+            // It used to be packed here with argsort + sum_rows. The HTP argsort costs ~1 us
+            // per 16-element row, so 128 rows per layer were 126 us per layer, 0.9% of pp4096
+            // and 91% of the split's whole graph cost; the membership needs no sort at all.
+            // An all-zero row means no exceptions and the fold partial must stay EMPTY (m = -INF).
+            ggml_format_name(em, "sparse_exc_mem-%d", il);
+            // The FA op takes it as src[8]: that dependency keeps it alive until the op has run,
+            // which is as long as the GPU reads it. It is deliberately NOT a graph output: an
+            // output per layer made the scheduler cut the graph into one split per layer, and each
+            // split drains the DSP pipeline -- ~76 ms per pp4096 forward, more than the split saved.
+            if (exc_out) {
+                *exc_out = em;
+            }
+
+            if (llama_sparse_attn_debug()) {
+                // em * (1 - em) per (j, t, h), F32 [1, R, NBq/R, Hkv]. Every entry must read
+                // exactly 0.0, and unlike an em AND um probe this one can actually fail:
+                // em*(1-em) is zero only where em is exactly 0 or 1, while em AND um is
+                // identically zero for ANY 0/1 um and so proves nothing.
+                //
+                // Non-binary em IS the silent failure here. em is a product of two clamps, and
+                // the 1e-9 band that binarises them can leave a member weighing 0.3, which a
+                // consumer testing "nonzero" takes as a member while the NPU dropped it -- or,
+                // reading "> 0.5", drops a block the NPU is not computing either.
+                ggml_tensor * bin = ggml_sum_rows(ctx0,
+                                        ggml_mul(ctx0, em, ggml_scale_bias(ctx0, em, -1.0f, 1.0f)));
+                ggml_format_name(bin, "sparse_exc_binary-%d", il);
+                ggml_set_output(bin);
+                ggml_build_forward_expand(gf, bin);
+            }
+        } else if (exc_out && llama_sparse_attn_exact()) {
+            // Exact-mask experiment (no split): the FULL per-sub-block membership goes to the FA
+            // op as src[8]; with no fold buffer the HMX kernel masks every (32-row group, block)
+            // pair the group's sub-block did not select and the union tile computes exactly the
+            // per-64-block policy. Same layout as sparse_exc_mem: (b, j, t, h).
+            ggml_tensor * pmb = ggml_clamp(ctx0, ggml_scale_bias(ctx0, pm, BIGF, -0.5f * BIGF), 0.0f, 1.0f);
+            ggml_tensor * xm  = ggml_reshape_4d(ctx0, pmb, NBk, R, NBq / R, Hkv);
+            ggml_format_name(xm, "sparse_exact_mem-%d", il);
+            *exc_out = xm;
+        }
 
         ggml_tensor * cnt = ggml_sum_rows(ctx0, um);          // [1, NBq/R, Hkv]
         cnt = ggml_reshape_3d(ctx0, cnt, NBq / R, Hkv, 1);
@@ -2838,7 +2975,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                  int   il,
          ggml_tensor * sparse_sel,
                  int   sparse_bq,
-         ggml_tensor * sparse_cnt) const {
+         ggml_tensor * sparse_cnt,
+         ggml_tensor * sparse_exc) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2880,6 +3018,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             ggml_flash_attn_ext_set_sparse(cur, sparse_sel, LLAMA_SPARSE_ATTN_BS, sparse_bq);
             if (sparse_cnt) {
                 ggml_flash_attn_ext_set_sparse_cnt(cur, sparse_cnt);
+            }
+            if (sparse_exc) {
+                ggml_flash_attn_ext_set_sparse_exc(cur, sparse_exc);
             }
         }
 
@@ -3133,8 +3274,9 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * sparse_sel = nullptr;
     ggml_tensor * sparse_cnt = nullptr;
+    ggml_tensor * sparse_exc = nullptr;
     if (inp->get_sparse_sel()) {
-        sparse_sel = build_sparse_sel(q_cur, inp->get_sparse_sel(), mctx_cur, il, &sparse_cnt);
+        sparse_sel = build_sparse_sel(q_cur, inp->get_sparse_sel(), mctx_cur, il, &sparse_cnt, &sparse_exc);
 
         // The bias leaf existing does NOT mean the selection reached the op: build_sparse_sel
         // can decline on shape, and the backend can still reject src[5] and run dense.
@@ -3153,7 +3295,7 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il,
-                                       sparse_sel, LLAMA_SPARSE_ATTN_BQ, sparse_cnt);
+                                       sparse_sel, LLAMA_SPARSE_ATTN_BQ, sparse_cnt, sparse_exc);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
