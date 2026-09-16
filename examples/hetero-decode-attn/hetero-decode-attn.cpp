@@ -755,7 +755,7 @@ static int run_cluster_runs(const options & o, ggml_backend_t be, ggml_backend_b
             double us = 0, ax = 0;
             if (prof_last(&us, &ax)) { r.usec.add(us); r.axi.add(ax); }
         }
-        double worst = 0; size_t rows_att = 0; int sym = 0;
+        double worst = 0; size_t rows_att = 0; int sym = 0, n_blocks = 0, n_packed = 0;
         for (int h = 0; h < o.nh; ++h) {
             const int kvh = h / G;
             std::vector<std::pair<int, bool>> keys;
@@ -763,8 +763,14 @@ static int run_cluster_runs(const options & o, ggml_backend_t be, ggml_backend_b
                 auto blocks = read_echo_blocks(kvh);
                 std::set<int> dev_runs;
                 for (auto & b : blocks) {
+                    n_blocks++;
+                    n_packed += b.bsz2 ? 1 : 0;
                     for (uint32_t r = b.row; r < (uint32_t) b.row + b.bsz; ++r) keys.push_back({ (int) pos_map[(size_t) kvh * rows_max + r], false });
-                    for (int i = 0; i < n_runs; ++i) if ((int) b.row >= runs[i].first && (int) b.row < runs[i].first + runs[i].second) dev_runs.insert(i);
+                    for (uint32_t r = b.row2; r < (uint32_t) b.row2 + b.bsz2; ++r) keys.push_back({ (int) pos_map[(size_t) kvh * rows_max + r], false });
+                    for (int i = 0; i < n_runs; ++i) {
+                        if ((int) b.row >= runs[i].first && (int) b.row < runs[i].first + runs[i].second) dev_runs.insert(i);
+                        if (b.bsz2 && (int) b.row2 >= runs[i].first && (int) b.row2 < runs[i].first + runs[i].second) dev_runs.insert(i);
+                    }
                 }
                 for (int p = covered_end; p < o.kv; ++p) keys.push_back({ p, true });
                 if (h % G == 0) {
@@ -772,6 +778,11 @@ static int run_cluster_runs(const options & o, ggml_backend_t be, ggml_backend_b
                     std::vector<int> hs = host_select(kvh); std::set<int> host_runs(hs.begin(), hs.end());
                     std::vector<int> diff; std::set_symmetric_difference(host_runs.begin(), host_runs.end(), dev_runs.begin(), dev_runs.end(), std::back_inserter(diff));
                     sym += (int) diff.size();
+                    if (!diff.empty() && o.verbose) {
+                        printf("    head %d run set differs:", kvh);
+                        for (int r : diff) printf(" %d%s(%d rows)", r, host_runs.count(r) ? "H" : "D", runs[r].second);
+                        printf("\n");
+                    }
                 }
             } else {
                 for (int p = 0; p < o.kv; ++p) keys.push_back({ p, true });
@@ -786,7 +797,14 @@ static int run_cluster_runs(const options & o, ggml_backend_t be, ggml_backend_b
         const double gbs = r.usec.empty() ? 0.0 : bytes / (r.usec.med() * 1e-6) / 1e9;
         printf("  %-10s graph_compute med %7.1f us | FA op med %7.1f us | %6.2f MB -> %5.1f GB/s | max|err| %.2e %s%s\n",
                name, r.wall.med(), r.usec.med(), bytes / 1048576.0, gbs, worst, worst < 2e-2 ? "OK" : "MISMATCH",
-               on ? (std::string(" | rows attended ") + std::to_string(rows_att / o.nkvh) + "/head, run set vs host greedy: sym diff " + std::to_string(sym)).c_str() : "");
+               on ? (std::string(" | rows attended ") + std::to_string(rows_att / o.nkvh) + "/head, run set vs host greedy: sym diff " + std::to_string(sym)
+                     + ", blocks " + std::to_string(n_blocks / o.nh) + "/head (" + std::to_string(n_packed / o.nh) + " packed)").c_str() : "");
+        if (on) {
+            dc_civac(lb + hdr.off_echo_sel, 128);
+            const uint32_t * tw = (const uint32_t *) (lb + hdr.off_echo_sel);
+            printf("  %-10s phases of the last op (us): setup %u | select %u | dec %u | merge %u | select slowest thread: dma issue %u wait %u score %u greedy %u\n",
+                   name, tw[1], tw[2], tw[3], tw[4], tw[5], tw[6], tw[7], tw[8]);
+        }
     };
     arm_res dense, sel;
     run_arm("dense", false, dense);
@@ -998,6 +1016,12 @@ static int run_cluster(const options & o, ggml_backend_t be, ggml_backend_buffer
         printf("  %-10s graph_compute med %7.1f us | FA op med %7.1f us (min %7.1f max %7.1f) | %6.2f MB -> %5.1f GB/s | AXI rd req med %.0f (%.0f B/req) | max|err| %.2e %s\n",
                name, r.wall.med(), r.usec.med(), r.usec.mn(), r.usec.mx(), bytes / 1048576.0, gbs,
                r.axi.med(), r.axi.med() > 0 ? bytes / r.axi.med() : 0.0, worst, worst < 2e-2 ? "OK" : "MISMATCH");
+        if (on) {
+            dc_civac(lb + hdr.off_echo_sel, 128);
+            const uint32_t * tw = (const uint32_t *) (lb + hdr.off_echo_sel);
+            printf("  %-10s phases of the last op (us): setup %u | select %u | dec %u | merge %u | select slowest thread: dma issue %u wait %u score %u greedy %u\n",
+                   name, tw[1], tw[2], tw[3], tw[4], tw[5], tw[6], tw[7], tw[8]);
+        }
     };
     arm_res dense, list;
     run_arm("dense", false, dense);

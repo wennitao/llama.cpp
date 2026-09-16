@@ -329,11 +329,14 @@ struct htp_fa_cluster_run {
     uint16_t flags;
 };
 
-// One DMA block of a selected run (the kernel's per-head list in runs mode; also the echo format).
+// One DMA block of the kernel's per-head list in runs mode (also the echo format): rows [row, row + bsz) of the
+// head's shadow and, when bsz2 != 0, a second run's rows [row2, row2 + bsz2) packed into the same 64-row block.
 struct htp_fa_cluster_blk {
     uint32_t row;
+    uint32_t row2;
     uint16_t bsz;
-    uint16_t pad;
+    uint16_t bsz2;
+    uint32_t pad;
 };
 #define HTP_FA_CLUSTER_MAX_CHUNKS   256
 #define HTP_FA_CLUSTER_MAX_HEADS    64
@@ -420,7 +423,7 @@ static inline uint64_t htp_fa_cluster_layout_v2(struct htp_fa_cluster_header * h
     h->n_runs_max  = runs ? (uint32_t) htp_fa_cluster_align((kv_size + avg_cluster - 1) / avg_cluster + 2ull * HTP_FA_CLUSTER_MAX_CHUNKS, 16) : 0;
     const uint64_t n_units = runs ? h->n_runs_max : h->n_pages_max;   // descriptor rows per head
     h->centroid_bytes  = (uint32_t) htp_fa_cluster_align((uint64_t) D * 2, 128);
-    h->host_sel_stride = (uint32_t) htp_fa_cluster_align(128 + (runs ? 8ull * (h->n_pages_max + h->n_runs_max) : 2ull * h->n_pages_max), 128);
+    h->host_sel_stride = (uint32_t) htp_fa_cluster_align(128 + (runs ? (uint64_t) sizeof(struct htp_fa_cluster_blk) * (h->n_pages_max + h->n_runs_max) : 2ull * h->n_pages_max), 128);
     uint64_t off = 0;
     h->off_chunks    = off;                            off += (uint64_t) h->max_chunks * sizeof(struct htp_fa_cluster_chunk);
     h->off_host_sel  = htp_fa_cluster_align(off, 128); off  = h->off_host_sel  + (uint64_t) n_kv_heads * h->host_sel_stride;

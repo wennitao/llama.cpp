@@ -65,16 +65,22 @@ static inline HVX_Vector hvx_vec_repl4(HVX_Vector v) {
     return Q6_V_vdelta_VV(v, ctrl);
 }
 
-static inline float hvx_vec_get_f32(HVX_Vector v) {
-    float __attribute__((aligned(128))) x;
-    hvx_vec_store_a(&x, 4, v);
-    return x;
-}
-
+// Lane 0 to a scalar register. vextract stalls until the vector result is ready but skips the
+// vector-store / scalar-reload round trip through L2 that the memory path pays on every call.
 static inline int32_t hvx_vec_get_i32(HVX_Vector v) {
+#if __HVX_ARCH__ >= 65
+    return Q6_R_vextract_VR(v, 0);
+#else
     int32_t __attribute__((aligned(128))) x;
     hvx_vec_store_a(&x, 4, v);
     return x;
+#endif
+}
+
+static inline float hvx_vec_get_f32(HVX_Vector v) {
+    union { int32_t i; float f; } u;
+    u.i = hvx_vec_get_i32(v);
+    return u.f;
 }
 
 static inline _Float16 hvx_vec_get_f16(HVX_Vector v) {

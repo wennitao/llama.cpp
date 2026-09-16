@@ -861,3 +861,62 @@ the design to return to for retrieval-heavy workloads. Next, in order: whole-clu
 the device (shadow layout, run lists, DSP-owned metadata), (in-place pages of llama's cache + one mean per page: removes the memory
 problem, the gather and the lag), positional tail pages so the dense window is really 64 keys, and
 the fixed per-page cost (K|V in one descriptor, several 16-key pages per 64-lane softmax).
+
+## Stage 9 -- the runs kernel's own fixed costs (2026-09-15, unit f3b4a4c5)
+
+With 16k out of scope the decode direction is the NPU alone (heterogeneous-npu-gpu.md 4l). At 4k and
+12.5% the runs-mode op took 151 us for 532 rows per head, 16 GB/s against 36 GB/s for the dense
+stream, and a density sweep put ~68 us of it in a fixed cost. Four qtimer stamps inside the op
+(echoed to the tool through the echo header, `phases of the last op`) split it: setup 4, select 49,
+decode loop 88, merge 4 us. The select pass then got its own four (DMA issue 1, DMA wait 1, scoring
+8, greedy fill 28 us on the slowest thread), and cycle counters inside the greedy phase found the
+cost in one place: the loop that marks forced runs +inf and empty runs -inf before the greedy fill
+took 44 thousand cycles per op, about 170 cycles per run, for one scalar VTCM load and one scalar
+VTCM store each. The greedy fill itself was 6 thousand cycles for its vector half and 6 for its
+scalar half; its two vector-to-scalar extractions per taken run, my first suspect, made no
+difference when replaced by `vextract`.
+
+**What changed.**
+- The marking is vectorised: the run table in VTCM is 16 runs per vector with words alternating
+  `row_first` and `(n_rows | flags << 16)`; a word deal of two vectors (`Q6_W_vdeal_VVR(hi, lo, -4)`,
+  odd words in the HIGH half) lines the packed words of runs 32i..32i+31 up with score vector i, and
+  two compares and two muxes do the marking. Lesson that cost four device rounds: the lane-validity
+  mask must use `Q6_Q_vsetq2_R`; `Q6_Q_vsetq_R(128)` wraps to zero lanes, so full vectors were never
+  marked and the sink run went unforced (the scoring code already guarded that case).
+- Two short runs share one 64-row DMA block: the select pass pairs consecutive taken segments whose
+  rows fit in 64 (`htp_fa_cluster_blk` carries a second `row2 / bsz2`), the stage pushes two
+  descriptors per tensor into one staging slot and the consumer pops both, and the per-block fixed
+  cost (descriptors, full-width softmax, accumulator scale) is paid once for both runs. Not in the
+  scatter fetch, whose row list is per segment. The echo stride grew with the 16-byte record.
+- `hvx_vec_get_i32/f32` use `vextract` instead of a vector store and scalar reload (no measurable
+  change here, kept as the cheaper form).
+
+**Op level** (`llama-hetero-decode-attn --cluster --runs`, window 64, sinks 4, chunk-local clusters,
+20 iterations, FA op median us; every arm exact to 4e-5 and its run set identical to the host's greedy
+selection):
+
+| config | before | after | select before -> after | decode loop before -> after |
+|---|--:|--:|--:|--:|
+| 4k, 12.5%, avg 32 | 151 | 121 | 49 -> 29 | 88 -> 77 |
+| 4k, 25%, avg 32 | 231 | 188 | 57 -> 40 | 159 -> 133 |
+| 4k, 1%, avg 32 | 83 | 60 | 39 -> 21 | 30 -> 26 |
+| 4k, 12.5%, avg 16 | 224 | 159 | 87 -> 50 | 124 -> 94 |
+| 4k, 12.5%, avg 64 | 124 | 113 | 33 -> 23 | 78 -> 75 |
+| 8k, 12.5%, avg 32 | 262 | 201 | 90 -> 54 | 158 -> 133 |
+
+At 4k and 12.5% two thirds of the blocks now carry two runs (54 of 83 per head). In-place 64-key
+positional pages over the same rows take 97 us, so 24 us of gap remain: the select pass (a
+positional page needs none) and the blocks a run pairing cannot fill.
+
+**Model level** (Qwen3-1.7B Q4_0, `GGML_HEXAGON_CLUSTER_RUNS=1 AVG=32 CHUNK=1024 ATTN=125,64
+THREADS=4`, old and new DSP library alternated in one session): decode-mode perplexity over two
+4096 contexts 19.6375 old, 19.6178 new (dense 20.3694; the sparse arms of the prefill work also
+scored 2-3% under dense on this test); tg64 24.4-25.8 old vs 25.2-25.6 new at d4096, 19.8-20.3 vs
+20.3 at d8192. The op saves 30 us per layer at 4k and 61 at 8k, 2% and 3.5% of the token, under
+tg64's noise with the sidecar's timing-dependent coverage; the op-level numbers are the evidence.
+
+**Where the rest is.** Decode loop 77 us at 4k: ~14 blocks per thread at ~5.5 us, about 2.3 us of
+which is per-block fixed cost, the rest rows at ~28 GB/s aggregate. Select 29 us: scoring 7, greedy
+7, DMA 3, the remainder thread dispatch and, in the tool only, the echo write. Two scalar VTCM reads
+per block remain in the decode loop's block source (~0.1 us each). Larger blocks (128 rows) would
+halve the fixed cost again but change the kernel's 64-lane softmax.
