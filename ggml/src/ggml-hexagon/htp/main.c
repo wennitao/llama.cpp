@@ -1023,6 +1023,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     // Clean cache at the start of the batch
     htp_trace_event_start(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
     qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
+    ctx->l2_inval_epoch++;
     hex_l2fetch_block(ctx, ctx->footprint);
     memset(ctx->dirty_ranges, 0, sizeof(ctx->dirty_ranges));
     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
@@ -1073,6 +1074,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     // Flush remaining dirty tensors at the end of the batch
     htp_trace_event_start(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
     qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
+    ctx->l2_inval_epoch++;
     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
 
     profile_stop(HTP_PROF_BASIC, &batch_prof);

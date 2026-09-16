@@ -161,6 +161,129 @@ enum htp_sync_probe_rec {
 #define HTP_FA_HETERO_BUF_SIZE       (8 * 1024 * 1024)
 #define HTP_FA_HETERO_DONE_TIMEOUT_US 50000
 
+// Heterogeneous PREFILL fold (dev prototype; host env GGML_HEXAGON_FA_FOLD).
+//
+// A second engine computes some of the KV blocks of a PREFILL FLASH_ATTN_EXT and leaves one
+// unnormalised online-softmax partial per (sequence, head, token) row. The HMX kernel folds that
+// partial into its FINAL NORMALIZATION instead of running a separate merge pass: the normalization
+// is already an HMX multiply by diag(1/l), so re-aiming that diagonal at w_htp/S_total costs
+// nothing, and the only new work is one scaled add of the other engine's accumulator while the
+// store thread de-tiles. The HTP's own (m, l, O) never leaves VTCM.
+//
+// The buffer describes itself -- op_params 0..15 are all taken -- and rides in src[7]. A magic
+// that does not match leaves the op bit-identical to the non-folded kernel.
+#define HTP_FA_FOLD_MAGIC     0x464f4c44  // 'FOLD' at word 0 of src[7]; anything else = off
+#define HTP_FA_FOLD_MAX_G_BR  1024        // rows per tile the prototype accepts (stack scratch)
+
+// hdr.flags. Zero means the partial is ALREADY RESIDENT when the op starts (a host-written
+// partial, e.g. examples/fa-fold-check): no handshake, no waiting, bit-identical to before.
+#define HTP_FA_FOLD_F_LIVE      (1u << 0)  // a producer fills the partial DURING this op: publish ready, wait for done
+#define HTP_FA_FOLD_F_FLUSH_KV  (1u << 1)  // flush K and V with Q before ready (the producer also reads the KV cache)
+// Dev measurement: instead of folding the other engine's partial into the final normalization,
+// write the HTP's OWN unnormalised (m, l, acc) to the off_h* regions and merge the two partials
+// into dst in a SEPARATE pass over DDR. Exists to price the explicit merge against the fold;
+// it is strictly more traffic (the fold keeps the HTP side in VTCM) and is not a deployment mode.
+#define HTP_FA_FOLD_F_SPILL     (1u << 2)
+// With SPILL: skip the merge pass (dst is left unwritten). Timing-only, to price the two halves
+// of SPILL separately.
+#define HTP_FA_FOLD_F_NOMERGE   (1u << 3)
+// STAGED (requires LIVE, neq3 == 1, <= HTP_FA_FOLD_MAX_STAGES KV heads): the producer delivers the
+// partial one KV head at a time in ascending head order and echoes the sequence into done word k
+// (slot line + 128 + 4k) as head k completes. The op then (1) skips the fold and the wait on tiles
+// whose 64-token sub-blocks have no exceptions, (2) runs those tiles FIRST so the producer works in
+// their shadow, and (3) takes one wait per KV head, at its first exception tile. hdr.off_exc names
+// a uint32 per (KV head, sub-block), row-major [n_kv_heads][ceil(neq1 / 64)], nonzero = that
+// sub-block has exceptions -- or, with hdr.exc_nbk != 0, the graph's own membership rows
+// (sparse_exc_mem: exc_nbk f32 per (head, sub-block), same row order, nonzero = member), which
+// the producer reads too, so nothing has to be packed for either engine. hdr.off_exc == 0 means
+// the membership is the op's src[8] itself (F32 [NBk, R, NBq/R, n_kv_heads], the graph's
+// sparse_exc_mem), which the op also FLUSHES before ready so the producer can read it.
+#define HTP_FA_FOLD_F_STAGED    (1u << 4)
+// INSTORE: fold in the store threads instead of the HMX normalisation. The tile leaves the KV loop
+// as the raw accumulator, the store threads form the two merge weights per 32-row group from the
+// VTCM (m, l) and the partial's (m, l), and emit w_htp * acc_htp + w_other * acc_other while
+// de-tiling. No diagonal build, no norm pass; each thread prefetches its slice of the partial with
+// one 2D l2fetch. Not with SPILL.
+#define HTP_FA_FOLD_F_INSTORE   (1u << 5)
+// NOFLUSH (with LIVE): do not flush Q / K / V / mask / membership before ready. The op's own input
+// flush at op start (htp_tensor_flush_all, whole-L2 above 4 MB dirty) already put every DSP-written
+// input in DDR, so the explicit line loops here -- ~32 MB per op -- were redundant and cost ~0.5 ms.
+#define HTP_FA_FOLD_F_NOFLUSH   (1u << 6)
+// STAGE_QB (with STAGED): the producer delivers the partial one QUERY BLOCK (Br rows, all heads) at
+// a time, done word k = query block k, and the op keeps its default query-block-outer order, which
+// keeps the mask DMA cache's reuse across the KV heads of a query block (KV-head-outer staging
+// refetches every mask rectangle per head, ~12 MB per op instead of ~1.6). <= 32 query blocks.
+#define HTP_FA_FOLD_F_STAGE_QB  (1u << 7)
+// Dev probes for INSTORE timing (results may be WRONG with PROBE_NOWEIGHTS): where the cost sits.
+#define HTP_FA_FOLD_F_PROBE_NOPF      (1u << 8)   // no per-thread prefetch of the partial
+#define HTP_FA_FOLD_F_PROBE_TILEPF    (1u << 9)   // whole-tile prefetch from the main thread at the fold site instead
+#define HTP_FA_FOLD_F_PROBE_NOWEIGHTS (1u << 10)  // skip the (m, l) gather and weights: constant 0.5/0.5
+#define HTP_FA_FOLD_F_PROBE_NOACC     (1u << 11)  // skip the partial's accumulator read: normalise only
+#define HTP_FA_FOLD_F_PROBE_NOINVAL   (1u << 13)  // skip the per-stage L2 invalidation of the partial's rows (timing only)
+#define HTP_FA_FOLD_F_PROBE_INVAL     (1u << 14)  // force the per-stage L2 invalidation even when the epoch says it is redundant
+// ACC_F16 (with INSTORE, not SPILL): the producer writes the partial's accumulator rows as f16
+// (row stride dv * 2). Halves the 7 MB per op the fold reads; the HTP's own accumulator is f16.
+#define HTP_FA_FOLD_F_ACC_F16         (1u << 15)
+// STAGE_QBH (with STAGED, implies STAGE_QB ordering): one stage per (query block, KV head), stage
+// k = qb * n_kv_heads + kv_head, so the first exception tile of a query block waits for one KV
+// head's partial rather than the whole block's. Needs hdr.off_done (the slot line holds 32 words).
+#define HTP_FA_FOLD_F_STAGE_QBH (1u << 12)
+#define HTP_FA_FOLD_EXC_SB      64
+#define HTP_FA_FOLD_MAX_STAGES  64          // with hdr.off_done; the legacy slot line holds HTP_FA_FOLD_LINE_STAGES
+#define HTP_FA_FOLD_LINE_STAGES 32
+
+// Handshake control region at hdr.off_ctl, laid out like the hetero DECODE control region so the
+// host drives both with one helper:
+//   slot s: ready_seq @ s * HTP_FA_HETERO_SLOT_STRIDE        (DSP writes, producer polls)
+//           wait_us   @ s * HTP_FA_HETERO_SLOT_STRIDE + 8    (DSP writes: us this op idled)
+//           done_seq  @ s * HTP_FA_HETERO_SLOT_STRIDE + 128  (producer writes; == ready_seq means the partial is complete)
+//   status  @ HTP_FA_HETERO_STATUS_OFF, uint32 words below
+// The region must therefore be at least HTP_FA_HETERO_STATUS_OFF + 32 bytes long.
+#define HTP_FA_FOLD_MAX_SLOTS       HTP_FA_HETERO_MAX_SLOTS
+#define HTP_FA_FOLD_DONE_TIMEOUT_US 50000
+
+enum htp_fa_fold_status_word {
+    HTP_FA_FOLD_ST_TIMEOUTS = 0,   // ops that gave up on the producer (each one FAILED the op)
+    HTP_FA_FOLD_ST_WAITS,          // ops that waited at all
+    HTP_FA_FOLD_ST_DONE_SEEN,      // last value read from the done word
+    HTP_FA_FOLD_ST_SEQ_WANTED,     // what it wanted
+    HTP_FA_FOLD_ST_SLOT,
+    HTP_FA_FOLD_ST_WAIT_US,        // last wait (STAGED: this op's blocked time summed over its stages)
+    HTP_FA_FOLD_ST_WAIT_US_MAX,
+    HTP_FA_FOLD_ST_TILES_BLOCKED,  // STAGED: stage waits that actually spun, summed over ops
+    HTP_FA_FOLD_ST_WAIT_US_SUM,    // STAGED: blocked time summed over ops (mean = / ops)
+    HTP_FA_FOLD_ST_N
+};
+
+// src[7] holds THREE regions, not one record per row. m and l are read one value per row while
+// the diagonal is built, so interleaving them with acc made every gather touch a 640 B line for
+// 8 bytes of payload; split out, a tile's m and l are 1 KB of contiguous stream per GQA head.
+// All offsets are 128-aligned byte offsets from the header. Row r of (sequence ib3, head iq2,
+// token iq1) is r = (ib3 * neq2 + iq2) * neq1 + iq1, and holds:
+//   m[r]        f32, the running max in NATURAL log units (-INFINITY or very negative = empty)
+//   l[r]        f32, the running sum
+//   acc[r][dv]  f32, the UNNORMALISED accumulator
+struct htp_fa_fold_hdr {
+    uint32_t magic;
+    uint32_t rows;      // neq1 * neq2 * neq3
+    uint32_t neq1;
+    uint32_t dv;
+    uint32_t off_m;
+    uint32_t off_l;
+    uint32_t off_acc;   // row stride is dv * sizeof(float)
+    uint32_t flags;     // HTP_FA_FOLD_F_*
+    uint32_t slot;      // handshake slot, < HTP_FA_FOLD_MAX_SLOTS (LIVE only)
+    uint32_t off_ctl;   // handshake control region, 128-aligned bytes from the header, >= 256 (LIVE only)
+    uint32_t timeout_us; // done-word deadline; 0 = HTP_FA_FOLD_DONE_TIMEOUT_US
+    uint32_t off_hm;     // SPILL only: the HTP's own partial, same shapes as off_m / off_l / off_acc
+    uint32_t off_hl;
+    uint32_t off_hacc;
+    uint32_t off_exc;    // STAGED only: per (KV head, 64-token sub-block) exception table, 128-aligned
+    uint32_t exc_nbk;    // STAGED only: 0 = one uint32 flag per (head, sub-block); else exc_nbk f32 per
+                         // (head, sub-block), the graph's sparse_exc_mem rows, nonzero = member
+    uint32_t off_done;   // STAGED only: done words (HTP_FA_FOLD_MAX_STAGES uint32, 128-aligned); 0 = slot line + 128
+};
+
 // Cluster-selected sparse decode attention (dev prototype; host env GGML_HEXAGON_CLUSTER_ATTN).
 //
 // The backend owns a "shadow" copy of the KV cache in cluster order: per layer and KV head the
@@ -322,7 +445,9 @@ static inline uint64_t htp_fa_cluster_layout(struct htp_fa_cluster_header * h, u
 }
 
 #define HTP_OP_MAX_DIMS    4    // aka GGML_MAX_DIMS
-#define HTP_OP_MAX_INPUTS  8    // sparse flash-attention carries sel (src 5) and its per-row count (src 6); hetero decode FA carries its control buffer (src 7)
+#define HTP_OP_MAX_INPUTS  12   // sparse flash-attention carries sel (src 5) and its per-row count (src 6); hetero FA carries its
+                                // control / fold buffer (src 7) and the prefill split its exception membership (src 8);
+                                // 12 + 4 output slots keep htp_op_desc a multiple of 8 bytes
 #define HTP_OP_MAX_OUTPUTS 4
 #define HTP_OP_MAX_PARAMS  16   // aka GGML_MAX_OP_PARAMS
 #define HTP_OP_MAX_KERN_PARAMS 32
@@ -371,7 +496,7 @@ struct htp_op_desc {
     int32_t  params[HTP_OP_MAX_PARAMS]; // Params for the op, e.g. epsilon of RMS norm
     int32_t  kernel_params[HTP_OP_MAX_KERN_PARAMS]; // generic blob for host-precomputed parameters
     uint16_t src[HTP_OP_MAX_INPUTS];    // Input tensors indices
-    uint16_t dst[HTP_OP_MAX_OUTPUTS];   // Output tensor indices (8 + 4 uint16 = 24 B, 64-bit aligned)
+    uint16_t dst[HTP_OP_MAX_OUTPUTS];   // Output tensor indices (12 + 4 uint16 = 32 B, 64-bit aligned)
 };
 
 #ifndef HTP_MAX_NTHREADS

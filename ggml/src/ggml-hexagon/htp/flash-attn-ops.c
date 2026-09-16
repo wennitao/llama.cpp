@@ -248,6 +248,62 @@ struct hmx_fa_context {
     size_t       d_tile_bytes;
     bool         mask_broadcast;       // true when mask->ne[2] == 1 (head-independent, single 2D DMA)
     dma_cache    m_cache;
+
+    // Hetero prefill fold (dev prototype, src[7] + HTP_FA_FOLD_MAGIC; see htp-ops.h).
+    // het_parts NULL leaves every path below bit-identical to the non-folded kernel.
+    const float *   het_m;       // [rows], natural-log running max (NULL = fold off)
+    const float *   het_l;       // [rows]
+    const uint8_t * het_acc;     // [rows][DV] f32
+    size_t          het_acc_stride;
+    // SPILL measurement mode: the HTP's own partial goes here and a separate pass merges.
+    float *         het_hm;
+    float *         het_hl;
+    uint8_t *       het_hacc;
+    bool            fold_spill;
+    bool            fold_nomerge;   // SPILL timing aid: no merge pass
+    uint32_t        het_neq1;
+    float *         het_g;       // per-row weight for the other engine's accumulator, [g_br]
+
+    // Live-producer handshake (HTP_FA_FOLD_F_LIVE). fold_ready NULL = the partial is already
+    // resident when the op starts, which is the no-wait path examples/fa-fold-check runs.
+    volatile uint32_t * fold_ready;    // ctl + slot * stride      (this op publishes its sequence here)
+    volatile uint32_t * fold_done;     // ctl + slot * stride + 128 (producer echoes the sequence back)
+    volatile uint32_t * fold_status;   // ctl + HTP_FA_HETERO_STATUS_OFF
+    size_t          fold_m_bytes;      // the three C1 regions, for the pre-fold invalidate
+    size_t          fold_l_bytes;
+    size_t          fold_acc_bytes;
+    uint32_t        fold_seq;
+    uint32_t        fold_slot;
+    uint32_t        fold_timeout_us;
+    bool            fold_flush_kv;
+    bool            fold_noflush;      // HTP_FA_FOLD_F_NOFLUSH: rely on the op-start dirty flush
+    bool            fold_need_inval;   // this op's L2 may hold partial lines from an earlier fold: invalidate per stage
+    bool            fold_waited;       // the op waits at most once, before its FIRST fold
+    bool            fold_ok;
+
+    // STAGED fold (HTP_FA_FOLD_F_STAGED): per-KV-head delivery, per-tile fold decision.
+    bool             fold_staged;
+    bool             fold_stage_qb;     // stages are query blocks (else KV heads)
+    bool             fold_stage_qbh;    // stages are (query block, KV head) pairs: qb * n_kv_heads + kvh (QB order)
+    uint32_t         fold_n_kv_heads;
+    bool             fold_instore;      // HTP_FA_FOLD_F_INSTORE: merge in the store threads, no diag, no norm
+    bool             fold_acc_f16;      // HTP_FA_FOLD_F_ACC_F16: the partial's accumulator rows are f16
+    uint32_t         fold_probe;        // HTP_FA_FOLD_F_PROBE_* bits (dev timing only)
+    bool             fold_pf_early;     // INSTORE: this tile's partial is valid at tile start, softmax threads prefetch it
+    bool             fold_tile;         // THIS tile folds (it has exceptions); false = plain path
+    const uint32_t * fold_exc;          // [n_kv_heads][fold_num_sb] x (exc_nbk ? exc_nbk : 1), nonzero = exception
+    uint32_t         fold_num_sb;
+    uint32_t         fold_exc_nbk;      // 0: one flag per (head, sub-block); else membership row length
+    // Exact-mask mode (src[8] without a fold buffer): the FULL per-sub-block membership,
+    // [n_kv_heads][num_sb] rows of xmask_nbk f32 (nonzero = the sub-block selected the block).
+    // The softmax sets every (32-row group, KV block) the group's sub-block did not select to -inf,
+    // so the large tile computes exactly the per-64-block policy.
+    const float *    xmask;
+    uint32_t         xmask_nbk;
+    uint32_t         xmask_num_sb;
+    uint64_t         fold_stage_seen;   // bit k: done word k confirmed and its rows invalidated
+    uint32_t         fold_wait_us_acc;  // this op's blocked time over all stages
+    uint32_t         fold_tiles_blocked;
 };
 
 // A "chunk" is one iteration of the KV loop: Bc rows staged into VTCM. Dense: the
@@ -1229,11 +1285,20 @@ typedef struct {
     uint32_t                  q_start;
     uint32_t                  kv_head;
     uint32_t                  ib3;
+    uint32_t                  neq2;
     size_t                    n_rows_g;
     size_t                    rows_per_t;
 } fa_o_store_args_t;
 
-static void fa_o_store_thread_f32(unsigned int n, unsigned int i, void * data) {
+static inline HVX_Vector fa_fold_weights_vec(struct hmx_fa_context * factx, size_t i, size_t n_rows_g, uint32_t q_start,
+                                             uint32_t kv_head, uint32_t ib3, uint32_t neq2, uint32_t G, HVX_Vector v_l2,
+                                             HVX_Vector v_ln2, HVX_Vector v_lo, float * m_o, float * l_o, HVX_Vector * w_other);
+static void fa_fold_prefetch_slice(struct hmx_fa_context * factx, unsigned int ith, size_t n_rows_g, uint32_t q_start,
+                                   uint32_t kv_head, uint32_t ib3);
+static void fa_fold_prefetch_tile_piece(struct hmx_fa_context * factx, unsigned int ith, unsigned int nth, size_t n_rows_g,
+                                        uint32_t q_start, uint32_t kv_head, uint32_t ib3);
+
+static inline void fa_o_store_impl_f32(unsigned int n, unsigned int i, void * data, const bool fold, const bool spill, const bool instore) {
     fa_o_store_args_t *     args  = (fa_o_store_args_t *) data;
     struct hmx_fa_context * factx = args->factx;
 
@@ -1261,22 +1326,124 @@ static void fa_o_store_thread_f32(unsigned int n, unsigned int i, void * data) {
     size_t q_idx = fastdiv(start, &factx->div_G);
     size_t h_idx = fastmodulo(start, G, &factx->div_G);
 
+    // Fold: the diagonal already carried w_htp/S_total into the tile, so all that is left is the
+    // other engine's term. het_g[r] is w_other/S_total, built alongside the diagonal.
+    const uint8_t * het_acc    = fold ? factx->het_acc : NULL;
+    const size_t    het_stride = fold ? factx->het_acc_stride : 0;
+    const float *   het_g      = fold ? factx->het_g : NULL;
+    const uint32_t  neq2       = args->neq2;
+
+    // Spill: the tile handed in is the UNNORMALISED accumulator (the norm was skipped), and it
+    // goes to the HTP-side partial with its (m, l) instead of to dst. vtcm_m_vec holds
+    // (m + scale) * log2(e) -- see fa_fold_diag_vec -- so m is unwound to natural units here,
+    // matching what the other engine writes, so the merge pass compares like with like.
+    const float * m_vec_f = spill ? (const float *) factx->vtcm_m_vec : NULL;
+    const float * l_vec_f = spill ? (const float *) factx->vtcm_l_vec : NULL;
+    const float   m_bias  = spill ? (float) factx->scale : 0.0f;
+    const float   k_ln2   = 0.6931471805599453f;
+    // The raw accumulator is in COLUMN-major tile order (tile (r, c) at c * n_row_tiles_g_br + r,
+    // see hmx_fa_o_update_worker); the norm pass is what re-lays it row-major for this walk.
+    const bool    raw          = spill || instore;
+    const size_t  o_col_stride = raw ? (size_t) (factx->g_br / HMX_FP16_TILE_N_ROWS) * HMX_FP16_TILE_N_ELMS : 0;
+
+    // In-store fold: the merge weights are formed per 32-row group from the VTCM (m, l) and the
+    // partial's (m, l), exactly as the diagonal builder would, but here in every store thread and
+    // with the diagonal itself never built. The thread's rows are one token run per GQA head, so
+    // ONE 2D l2fetch (width = run, height = G, stride = head stride) stages its slice of the
+    // partial's accumulator while the first rows are de-tiled; the (m, l) lines are dcfetch hints,
+    // which do not cancel it.
+    float      wa[HMX_FP16_TILE_N_ROWS] __attribute__((aligned(128)));
+    float      wb[HMX_FP16_TILE_N_ROWS] __attribute__((aligned(128)));
+    float      m_o[HMX_FP16_TILE_N_ROWS] __attribute__((aligned(128)));
+    float      l_o[HMX_FP16_TILE_N_ROWS] __attribute__((aligned(128)));
+    size_t     grp_cur   = (size_t) -1;
+    bool       grp_empty = false;   // no row of this 32-row group has a partial: skip its accumulator
+    const bool acc_f16   = instore && factx->fold_acc_f16;
+    HVX_Vector v_wh    = Q6_V_vzero();
+    const HVX_Vector v_l2  = hvx_vec_splat_f32(EXP_LOG2E_F);
+    const HVX_Vector v_ln2 = hvx_vec_splat_f32(0.6931471805599453f);
+    const HVX_Vector v_lo  = hvx_vec_splat_f32(-80.0f);
+    if (instore && !factx->fold_pf_early && !(factx->fold_probe & HTP_FA_FOLD_F_PROBE_NOPF)) {
+        // late: the partial only became valid at this tile's fold site (first tile of a head in
+        // STAGED / LIVE), so the fetch and the reads start together
+        fa_fold_prefetch_slice(factx, i, n_rows_g, q_start, kv_head, ib3);
+    }
+
     for (size_t r = start; r < end; ++r) {
         float * out = (float *) ((uint8_t *) dst->data + (kv_head * G + h_idx) * dst->nb[1] +
                                  (q_start + q_idx) * dst->nb[2] + ib3 * dst->nb[3]);
+        if (spill) {
+            const size_t hrow = ((size_t) ib3 * neq2 + (kv_head * G + h_idx)) * factx->het_neq1 + (q_start + q_idx);
+            out = (float *) (factx->het_hacc + hrow * factx->het_acc_stride);
+            factx->het_hm[hrow] = (m_vec_f[r] - m_bias) * k_ln2;
+            factx->het_hl[hrow] = l_vec_f[r];
+        }
 
         size_t         r0            = r / HMX_FP16_TILE_N_ROWS;
         size_t         r1            = r % HMX_FP16_TILE_N_ROWS;
         const __fp16 * tile_row_base = o_tile_src + r0 * HMX_FP16_TILE_N_ROWS * DV;
 
-        for (uint32_t d = 0; d < DV / 32; ++d) {
-            const HVX_Vector * in_tile = (const HVX_Vector *) (tile_row_base + d * HMX_FP16_TILE_N_ELMS);
-            HVX_VectorPair     vp      = hvx_vec_f16_to_f32_shuff(in_tile[r1 / 2]);
-            if (r1 % 2 == 0) {
-                *(HVX_UVector *) (out + d * 32) = Q6_V_lo_W(vp);
-            } else {
-                *(HVX_UVector *) (out + d * 32) = Q6_V_hi_W(vp);
+        const uint8_t * acc_o = NULL;   // this row of the other engine's accumulator (f32, or f16 with ACC_F16)
+        HVX_Vector      v_wo  = Q6_V_vzero();
+        if (fold) {
+            const size_t hrow = ((size_t) ib3 * neq2 + (kv_head * G + h_idx)) * factx->het_neq1 + (q_start + q_idx);
+            acc_o = het_acc + hrow * het_stride;
+            v_wo  = hvx_vec_splat_f32(het_g[r]);
+        }
+        if (instore) {
+            if (r0 != grp_cur) {
+                grp_cur = r0;
+                if (factx->fold_probe & HTP_FA_FOLD_F_PROBE_NOWEIGHTS) {
+                    hvx_vmem(wa) = hvx_vec_splat_f32(0.5f);
+                    hvx_vmem(wb) = hvx_vec_splat_f32(0.5f);
+                    grp_empty = false;
+                } else {
+                    HVX_Vector vb;
+                    HVX_Vector va = fa_fold_weights_vec(factx, r0, n_rows_g, q_start, kv_head, ib3, neq2, (uint32_t) G,
+                                                        v_l2, v_ln2, v_lo, m_o, l_o, &vb);
+                    hvx_vmem(wa) = va;
+                    hvx_vmem(wb) = vb;
+                    // an empty partial has l == 0 and a zero accumulator: its term is exactly 0
+                    bool empty = true;
+                    for (size_t j = 0; j < HMX_FP16_TILE_N_ROWS && empty; ++j) empty = l_o[j] == 0.0f;
+                    grp_empty = empty;
+                }
             }
+            const size_t hrow = ((size_t) ib3 * neq2 + (kv_head * G + h_idx)) * factx->het_neq1 + (q_start + q_idx);
+            acc_o = factx->het_acc + hrow * factx->het_acc_stride;
+            v_wh  = hvx_vec_splat_f32(wa[r1]);
+            v_wo  = hvx_vec_splat_f32(wb[r1]);
+        }
+        const bool skip_acc = instore && (grp_empty || (factx->fold_probe & HTP_FA_FOLD_F_PROBE_NOACC));
+
+        HVX_VectorPair vp_o16 = Q6_W_vcombine_VV(Q6_V_vzero(), Q6_V_vzero());
+        for (uint32_t d = 0; d < DV / 32; ++d) {
+            const HVX_Vector * in_tile = raw
+                ? (const HVX_Vector *) (o_tile_src + d * o_col_stride + r0 * HMX_FP16_TILE_N_ELMS)
+                : (const HVX_Vector *) (tile_row_base + d * HMX_FP16_TILE_N_ELMS);
+            HVX_VectorPair     vp      = hvx_vec_f16_to_f32_shuff(in_tile[r1 / 2]);
+            HVX_Vector         v_out   = (r1 % 2 == 0) ? Q6_V_lo_W(vp) : Q6_V_hi_W(vp);
+            if (instore || fold) {
+                HVX_Vector v_acc = Q6_V_vzero();
+                if (!skip_acc) {
+                    if (acc_f16) {
+                        // 64 f16 dims per vector: convert once, use the low half on even d, the high on odd
+                        if ((d & 1) == 0) {
+                            vp_o16 = hvx_vec_f16_to_f32(*(const HVX_UVector *) (acc_o + (size_t) d * 32 * sizeof(__fp16)));
+                        }
+                        v_acc = (d & 1) ? Q6_V_hi_W(vp_o16) : Q6_V_lo_W(vp_o16);
+                    } else {
+                        v_acc = *(const HVX_UVector *) (acc_o + (size_t) d * 32 * sizeof(float));
+                    }
+                }
+                if (instore) {
+                    v_out = skip_acc ? HVX_OP_MUL_F32(v_wh, v_out)
+                                     : HVX_OP_ADD_F32(HVX_OP_MUL_F32(v_wh, v_out), HVX_OP_MUL_F32(v_wo, v_acc));
+                } else {
+                    v_out = HVX_OP_ADD_F32(v_out, HVX_OP_MUL_F32(v_wo, v_acc));
+                }
+            }
+            *(HVX_UVector *) (out + d * 32) = v_out;
         }
 
         h_idx++;
@@ -1286,6 +1453,22 @@ static void fa_o_store_thread_f32(unsigned int n, unsigned int i, void * data) {
         }
     }
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) (args->q_start * G + start));
+}
+
+static void fa_o_store_thread_f32(unsigned int n, unsigned int i, void * data) {
+    fa_o_store_impl_f32(n, i, data, /*fold=*/false, /*spill=*/false, /*instore=*/false);
+}
+
+static void fa_o_store_thread_f32_fold(unsigned int n, unsigned int i, void * data) {
+    fa_o_store_impl_f32(n, i, data, /*fold=*/true, /*spill=*/false, /*instore=*/false);
+}
+
+static void fa_o_store_thread_f32_spill(unsigned int n, unsigned int i, void * data) {
+    fa_o_store_impl_f32(n, i, data, /*fold=*/false, /*spill=*/true, /*instore=*/false);
+}
+
+static void fa_o_store_thread_f32_instore(unsigned int n, unsigned int i, void * data) {
+    fa_o_store_impl_f32(n, i, data, /*fold=*/false, /*spill=*/false, /*instore=*/true);
 }
 
 static void fa_o_store_thread_f16(unsigned int n, unsigned int i, void * data) {
@@ -1350,6 +1533,7 @@ static void fa_phase_o_store(struct hmx_fa_context *   factx,
                              uint32_t                  q_start,
                              uint32_t                  kv_head,
                              uint32_t                  ib3,
+                             uint32_t                  neq2,
                              size_t                    n_rows_g) {
     work_queue_t wp = factx->octx->ctx->work_queue;
     uint32_t n = 1;
@@ -1357,8 +1541,12 @@ static void fa_phase_o_store(struct hmx_fa_context *   factx,
         n = factx->n_threads;
     }
     size_t rows_per_t = hmx_ceil_div(n_rows_g, n);
-    fa_o_store_args_t args = { factx, dst, o_tile_src, q_start, kv_head, ib3, n_rows_g, rows_per_t };
-    worker_callback_t store_fn = factx->is_dst_fp32 ? fa_o_store_thread_f32 : fa_o_store_thread_f16;
+    fa_o_store_args_t args = { factx, dst, o_tile_src, q_start, kv_head, ib3, neq2, n_rows_g, rows_per_t };
+    worker_callback_t store_fn = factx->is_dst_fp32
+                                     ? (factx->fold_spill ? fa_o_store_thread_f32_spill
+                                        : (factx->fold_tile ? (factx->fold_instore ? fa_o_store_thread_f32_instore : fa_o_store_thread_f32_fold)
+                                                            : fa_o_store_thread_f32))
+                                     : fa_o_store_thread_f16;
     if (n > 1) {
         work_queue_run(wp, store_fn, &args, n);
     } else {
@@ -1379,6 +1567,7 @@ typedef struct {
     uint32_t                  G;
     uint32_t                  kv_head;
     uint32_t                  kv_start;
+    uint32_t                  kv_blk;          // chunk index (exact-mask mode maps its blocks back to KV block ids)
     uint32_t                  q_start;
     uint32_t                  ib3;
     bool                      is_first_block;  // first KV block processed for this Q block
@@ -1400,6 +1589,11 @@ static inline void fa_softmax_impl(
 ) {
     fa_softmax_args_t *     args  = (fa_softmax_args_t *) data;
     struct hmx_fa_context * factx = args->factx;
+    // INSTORE fold: stage this thread's slice of the partial into L2 a whole tile ahead of the
+    // store that reads it. Issued once per tile, from every worker (one l2fetch engine per thread).
+    if (args->is_first_block && factx->fold_pf_early) {
+        fa_fold_prefetch_tile_piece(factx, i, n, args->n_rows_g, args->q_start, args->kv_head, args->ib3);
+    }
 
     const size_t n_rows_g       = args->n_rows_g;
     const size_t kv_rows        = args->kv_rows;
@@ -1431,10 +1625,35 @@ static inline void fa_softmax_impl(
 
     const HVX_Vector v_neg_inf = Q6_Vh_vsplat_R(0xfbff);
 
+    // exact-mask mode: this chunk's KV block per 64-key vector, once per call
+    uint32_t xm_blk[16];
+    uint32_t xm_nblk = 0;
+    if (factx->xmask) {
+        const uint32_t qb = fa_sel_row(factx, args->q_start);
+        for (size_t c = 0; c < kv_rows && xm_nblk < 16; c += 64) {
+            xm_blk[xm_nblk] = fa_chunk_block_idx(factx, args->kv_blk, xm_nblk, qb, args->kv_head, args->ib3);
+            xm_nblk++;
+        }
+    }
+
     for (size_t r_vec_idx = vec_start; r_vec_idx < vec_end; ++r_vec_idx) {
         HVX_Vector rowmax_acc_v = v_neg_inf;
         HVX_Vector rowsum_acc_v = Q6_V_vzero();
         HVX_Vector m_prev_v0    = factx->vtcm_m_vec[r_vec_idx];
+
+        // exact-mask mode: the group's 32 rows are 32/G tokens of one 64-token sub-block; one bit
+        // per 64-key vector says the sub-block did not select that block
+        uint32_t xm_bits = 0;
+        if (factx->xmask) {
+            const uint32_t tok = args->q_start + (uint32_t) fastdiv(r_vec_idx * 32, &factx->div_G);
+            const uint32_t sb  = tok / HTP_FA_FOLD_EXC_SB;
+            const float *  row = factx->xmask + ((size_t) args->kv_head * factx->xmask_num_sb + sb) * factx->xmask_nbk;
+            for (uint32_t ci = 0; ci < xm_nblk; ++ci) {
+                if (xm_blk[ci] >= factx->xmask_nbk || row[xm_blk[ci]] == 0.0f) {
+                    xm_bits |= 1u << ci;
+                }
+            }
+        }
 
         // A 32-row unit starts 64 B into the fp16 slopes array on odd units, but
         // hvx_vmem is an ALIGNED load, and hvx_vmemu would read 64 B past the end of
@@ -1507,6 +1726,16 @@ static inline void fa_softmax_impl(
                     HVX_VectorPair vp_s_drow = Q6_W_vdeal_VVR(*pv_s_in1, *pv_s_in0, -2);
                     my_row_buf0[ci]          = Q6_V_lo_W(vp_s_drow);
                     my_row_buf1[ci]          = Q6_V_hi_W(vp_s_drow);
+                }
+            }
+
+            if (xm_bits) {
+                // exact-mask mode: whole 64-key vectors of blocks this group's sub-block did not select
+                for (uint32_t ci = 0; ci < xm_nblk; ++ci) {
+                    if (xm_bits & (1u << ci)) {
+                        my_row_buf0[ci] = v_neg_inf;
+                        my_row_buf1[ci] = v_neg_inf;
+                    }
                 }
             }
 
@@ -1830,6 +2059,594 @@ static __attribute__((noinline)) void fa_build_d_diag_inv_l(struct hmx_fa_contex
             HVX_Vector inv_lo = HVX_OP_MUL_F32(one, hvx_vec_inverse_f32(factx->vtcm_l_vec[i]));
             HVX_Vector inv_hi = (i + 1 < n_row_tiles) ? HVX_OP_MUL_F32(one, hvx_vec_inverse_f32(factx->vtcm_l_vec[i + 1])) : Q6_V_vzero();
             v_content = hvx_vec_f32_to_f16(inv_lo, inv_hi);
+        } else {
+            v_content = Q6_V_vror_VR(v_content, 64);
+        }
+
+        __fp16 * out_base = factx->vtcm_d_inv_l + i * HMX_FP16_TILE_N_ELMS;
+        Q6_vscatter_QRMVhV(q_32_mask, (size_t) out_base, HMX_FP16_TILE_SIZE - 1, v_offsets, v_content);
+    }
+}
+
+// ---- Live-producer handshake for the prefill fold (HTP_FA_FOLD_F_LIVE) ----
+//
+// Same shape as the hetero DECODE handshake below: the DSP publishes an incrementing sequence in
+// the slot's ready word, the producer echoes it into the done word once the whole partial is
+// written. Everything the producer reads is flushed BEFORE ready goes up, everything it writes is
+// invalidated AFTER done comes back.
+
+// Invalidate one region another engine wrote. Rounded out to whole lines: the C1 regions are
+// 128-aligned but their lengths are not, and the DSP never has dirty lines here (it only ever
+// writes the control region, which is a separate 128-aligned region), so over-invalidating a tail
+// line cannot lose a store.
+static inline void fa_fold_inval_range(const void * p, size_t bytes) {
+    if (!bytes) {
+        return;
+    }
+    const uint32_t s = (uint32_t) (uintptr_t) p & ~(uint32_t) (HEX_L2_LINE_SIZE - 1);
+    const uint32_t e = ((uint32_t) (uintptr_t) p + (uint32_t) bytes + HEX_L2_LINE_SIZE - 1) & ~(uint32_t) (HEX_L2_LINE_SIZE - 1);
+    qurt_mem_cache_clean((qurt_addr_t) s, e - s, QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+}
+
+// Publish ready. Called BEFORE the KV loop: the producer's blocks do not depend on anything this
+// op computes, so every microsecond it starts earlier comes straight off the wait below.
+static void fa_fold_publish_ready(struct hmx_fa_context *   factx,
+                                  const struct htp_tensor * q,
+                                  const struct htp_tensor * k,
+                                  const struct htp_tensor * v) {
+    // The batch flushes its dirty ranges when it EXITS, which is long after the producer reads Q.
+    // Flush here or the producer attends over whatever DDR still holds -- unless the header says
+    // the op-start input flush (htp_tensor_flush_all) already covered every DSP-written input.
+    if (!factx->fold_noflush) {
+        hex_l2flush((void *) (uintptr_t) q->data, q->size);
+        // The producer also reads the mask (a CPY on this DSP wrote its f16 copy) and, in the
+        // prefill split, the exception membership (src[8], written by the selection ops before this).
+        if (factx->octx->src[3] && factx->octx->src[3]->data) {
+            hex_l2flush((void *) (uintptr_t) factx->octx->src[3]->data, factx->octx->src[3]->size);
+        }
+        if (factx->octx->src[8] && factx->octx->src[8]->data) {
+            hex_l2flush((void *) (uintptr_t) factx->octx->src[8]->data, factx->octx->src[8]->size);
+        }
+        if (factx->fold_flush_kv) {
+            hex_l2flush((void *) (uintptr_t) k->data, k->size);
+            hex_l2flush((void *) (uintptr_t) v->data, v->size);
+        }
+    }
+
+    volatile uint32_t * ready = factx->fold_ready;
+    Q6_dcinva_A((void *) ready);
+    factx->fold_seq = *ready + 1;
+    *ready          = factx->fold_seq;
+    qurt_mem_cache_clean((qurt_addr_t) ready, sizeof(uint32_t), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+}
+
+// The op's ONE wait, taken just before the first fa_build_d_diag_fold. false = the producer never
+// published; the caller must fail the op, because no correct partial exists and the fold would
+// otherwise merge stale memory that looks like a plausible tensor.
+static bool fa_fold_wait_done(struct hmx_fa_context * factx) {
+    if (factx->fold_waited) {
+        return factx->fold_ok;
+    }
+    factx->fold_waited = true;
+
+    volatile uint32_t * done = factx->fold_done;
+    const uint64_t t0        = HAP_perf_get_qtimer_count();
+    const uint64_t timeout   = (uint64_t) factx->fold_timeout_us * 192ull / 10ull;   // 19.2 MHz qtimer
+    uint32_t       seen      = 0;
+    bool           ok        = true;
+    for (;;) {
+        Q6_dcinva_A((void *) done);
+        seen = *done;
+        if (seen == factx->fold_seq) {
+            break;
+        }
+        if (HAP_perf_get_qtimer_count() - t0 > timeout) {
+            ok = false;
+            break;
+        }
+    }
+    const uint32_t wait_us = (uint32_t) ((HAP_perf_get_qtimer_count() - t0) * 10ull / 192ull);
+
+    // Feedback for the host: how long this op idled, every time -- a fold that is correct but
+    // always 2 ms late is a performance bug the host can only see from here.
+    {
+        volatile uint32_t * wait_w = factx->fold_ready + 2;   // slot line + 8, the decode convention
+        *wait_w = wait_us;
+        qurt_mem_cache_clean((qurt_addr_t) wait_w, sizeof(uint32_t), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+    }
+    {
+        volatile uint32_t * st = factx->fold_status;
+        qurt_mem_cache_clean((qurt_addr_t) st, HTP_FA_FOLD_ST_N * sizeof(uint32_t), QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+        st[HTP_FA_FOLD_ST_TIMEOUTS]  += ok ? 0u : 1u;
+        st[HTP_FA_FOLD_ST_WAITS]     += 1u;
+        st[HTP_FA_FOLD_ST_DONE_SEEN]  = seen;
+        st[HTP_FA_FOLD_ST_SEQ_WANTED] = factx->fold_seq;
+        st[HTP_FA_FOLD_ST_SLOT]       = factx->fold_slot;
+        st[HTP_FA_FOLD_ST_WAIT_US]    = wait_us;
+        if (wait_us > st[HTP_FA_FOLD_ST_WAIT_US_MAX]) {
+            st[HTP_FA_FOLD_ST_WAIT_US_MAX] = wait_us;
+        }
+        qurt_mem_cache_clean((qurt_addr_t) st, HTP_FA_FOLD_ST_N * sizeof(uint32_t), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+    }
+
+    if (!ok) {
+        FARF(ERROR, "fa fold: slot %u seq %u: producer done not seen within %u us (saw %u)", factx->fold_slot,
+             factx->fold_seq, factx->fold_timeout_us, seen);
+        return false;
+    }
+
+    // The producer wrote all three C1 regions from another engine. Lines this DSP kept from an
+    // EARLIER op on the same buffer (the previous layer folds through the same allocation) are
+    // stale, and a stale line is a silently wrong softmax anchor.
+    if (factx->fold_need_inval) {
+        fa_fold_inval_range(factx->het_m, factx->fold_m_bytes);
+        fa_fold_inval_range(factx->het_l, factx->fold_l_bytes);
+        fa_fold_inval_range(factx->het_acc, factx->fold_acc_bytes);
+    }
+
+    factx->fold_ok = true;
+    return true;
+}
+
+// Does the tile starting at q_start for this KV head have any exception sub-block? (STAGED)
+static inline bool fa_fold_tile_has_exc(const struct hmx_fa_context * factx, uint32_t kv_head, uint32_t q_start, uint32_t neq1) {
+    const uint32_t   q_end = hex_smin(q_start + factx->Br, neq1);
+    const uint32_t   sb0   = q_start / HTP_FA_FOLD_EXC_SB;
+    const uint32_t   sb1   = (q_end + HTP_FA_FOLD_EXC_SB - 1) / HTP_FA_FOLD_EXC_SB;
+    const uint32_t   nbk   = factx->fold_exc_nbk ? factx->fold_exc_nbk : 1;   // flags, or membership rows
+    const uint32_t * row   = factx->fold_exc + ((size_t) kv_head * factx->fold_num_sb + sb0) * nbk;
+    for (uint32_t k = 0; k < (sb1 - sb0) * nbk; ++k) {
+        if (row[k]) {   // nonzero bits: 1.0f as f32 or a uint32 flag, both nonzero
+            return true;
+        }
+    }
+    return false;
+}
+
+// STAGED: head kv_head is delivered -- record it and drop the lines this DSP may hold of its rows
+// (rows of the G query heads of one KV head are contiguous).
+// The stage a tile belongs to: its KV head, or its query block (HTP_FA_FOLD_F_STAGE_QB).
+static inline uint32_t fa_fold_stage_of(const struct hmx_fa_context * factx, uint32_t q_start, uint32_t kv_head) {
+    if (factx->fold_stage_qbh) {
+        return (q_start / factx->Br) * factx->fold_n_kv_heads + kv_head;
+    }
+    return factx->fold_stage_qb ? q_start / factx->Br : kv_head;
+}
+
+static void fa_fold_stage_mark(struct hmx_fa_context * factx, uint32_t stage) {
+    factx->fold_stage_seen |= 1ull << stage;
+    if (!factx->fold_need_inval || (factx->fold_probe & HTP_FA_FOLD_F_PROBE_NOINVAL)) {
+        return;   // no stale lines possible (see the epoch check at setup)
+    }
+    if (factx->fold_stage_qb) {
+        // rows [qb*Br, +Br) of every query head (QB), or of the G heads of one KV head (QBH)
+        const uint32_t neq2 = factx->octx->src[0]->ne[2];
+        const uint32_t qb   = factx->fold_stage_qbh ? stage / factx->fold_n_kv_heads : stage;
+        const uint32_t h0   = factx->fold_stage_qbh ? (stage % factx->fold_n_kv_heads) * factx->G : 0;
+        const uint32_t h1   = factx->fold_stage_qbh ? h0 + factx->G : neq2;
+        const size_t   tok0 = (size_t) qb * factx->Br;
+        const size_t   nrow = hex_smin((size_t) factx->Br, (size_t) factx->het_neq1 - tok0);
+        for (uint32_t h = h0; h < h1; ++h) {
+            const size_t row0 = (size_t) h * factx->het_neq1 + tok0;
+            fa_fold_inval_range(factx->het_m + row0, nrow * sizeof(float));
+            fa_fold_inval_range(factx->het_l + row0, nrow * sizeof(float));
+            fa_fold_inval_range(factx->het_acc + row0 * factx->het_acc_stride, nrow * factx->het_acc_stride);
+        }
+        return;
+    }
+    const size_t row0 = (size_t) stage * factx->G * factx->het_neq1;
+    const size_t nrow = (size_t) factx->G * factx->het_neq1;
+    fa_fold_inval_range(factx->het_m + row0, nrow * sizeof(float));
+    fa_fold_inval_range(factx->het_l + row0, nrow * sizeof(float));
+    fa_fold_inval_range(factx->het_acc + row0 * factx->het_acc_stride, nrow * factx->het_acc_stride);
+}
+
+// The per-tile wait. Single-wait mode defers to fa_fold_wait_done. STAGED waits for THIS tile's KV
+// head the first time a tile of that head folds, then invalidates that head's rows of the partial
+// (rows of the G query heads of one KV head are contiguous), and never blocks on the head again.
+static bool fa_fold_wait_tile(struct hmx_fa_context * factx, uint32_t q_start, uint32_t kv_head) {
+    if (!factx->fold_staged) {
+        return fa_fold_wait_done(factx);
+    }
+    const uint32_t stage = fa_fold_stage_of(factx, q_start, kv_head);
+    if (factx->fold_stage_seen & (1ull << stage)) {
+        return true;
+    }
+    volatile uint32_t * done    = factx->fold_done + stage;
+    const uint64_t      t0      = HAP_perf_get_qtimer_count();
+    const uint64_t      timeout = (uint64_t) factx->fold_timeout_us * 192ull / 10ull;
+    bool                spun    = false;
+    for (;;) {
+        Q6_dcinva_A((void *) done);
+        const uint32_t seen = *done;
+        if (seen == factx->fold_seq) {
+            break;
+        }
+        spun = true;
+        if (HAP_perf_get_qtimer_count() - t0 > timeout) {
+            volatile uint32_t * st = factx->fold_status;
+            qurt_mem_cache_clean((qurt_addr_t) st, HTP_FA_FOLD_ST_N * sizeof(uint32_t), QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+            st[HTP_FA_FOLD_ST_TIMEOUTS] += 1u;
+            st[HTP_FA_FOLD_ST_DONE_SEEN]  = seen;
+            st[HTP_FA_FOLD_ST_SEQ_WANTED] = factx->fold_seq;
+            qurt_mem_cache_clean((qurt_addr_t) st, HTP_FA_FOLD_ST_N * sizeof(uint32_t), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+            FARF(ERROR, "fa fold: staged: stage %u seq %u not delivered within %u us (saw %u)", stage, factx->fold_seq,
+                 factx->fold_timeout_us, seen);
+            return false;
+        }
+    }
+    factx->fold_wait_us_acc   += (uint32_t) ((HAP_perf_get_qtimer_count() - t0) * 10ull / 192ull);
+    factx->fold_tiles_blocked += spun ? 1u : 0u;
+    fa_fold_stage_mark(factx, stage);
+    return true;
+}
+
+// STAGED, non-blocking: is head kv_head delivered already? Marks it (and invalidates its rows) if so.
+static bool fa_fold_try_stage(struct hmx_fa_context * factx, uint32_t stage) {
+    if (factx->fold_stage_seen & (1ull << stage)) {
+        return true;
+    }
+    volatile uint32_t * done = factx->fold_done + stage;
+    Q6_dcinva_A((void *) done);
+    if (*done != factx->fold_seq) {
+        return false;
+    }
+    fa_fold_stage_mark(factx, stage);
+    return true;
+}
+
+// Can this tile's partial be read NOW (i.e. prefetched from the start of the tile)? Resident: always.
+// Single-wait LIVE: once the op's one wait has passed. STAGED: once the head is delivered.
+static bool fa_fold_partial_valid(struct hmx_fa_context * factx, uint32_t q_start, uint32_t kv_head) {
+    if (!factx->fold_ready) {
+        return true;
+    }
+    if (factx->fold_staged) {
+        return fa_fold_try_stage(factx, fa_fold_stage_of(factx, q_start, kv_head));
+    }
+    return factx->fold_waited && factx->fold_ok;
+}
+
+// The l2fetch descriptor's stride is a 16-BIT field (PRM: Rtt[47:32]), so a fetch can never span
+// GQA heads of the partial (head stride = neq1 * 512 B) or the two accumulators of the merge: every
+// fetch here is LINEAR (hex_l2fetch_block, 16 KB rows), and one thread issues one fetch per call
+// site, because a second l2fetch on the same thread replaces the first.
+//
+// Early form (from the first chunk's softmax workers, a whole tile ahead of the store): the tile's
+// partial is G head runs of n_rows_q records; worker ith takes head (ith % G), piece (ith / G) of
+// that run, so the n workers between them cover the tile with one linear fetch each. The (m, l)
+// lines of the piece are dcfetch hints, which do not cancel it.
+static void fa_fold_prefetch_tile_piece(struct hmx_fa_context * factx, unsigned int ith, unsigned int nth, size_t n_rows_g,
+                                        uint32_t q_start, uint32_t kv_head, uint32_t ib3) {
+    const uint32_t G        = factx->G;
+    const uint32_t neq2     = factx->octx->src[0]->ne[2];
+    const size_t   n_rows_q = (n_rows_g + G - 1) / G;
+    const uint32_t h        = ith % G;
+    const uint32_t pieces   = (nth + G - 1) / G;
+    const uint32_t piece    = ith / G;
+    const size_t   per      = (n_rows_q + pieces - 1) / pieces;
+    const size_t   t0       = (size_t) piece * per;
+    const size_t   t1       = hex_smin(t0 + per, n_rows_q);
+    if (t0 >= t1) {
+        return;
+    }
+    const size_t row0 = ((size_t) ib3 * neq2 + (kv_head * G + h)) * factx->het_neq1 + q_start + t0;
+    hex_l2fetch_rows(factx->het_acc + row0 * factx->het_acc_stride, (uint32_t) factx->het_acc_stride, (uint32_t) (t1 - t0));
+    for (size_t t = 0; t < t1 - t0; t += 32) {
+        Q6_dcfetch_A((void *) (factx->het_m + row0 + t));
+        Q6_dcfetch_A((void *) (factx->het_l + row0 + t));
+    }
+}
+
+// Late form (from the store thread itself, when the partial only became valid at the fold site):
+// the thread's own rows are one token run per head; head runs are fetched in turn, and on this
+// thread only the last is guaranteed to survive, so this is the fallback and not the design.
+static void fa_fold_prefetch_slice(struct hmx_fa_context * factx, unsigned int ith, size_t n_rows_g, uint32_t q_start,
+                                   uint32_t kv_head, uint32_t ib3) {
+    const uint32_t G       = factx->G;
+    const uint32_t neq2    = factx->octx->src[0]->ne[2];
+    const uint32_t n_store = (factx->n_threads > 1 && n_rows_g >= (size_t) factx->n_threads * 2) ? factx->n_threads : 1;
+    if (ith >= n_store) {
+        return;
+    }
+    const size_t rows_per_t = hmx_ceil_div(n_rows_g, n_store);
+    const size_t start      = (size_t) ith * rows_per_t;
+    const size_t end        = hex_smin(start + rows_per_t, n_rows_g);
+    if (start >= end) {
+        return;
+    }
+    const size_t tok0 = q_start + fastdiv(start, &factx->div_G);
+    const size_t tok1 = q_start + fastdiv(end - 1, &factx->div_G) + 1;
+    for (uint32_t h = 0; h < G; ++h) {
+        const size_t hr = ((size_t) ib3 * neq2 + kv_head * G + h) * factx->het_neq1 + tok0;
+        hex_l2fetch_rows(factx->het_acc + hr * factx->het_acc_stride, (uint32_t) factx->het_acc_stride, (uint32_t) (tok1 - tok0));
+        for (size_t t = 0; t < tok1 - tok0; t += 32) {
+            Q6_dcfetch_A((void *) (factx->het_m + hr + t));
+            Q6_dcfetch_A((void *) (factx->het_l + hr + t));
+        }
+    }
+}
+
+// STAGED: the op's handshake feedback, written once at the end (the single-wait path writes it
+// from inside its one wait).
+static void fa_fold_staged_status(struct hmx_fa_context * factx) {
+    volatile uint32_t * wait_w = factx->fold_ready + 2;
+    *wait_w = factx->fold_wait_us_acc;
+    qurt_mem_cache_clean((qurt_addr_t) wait_w, sizeof(uint32_t), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+
+    volatile uint32_t * st = factx->fold_status;
+    qurt_mem_cache_clean((qurt_addr_t) st, HTP_FA_FOLD_ST_N * sizeof(uint32_t), QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+    st[HTP_FA_FOLD_ST_WAITS]        += factx->fold_tiles_blocked ? 1u : 0u;
+    st[HTP_FA_FOLD_ST_TILES_BLOCKED] += factx->fold_tiles_blocked;
+    st[HTP_FA_FOLD_ST_SEQ_WANTED]    = factx->fold_seq;
+    st[HTP_FA_FOLD_ST_SLOT]          = factx->fold_slot;
+    st[HTP_FA_FOLD_ST_WAIT_US]       = factx->fold_wait_us_acc;
+    st[HTP_FA_FOLD_ST_WAIT_US_SUM]  += factx->fold_wait_us_acc;
+    if (factx->fold_wait_us_acc > st[HTP_FA_FOLD_ST_WAIT_US_MAX]) {
+        st[HTP_FA_FOLD_ST_WAIT_US_MAX] = factx->fold_wait_us_acc;
+    }
+    qurt_mem_cache_clean((qurt_addr_t) st, HTP_FA_FOLD_ST_N * sizeof(uint32_t), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+}
+
+// SPILL mode's second half: the explicit merge over DDR. Both partials are read from DDR --
+// the HTP's own side included, which is exactly the stream the fold avoids by keeping its
+// accumulator in VTCM. Structured to be memory-bound, so the number it produces is the
+// design's floor and not this loop's overhead:
+//  - weights are built 32 rows at a time with vector math (the four (m, l) arrays are
+//    contiguous in row order, so they load as vectors) and parked in a small scratch, so
+//    the per-row work is two scalar loads, two splats and the combine;
+//  - both accumulators are prefetched two groups ahead with ONE 2D l2fetch (width = the
+//    group, height 2, stride = the distance between the regions). One l2fetch per thread is
+//    all the hardware keeps in flight, so two calls per group would cancel each other, and a
+//    whole-range fetch (the previous version) thrashes: each thread's range is larger than L2.
+#define FA_MERGE_GROUP 64
+#define FA_MERGE_LEAD  3    // groups of accumulator prefetch kept in flight per thread
+static void fa_fold_merge_thread(unsigned int nth, unsigned int ith, void * data) {
+    struct hmx_fa_context * factx = (struct hmx_fa_context *) data;
+    const struct htp_tensor * dst = factx->octx->dst;
+    const struct htp_tensor * q   = factx->octx->src[0];
+    const uint32_t neq1 = q->ne[1], neq2 = q->ne[2], neq3 = q->ne[3];
+    const size_t   DV   = factx->DV;
+    const size_t   rows = (size_t) neq1 * neq2 * neq3;
+    const size_t   per  = hex_align_up((rows + nth - 1) / nth, FA_MERGE_GROUP);   // groups stay 128 B aligned
+    const size_t   r0   = (size_t) ith * per;
+    const size_t   r1   = hex_smin(r0 + per, rows);
+    if (r0 >= r1) {
+        return;
+    }
+    const size_t    stride = factx->het_acc_stride;
+    const uint8_t * hacc   = factx->het_hacc;
+    const uint8_t * oacc   = factx->het_acc;
+
+    const float * hm = factx->het_hm;
+    const float * hl = factx->het_hl;
+    const float * om = factx->het_m;
+    const float * ol = factx->het_l;
+
+    const HVX_Vector v_lo   = hvx_vec_splat_f32(-80.0f);
+    const HVX_Vector v_zero = Q6_V_vzero();
+
+    float wa[FA_MERGE_GROUP] __attribute__((aligned(128)));
+    float wb[FA_MERGE_GROUP] __attribute__((aligned(128)));
+
+    // Lead-in: the other engine's rows for the first groups (the HTP's own rows follow inside the loop).
+    // The l2fetch stride field is 16 bits, so the two regions (8 MB apart) need separate fetches.
+    {
+        const size_t n = hex_smin(FA_MERGE_LEAD * FA_MERGE_GROUP, r1 - r0);
+        hex_l2fetch_rows(oacc + r0 * stride, (uint32_t) stride, (uint32_t) n);
+    }
+    // the (m, l) lines of the first group; later groups' lines are loaded one group early
+    HVX_Vector vm_h[2] = { hvx_vmem(hm + r0), hvx_vmem(hm + r0 + 32) }, vl_h[2] = { hvx_vmem(hl + r0), hvx_vmem(hl + r0 + 32) };
+    HVX_Vector vm_o[2] = { hvx_vmem(om + r0), hvx_vmem(om + r0 + 32) }, vl_o[2] = { hvx_vmem(ol + r0), hvx_vmem(ol + r0 + 32) };
+
+    // row -> (iq1, iq2, iq3), advanced incrementally
+    size_t iq3 = r0 / ((size_t) neq2 * neq1);
+    size_t rem = r0 - iq3 * neq2 * neq1;
+    size_t iq2 = rem / neq1;
+    size_t iq1 = rem - iq2 * neq1;
+
+    for (size_t g = r0; g < r1; g += FA_MERGE_GROUP) {
+        const size_t n = hex_smin(FA_MERGE_GROUP, r1 - g);
+        const size_t pf  = g + FA_MERGE_LEAD * FA_MERGE_GROUP;
+        const size_t npf = pf < r1 ? hex_smin(FA_MERGE_GROUP, r1 - pf) : 0;
+        // this group's HTP rows were fetched a lead ago from the same thread; refresh the lead on
+        // the HTP side now and on the other engine's side after the weights, so the two fetches
+        // do not replace each other on this thread's single l2fetch engine
+        hex_l2fetch_rows(hacc + g * stride, (uint32_t) stride, (uint32_t) n);
+
+        // both partials are natural-log anchored; weights via the vector exp, clamped like the fold
+        for (int h = 0; h < FA_MERGE_GROUP / 32; ++h) {
+            const HVX_Vector vM   = Q6_Vsf_vmax_VsfVsf(vm_h[h], vm_o[h]);
+            const HVX_Vector vw_h = hvx_vec_exp_f32(Q6_Vsf_vmax_VsfVsf(HVX_OP_SUB_F32(vm_h[h], vM), v_lo));
+            const HVX_Vector vw_o = hvx_vec_exp_f32(Q6_Vsf_vmax_VsfVsf(HVX_OP_SUB_F32(vm_o[h], vM), v_lo));
+            const HVX_Vector vS   = HVX_OP_ADD_F32(HVX_OP_MUL_F32(vw_h, vl_h[h]), HVX_OP_MUL_F32(vw_o, vl_o[h]));
+            const HVX_VectorPred q_pos = Q6_Q_vcmp_gt_VsfVsf(vS, v_zero);
+            const HVX_Vector vinv = Q6_V_vmux_QVV(q_pos, hvx_vec_inverse_f32(vS), v_zero);   // S == 0: nothing to merge
+            hvx_vmem(wa + 32 * h) = HVX_OP_MUL_F32(vw_h, vinv);
+            hvx_vmem(wb + 32 * h) = HVX_OP_MUL_F32(vw_o, vinv);
+        }
+
+        if (npf) {
+            hex_l2fetch_rows(oacc + pf * stride, (uint32_t) stride, (uint32_t) npf);
+        }
+
+        // next group's (m, l) lines: issued here so they land during this group's combine
+        if (g + FA_MERGE_GROUP < r1) {
+            for (int h = 0; h < FA_MERGE_GROUP / 32; ++h) {
+                vm_h[h] = hvx_vmem(hm + g + FA_MERGE_GROUP + 32 * h);
+                vl_h[h] = hvx_vmem(hl + g + FA_MERGE_GROUP + 32 * h);
+                vm_o[h] = hvx_vmem(om + g + FA_MERGE_GROUP + 32 * h);
+                vl_o[h] = hvx_vmem(ol + g + FA_MERGE_GROUP + 32 * h);
+            }
+        }
+
+        for (size_t j = 0; j < n; ++j) {
+            const size_t r = g + j;
+            float * out = (float *) ((uint8_t *) dst->data + iq2 * dst->nb[1] + iq1 * dst->nb[2] + iq3 * dst->nb[3]);
+            const float * a = (const float *) (hacc + r * stride);
+            const float * b = (const float *) (oacc + r * stride);
+            const HVX_Vector v_a = hvx_vec_splat_f32(wa[j]);
+            const HVX_Vector v_b = hvx_vec_splat_f32(wb[j]);
+            for (size_t d = 0; d < DV; d += 32) {
+                HVX_Vector v = HVX_OP_ADD_F32(HVX_OP_MUL_F32(v_a, hvx_vmem(a + d)), HVX_OP_MUL_F32(v_b, hvx_vmem(b + d)));
+                *(HVX_UVector *) (out + d) = v;
+            }
+            if (++iq1 == neq1) {
+                iq1 = 0;
+                if (++iq2 == neq2) {
+                    iq2 = 0;
+                    ++iq3;
+                }
+            }
+        }
+    }
+}
+
+// Bail out of the HMX prefill op without leaving the DSP in a state later ops inherit. The KV
+// pipeline runs one iteration ahead, so at it > 0 the ring already holds this iteration's Q and
+// first chunk; a bare return hands those descriptors to whatever op runs next.
+static int fa_fold_bail(dma_queue * dma, const char * why, uint32_t a, uint32_t b) {
+    FARF(ERROR, "fa fold: %s (%u, %u)", why, a, b);
+    dma_queue_flush(dma);
+    return HTP_STATUS_INTERNAL_ERR;
+}
+
+// One 32-row group of the fold: gather the partial's (m, l) for these rows, combine with the
+// HTP's own running (m, l), and leave w_other/S_total in het_g. Returns w_htp/S_total, the
+// diagonal the HMX normalization multiplies O by.
+//
+// Rows of a tile are (token, GQA head) pairs with the head index moving fastest -- the same
+// order fa_o_store_impl_f32 walks, so the two agree on which partial belongs to which row.
+static inline HVX_Vector fa_fold_weights_vec(struct hmx_fa_context * factx,
+                                          size_t                  i,
+                                          size_t                  n_rows_g,
+                                          uint32_t                q_start,
+                                          uint32_t                kv_head,
+                                          uint32_t                ib3,
+                                          uint32_t                neq2,
+                                          uint32_t                G,
+                                          HVX_Vector              v_l2,
+                                          HVX_Vector              v_ln2,
+                                          HVX_Vector              v_lo,
+                                          float *                 m_o,
+                                          float *                 l_o,
+                                          HVX_Vector *            w_other) {
+    const size_t r0 = i * 32;
+    for (size_t j = 0; j < 32; ++j) {
+        const size_t r = r0 + j;
+        if (r >= n_rows_g) {
+            m_o[j] = HTP_FA_M_INITIAL_VAL;
+            l_o[j] = 0.0f;
+            continue;
+        }
+        const size_t q_idx = fastdiv(r, &factx->div_G);
+        const size_t h_idx = fastmodulo(r, G, &factx->div_G);
+        const size_t hrow  = ((size_t) ib3 * neq2 + (kv_head * G + h_idx)) * factx->het_neq1 + (q_start + q_idx);
+        m_o[j] = factx->het_m[hrow];
+        l_o[j] = factx->het_l[hrow];
+    }
+
+    const HVX_Vector vm_h = factx->vtcm_m_vec[i];                              // base-2 already
+    const HVX_Vector vl_h = factx->vtcm_l_vec[i];
+    // vtcm_m_vec does NOT hold m: it holds (m + scale) * log2(e). The extra scale term cancels in
+    // the O/l normalization, so nothing in the non-folded kernel can see it -- but an external
+    // partial must carry the same bias or the two anchors are compared on different footings.
+    // Verified on device at DK=128 and DK=64, where the measured offset tracks scale * log2(e).
+    const HVX_Vector v_bias = hvx_vec_splat_f32((float) factx->scale);
+    const HVX_Vector vm_o = HVX_OP_ADD_F32(HVX_OP_MUL_F32(hvx_vmem(m_o), v_l2), v_bias);
+    const HVX_Vector vl_o = hvx_vmem(l_o);
+
+    const HVX_Vector vM  = Q6_Vsf_vmax_VsfVsf(vm_h, vm_o);
+    const HVX_Vector dh  = Q6_Vsf_vmax_VsfVsf(HVX_OP_SUB_F32(vm_h, vM), v_lo);
+    const HVX_Vector don = Q6_Vsf_vmax_VsfVsf(HVX_OP_SUB_F32(vm_o, vM), v_lo);
+    const HVX_Vector w_h = hvx_vec_exp_f32(HVX_OP_MUL_F32(dh, v_ln2));
+    const HVX_Vector w_o = hvx_vec_exp_f32(HVX_OP_MUL_F32(don, v_ln2));
+
+    const HVX_Vector S    = HVX_OP_ADD_F32(HVX_OP_MUL_F32(w_h, vl_h), HVX_OP_MUL_F32(w_o, vl_o));
+    const HVX_Vector invS = hvx_vec_inverse_f32(S);
+
+    *w_other = HVX_OP_MUL_F32(w_o, invS);
+
+
+    return HVX_OP_MUL_F32(w_h, invS);
+}
+
+// Diagonal-builder form: w_other/S_total goes to het_g[r] for the store thread, w_htp/S_total is returned.
+static inline HVX_Vector fa_fold_diag_vec(struct hmx_fa_context * factx, size_t i, size_t n_rows_g, uint32_t q_start,
+                                          uint32_t kv_head, uint32_t ib3, uint32_t neq2, uint32_t G, HVX_Vector v_l2,
+                                          HVX_Vector v_ln2, HVX_Vector v_lo, float * m_o, float * l_o) {
+    HVX_Vector w_other;
+    const HVX_Vector w_h = fa_fold_weights_vec(factx, i, n_rows_g, q_start, kv_head, ib3, neq2, G, v_l2, v_ln2, v_lo, m_o, l_o, &w_other);
+    hvx_vmem(factx->het_g + i * 32) = w_other;
+    return w_h;
+}
+
+// Fold variant of fa_build_d_diag_inv_l. With a partial from another engine the correct final
+// diagonal is w_htp/S_total, not 1/l -- so the rescale of the HTP's own accumulator costs nothing
+// beyond a different diagonal, and only the other engine's term needs new work in the store.
+//
+// The two domains differ and the mismatch is SILENT: the HMX path folds log2(e) into scale
+// (factx.scale *= EXP_LOG2E_F) so its m is base-2, while the partial's m is natural. Only m
+// converts; l is a sum of exp(x - m) terms and has the same value in either base.
+// The diagonal builder's prefetch, on its own: G runs of the tile's m, l and acc records into L2.
+static void fa_fold_prefetch_tile(struct hmx_fa_context * factx, size_t n_rows_g, uint32_t q_start, uint32_t kv_head,
+                                  uint32_t ib3, uint32_t neq2) {
+    const uint32_t G        = factx->G;
+    const size_t   n_rows_q = (n_rows_g + G - 1) / G;
+    for (uint32_t h = 0; h < G; ++h) {
+        const size_t row0 = ((size_t) ib3 * neq2 + (kv_head * G + h)) * factx->het_neq1 + q_start;
+        hex_l2fetch_rows(factx->het_m + row0, (uint32_t) (n_rows_q * sizeof(float)), 1);
+        hex_l2fetch_rows(factx->het_l + row0, (uint32_t) (n_rows_q * sizeof(float)), 1);
+        hex_l2fetch_rows(factx->het_acc + row0 * factx->het_acc_stride, (uint32_t) factx->het_acc_stride, (uint32_t) n_rows_q);
+    }
+}
+
+static __attribute__((noinline)) void fa_build_d_diag_fold(struct hmx_fa_context * factx,
+                                                           size_t                  n_row_tiles,
+                                                           size_t                  n_rows_g,
+                                                           uint32_t                q_start,
+                                                           uint32_t                kv_head,
+                                                           uint32_t                ib3,
+                                                           uint32_t                neq2) {
+    // The fold reads its partials from DDR. Tile rows interleave the G GQA heads, but for ONE head
+    // the records are contiguous in the row index, so the tile's partials are G runs of
+    // n_rows_q records. Pull them into L2 before the gather touches them one scalar at a time --
+    // without this the gather misses to DRAM on every row and costs more than the whole op.
+    {
+        const uint32_t G       = factx->G;
+        const size_t   n_rows_q = (n_rows_g + G - 1) / G;
+        for (uint32_t h = 0; h < G; ++h) {
+            const size_t row0 = ((size_t) ib3 * neq2 + (kv_head * G + h)) * factx->het_neq1 + q_start;
+            hex_l2fetch_rows(factx->het_m + row0, (uint32_t) (n_rows_q * sizeof(float)), 1);
+            hex_l2fetch_rows(factx->het_l + row0, (uint32_t) (n_rows_q * sizeof(float)), 1);
+            hex_l2fetch_rows(factx->het_acc + row0 * factx->het_acc_stride, (uint32_t) factx->het_acc_stride, (uint32_t) n_rows_q);
+        }
+    }
+
+    const HVX_Vector     v_offsets = *(const HVX_Vector *) d_tile_scatter_offsets;
+    const HVX_VectorPred q_32_mask = Q6_Q_vsetq_R(32 * sizeof(__fp16));
+
+    const uint32_t G      = factx->G;
+    const HVX_Vector v_l2 = hvx_vec_splat_f32(EXP_LOG2E_F);
+    const HVX_Vector v_ln2  = hvx_vec_splat_f32(0.6931471805599453f);
+    // exp2(x) = exp(x * ln2). Clamped so an empty partial (m = HTP_FA_M_INITIAL_VAL) cannot
+    // reach the exp as -inf and return NaN, which would then survive the NaN * 0 acc term.
+    const HVX_Vector v_lo = hvx_vec_splat_f32(-80.0f);
+
+    HVX_Vector v_content = Q6_V_vzero();
+    float m_o[32] __attribute__((aligned(128)));
+    float l_o[32] __attribute__((aligned(128)));
+    HVX_Vector d_hi = Q6_V_vzero();
+
+    for (size_t i = 0; i < n_row_tiles; ++i) {
+        if ((i % 2) == 0) {
+            HVX_Vector d_lo = fa_fold_diag_vec(factx, i, n_rows_g, q_start, kv_head, ib3, neq2, G,
+                                               v_l2, v_ln2, v_lo, m_o, l_o);
+            d_hi = (i + 1 < n_row_tiles)
+                       ? fa_fold_diag_vec(factx, i + 1, n_rows_g, q_start, kv_head, ib3, neq2, G,
+                                          v_l2, v_ln2, v_lo, m_o, l_o)
+                       : Q6_V_vzero();
+            v_content = hvx_vec_f32_to_f16(d_lo, d_hi);
         } else {
             v_content = Q6_V_vror_VR(v_content, 64);
         }
@@ -2239,10 +3056,13 @@ static inline void fa_prefetch_block(dma_queue * dma, const struct htp_tensor * 
 // n_kv_heads-separated iterations and every slot is overwritten in between. Dense and
 // shared-selection keep kv_head_outer = false, i.e. the original order, byte for byte.
 struct fa_iter_order {
-    uint32_t n_q_blocks;
-    uint32_t n_kv_heads;
-    bool     kv_head_outer;
+    uint32_t         n_q_blocks;
+    uint32_t         n_kv_heads;
+    bool             kv_head_outer;
+    const uint16_t * perm;   // optional: it -> linear index in the base order (STAGED fold)
+    uint32_t         n_iter; // perm's length; it >= n_iter is the loop's "one past the end" probe
 };
+#define FA_ITER_PERM_MAX 1024
 
 struct fa_iter {
     uint32_t ib3;
@@ -2251,6 +3071,12 @@ struct fa_iter {
 };
 
 static inline struct fa_iter fa_iter_at(const struct fa_iter_order * o, uint32_t it) {
+    // The tail prefetch asks for it + 1 on the LAST iteration too, and reads ib3 >= neq3 as "no
+    // successor". Past the table that probe must stay unpermuted, or it indexes stack garbage and
+    // can invent a next tile whose DMAs land on the tile still being stored.
+    if (o->perm && it < o->n_iter) {
+        it = o->perm[it];
+    }
     const uint32_t per_seq = o->n_q_blocks * o->n_kv_heads;
     struct fa_iter r;
     r.ib3 = it / per_seq;
@@ -2488,6 +3314,247 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     // dma_cache picks its own slot and pushes exactly one descriptor, so it can only
     // serve a chunk that is a single block.
     factx.mask_use_cache      = (factx.m <= 1) && factx.mask_broadcast;
+    // Per-row weight for the other engine's accumulator, built with the diagonal and consumed by
+    // the store. Stack rather than VTCM so the fold cannot shift the tile-size search and
+    // invalidate every measurement taken without it.
+    float het_g_scratch[HTP_FA_FOLD_MAX_G_BR + 32];
+
+    // Hetero prefill fold (dev prototype; see htp-ops.h). src[7] describes itself, so a buffer
+    // whose magic does not match leaves every path below bit-identical to the non-folded kernel.
+    // A buffer whose magic DOES match is a promise that another engine owns part of this softmax,
+    // so from here on nothing may quietly drop it: a shape the prototype cannot serve fails the op
+    // instead of falling back to an HTP-only answer that still looks like a plausible tensor.
+    factx.het_m          = NULL;
+    factx.het_l          = NULL;
+    factx.het_acc        = NULL;
+    factx.het_acc_stride = 0;
+    factx.het_neq1       = 0;
+    factx.het_g          = NULL;
+    factx.het_hm         = NULL;
+    factx.het_hl         = NULL;
+    factx.het_hacc       = NULL;
+    factx.fold_spill     = false;
+    factx.fold_nomerge   = false;
+    factx.fold_staged    = false;
+    factx.fold_stage_qb  = false;
+    factx.fold_stage_qbh = false;
+    factx.fold_need_inval = true;
+    factx.xmask          = NULL;
+    factx.xmask_nbk      = 0;
+    factx.xmask_num_sb   = 0;
+    factx.fold_n_kv_heads = 0;
+    factx.fold_instore   = false;
+    factx.fold_probe     = 0;
+    factx.fold_pf_early  = false;
+    factx.fold_tile      = false;
+    factx.fold_exc       = NULL;
+    factx.fold_num_sb    = 0;
+    factx.fold_exc_nbk   = 0;
+    factx.fold_stage_seen   = 0;
+    factx.fold_wait_us_acc  = 0;
+    factx.fold_tiles_blocked = 0;
+    if (octx->src[7] && octx->src[7]->data) {
+        uint8_t * const fb = (uint8_t *) (uintptr_t) octx->src[7]->data;
+        // The host writes this header from the CPU. A line left over from an earlier op on the
+        // same buffer would hand us the previous graph's offsets.
+        Q6_dcinva_A(fb);
+        Q6_dcinva_A(fb + HEX_L2_LINE_SIZE);
+        const struct htp_fa_fold_hdr * fh = (const struct htp_fa_fold_hdr *) fb;
+        if (fh->magic == HTP_FA_FOLD_MAGIC) {
+            const uint64_t rows       = (uint64_t) neq1 * neq2 * neq3;
+            const bool     acc_f16    = (fh->flags & HTP_FA_FOLD_F_ACC_F16) != 0;
+            const uint64_t acc_stride = (uint64_t) DV * (acc_f16 ? sizeof(__fp16) : sizeof(float));
+            const uint64_t ml_bytes   = rows * sizeof(float);
+            const uint64_t bufsz      = octx->src[7]->size;
+            // Reject every configuration whose softmax is not in the domain the partial is written
+            // in. With a softcap factx.scale keeps its NATURAL value (see the branch above), so the
+            // fold's bias would be scale rather than scale*log2(e), and the HTP's logits are
+            // tanh-capped while the producer's are not. ALiBi adds a per-head slope the producer
+            // does not apply, and sinks are folded in by the HTP alone. Each of those is a
+            // plausible-looking tensor, not an error, so they fail the op here.
+            const bool bad_domain = kparams->logit_softcap != 0.0f || kparams->max_bias != 0.0f || octx->src[4];
+            if (bad_domain || !factx.is_dst_fp32 || fh->neq1 != neq1 || fh->dv != DV || (uint64_t) fh->rows != rows ||
+                factx.g_br > HTP_FA_FOLD_MAX_G_BR ||
+                (fh->off_m % 128) != 0 || (fh->off_l % 128) != 0 || (fh->off_acc % 128) != 0 ||
+                (uint64_t) fh->off_m + ml_bytes > bufsz ||
+                (uint64_t) fh->off_l + ml_bytes > bufsz ||
+                (uint64_t) fh->off_acc + rows * acc_stride > bufsz) {
+                FARF(ERROR, "fa fold: unusable: softcap %d alibi %d sinks %d | rows %u want %u, neq1 %u want %u, dv %u want %u, g_br %u, dst_f32 %u, size %u",
+                     kparams->logit_softcap != 0.0f, kparams->max_bias != 0.0f, octx->src[4] != NULL,
+                     fh->rows, (unsigned) rows, fh->neq1, neq1, fh->dv, DV, factx.g_br,
+                     (unsigned) factx.is_dst_fp32, octx->src[7]->size);
+                return HTP_STATUS_INVAL_PARAMS;
+            }
+            factx.het_m          = (const float *) (fb + fh->off_m);
+            factx.het_l          = (const float *) (fb + fh->off_l);
+            factx.het_acc        = fb + fh->off_acc;
+            factx.het_acc_stride = (size_t) acc_stride;
+            factx.het_neq1       = fh->neq1;
+            factx.het_g          = (float *) (((uintptr_t) het_g_scratch + 127) & ~(uintptr_t) 127);
+            // Exactly the ranges the fold reads: m[rows], l[rows], acc[rows][dv].
+            factx.fold_m_bytes   = (size_t) ml_bytes;
+            factx.fold_l_bytes   = (size_t) ml_bytes;
+            factx.fold_acc_bytes = (size_t) (rows * acc_stride);
+            factx.fold_instore   = (fh->flags & HTP_FA_FOLD_F_INSTORE) != 0;
+            factx.fold_acc_f16   = acc_f16;
+            if (acc_f16 && (!factx.fold_instore || (fh->flags & HTP_FA_FOLD_F_SPILL))) {
+                FARF(ERROR, "fa fold: ACC_F16 needs INSTORE and excludes SPILL (flags %u)", fh->flags);
+                return HTP_STATUS_INVAL_PARAMS;
+            }
+            factx.fold_probe     = fh->flags & (HTP_FA_FOLD_F_PROBE_NOPF | HTP_FA_FOLD_F_PROBE_TILEPF |
+                                                HTP_FA_FOLD_F_PROBE_NOWEIGHTS | HTP_FA_FOLD_F_PROBE_NOACC |
+                                                HTP_FA_FOLD_F_PROBE_NOINVAL | HTP_FA_FOLD_F_PROBE_INVAL);
+
+            // A live producer fills the partial while this op runs. Without the flag the partial
+            // is already resident and the op behaves exactly as it did before the handshake.
+            if (fh->flags & HTP_FA_FOLD_F_LIVE) {
+                const uint64_t ctl_end = (uint64_t) fh->off_ctl + HTP_FA_HETERO_STATUS_OFF +
+                                         HTP_FA_FOLD_ST_N * sizeof(uint32_t);
+                // >= 256 keeps the control region clear of the two header lines invalidated above,
+                // which would otherwise discard the ready word of slot 0.
+                // The control region is 96 KB + change (HTP_FA_HETERO_STATUS_OFF), so "it fits in
+                // the buffer" is not enough: overlapping m, l or acc would have the producer's
+                // ready/done words land inside a partial the fold then reads as data.
+                const uint64_t m_end   = (uint64_t) fh->off_m   + ml_bytes;
+                const uint64_t l_end   = (uint64_t) fh->off_l   + ml_bytes;
+                const uint64_t a_end   = (uint64_t) fh->off_acc + rows * acc_stride;
+                const uint64_t c_beg   = fh->off_ctl;
+                const bool overlaps = (c_beg < m_end && fh->off_m   < ctl_end) ||
+                                      (c_beg < l_end && fh->off_l   < ctl_end) ||
+                                      (c_beg < a_end && fh->off_acc < ctl_end);
+                if (fh->slot >= HTP_FA_FOLD_MAX_SLOTS || fh->off_ctl < 256 || (fh->off_ctl % 128) != 0 ||
+                    ctl_end > bufsz || overlaps) {
+                    FARF(ERROR, "fa fold: live producer with a bad control region: slot %u off_ctl %u size %u overlaps %d",
+                         fh->slot, fh->off_ctl, octx->src[7]->size, (int) overlaps);
+                    return HTP_STATUS_INVAL_PARAMS;
+                }
+                uint8_t * const ctl   = fb + fh->off_ctl;
+                factx.fold_ready      = (volatile uint32_t *) (ctl + (size_t) fh->slot * HTP_FA_HETERO_SLOT_STRIDE);
+                factx.fold_done       = (volatile uint32_t *) (ctl + (size_t) fh->slot * HTP_FA_HETERO_SLOT_STRIDE + 128);
+                if (fh->off_done) {
+                    // a longer done line outside the slot: no overlap with the partial or the control region
+                    const uint64_t d_beg = fh->off_done, d_end = d_beg + HTP_FA_FOLD_MAX_STAGES * sizeof(uint32_t);
+                    const bool d_bad = (fh->off_done % 128) != 0 || d_beg < 256 || d_end > bufsz ||
+                                       (d_beg < m_end && fh->off_m < d_end) || (d_beg < l_end && fh->off_l < d_end) ||
+                                       (d_beg < a_end && fh->off_acc < d_end) || (d_beg < ctl_end && c_beg < d_end);
+                    if (d_bad) {
+                        FARF(ERROR, "fa fold: bad done line off_done %u", fh->off_done);
+                        return HTP_STATUS_INVAL_PARAMS;
+                    }
+                    factx.fold_done = (volatile uint32_t *) (fb + fh->off_done);
+                }
+                factx.fold_status     = (volatile uint32_t *) (ctl + HTP_FA_HETERO_STATUS_OFF);
+                factx.fold_slot       = fh->slot;
+                factx.fold_timeout_us = fh->timeout_us ? fh->timeout_us : HTP_FA_FOLD_DONE_TIMEOUT_US;
+                factx.fold_flush_kv   = (fh->flags & HTP_FA_FOLD_F_FLUSH_KV) != 0;
+                factx.fold_noflush    = (fh->flags & HTP_FA_FOLD_F_NOFLUSH) != 0;
+                // Stale partial lines can only be ones this DSP read in an earlier fold. If a whole-L2
+                // flush-invalidate ran since (the op-start flush is one whenever > 4 MB of inputs are
+                // dirty; Q alone is 8 MB at ub 1024) nothing stale is left and the per-stage range
+                // invalidation (~8 MB of dcinva per op, ~115 us) is skipped; otherwise one whole-L2
+                // invalidate here replaces it. (Doing the whole-L2 flush unconditionally cost ~18% of
+                // pp4096 and fixed nothing: the producer's stale reads were on the GPU's side, see
+                // the submission trigger in ggml-hexagon.cpp.)
+                {
+                    struct htp_context * hctx = octx->ctx;
+                    if (hctx->l2_inval_epoch == hctx->fold_l2_epoch_seen) {
+                        qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
+                        hctx->l2_inval_epoch++;
+                        FARF(HIGH, "fa fold: whole-L2 invalidate before ready (no flush since the last fold)");
+                    }
+                    hctx->fold_l2_epoch_seen = hctx->l2_inval_epoch;
+                    factx.fold_need_inval = (factx.fold_probe & HTP_FA_FOLD_F_PROBE_INVAL) != 0;
+                }
+            }
+
+            if (fh->flags & HTP_FA_FOLD_F_STAGED) {
+                const uint32_t num_sb    = (neq1 + HTP_FA_FOLD_EXC_SB - 1) / HTP_FA_FOLD_EXC_SB;
+                if (fh->off_exc == 0) {
+                    // The membership is src[8] itself: F32 [NBk, R, NBq/R, n_kv_heads], one 0/1 row of
+                    // NBk per (head, 64-token sub-block) in exactly the (head * num_sb + sb) order.
+                    const struct htp_tensor * em = octx->src[8];
+                    const bool bad = !em || !em->data || em->type != HTP_TYPE_F32 || em->nb[0] != sizeof(float) ||
+                                     (uint64_t) em->ne[1] * em->ne[2] != num_sb || em->ne[3] != n_kv_heads ||
+                                     !(fh->flags & HTP_FA_FOLD_F_LIVE) || neq3 != 1 || n_kv_heads > HTP_FA_FOLD_MAX_STAGES;
+                    if (bad) {
+                        FARF(ERROR, "fa fold: STAGED with src[8] membership unusable: em %p heads %u num_sb %u", em, n_kv_heads, num_sb);
+                        return HTP_STATUS_INVAL_PARAMS;
+                    }
+                    factx.fold_staged  = true;
+                    factx.fold_exc     = (const uint32_t *) (uintptr_t) em->data;   // this DSP wrote it: coherent
+                    factx.fold_num_sb  = num_sb;
+                    factx.fold_exc_nbk = em->ne[0];
+                } else {
+                const uint64_t exc_bytes = (uint64_t) n_kv_heads * num_sb * (fh->exc_nbk ? fh->exc_nbk : 1) * sizeof(uint32_t);
+                const uint64_t exc_beg   = fh->off_exc, exc_end = exc_beg + exc_bytes;
+                const uint64_t m_end  = (uint64_t) fh->off_m + ml_bytes, l_end = (uint64_t) fh->off_l + ml_bytes;
+                const uint64_t a_end  = (uint64_t) fh->off_acc + rows * acc_stride;
+                const uint64_t c_end  = (uint64_t) fh->off_ctl + HTP_FA_HETERO_STATUS_OFF + HTP_FA_FOLD_ST_N * sizeof(uint32_t);
+                const bool overlaps = (exc_beg < m_end && fh->off_m < exc_end) || (exc_beg < l_end && fh->off_l < exc_end) ||
+                                      (exc_beg < a_end && fh->off_acc < exc_end) || (exc_beg < c_end && fh->off_ctl < exc_end);
+                if (!(fh->flags & HTP_FA_FOLD_F_LIVE) || neq3 != 1 || n_kv_heads > HTP_FA_FOLD_MAX_STAGES ||
+                    (fh->off_exc % 128) != 0 || exc_beg < 256 || exc_end > bufsz || overlaps) {
+                    FARF(ERROR, "fa fold: STAGED unusable: flags %u neq3 %u heads %u off_exc %u size %u overlaps %d",
+                         fh->flags, neq3, n_kv_heads, fh->off_exc, octx->src[7]->size, (int) overlaps);
+                    return HTP_STATUS_INVAL_PARAMS;
+                }
+                factx.fold_staged = true;
+                factx.fold_exc    = (const uint32_t *) (fb + fh->off_exc);
+                factx.fold_num_sb = num_sb;
+                factx.fold_exc_nbk = fh->exc_nbk;
+                fa_fold_inval_range(factx.fold_exc, (size_t) exc_bytes);   // host-written before the op
+                }
+            }
+
+            if (factx.fold_staged) {
+                factx.fold_stage_qbh   = (fh->flags & HTP_FA_FOLD_F_STAGE_QBH) != 0;
+                factx.fold_stage_qb    = factx.fold_stage_qbh || (fh->flags & HTP_FA_FOLD_F_STAGE_QB) != 0;
+                factx.fold_n_kv_heads  = n_kv_heads;
+                const uint32_t n_qb     = (neq1 + factx.Br - 1) / factx.Br;
+                const uint32_t n_stages = factx.fold_stage_qbh ? n_qb * n_kv_heads : factx.fold_stage_qb ? n_qb : n_kv_heads;
+                const uint32_t max_st   = fh->off_done ? HTP_FA_FOLD_MAX_STAGES : HTP_FA_FOLD_LINE_STAGES;
+                if (n_stages > max_st) {
+                    FARF(ERROR, "fa fold: STAGED: %u stages exceed the done line (%u)", n_stages, max_st);
+                    return HTP_STATUS_INVAL_PARAMS;
+                }
+            }
+
+            if (fh->flags & HTP_FA_FOLD_F_SPILL) {
+                // Same shape rules as the other engine's regions, plus disjointness from them: the
+                // merge reads both sides, so an overlap would read a row of one as the other.
+                const uint64_t hm_end = (uint64_t) fh->off_hm + ml_bytes, hl_end = (uint64_t) fh->off_hl + ml_bytes;
+                const uint64_t ha_end = (uint64_t) fh->off_hacc + rows * acc_stride;
+                const uint64_t m_end  = (uint64_t) fh->off_m + ml_bytes,  l_end = (uint64_t) fh->off_l + ml_bytes;
+                const uint64_t a_end  = (uint64_t) fh->off_acc + rows * acc_stride;
+                const bool bad = (fh->off_hm % 128) || (fh->off_hl % 128) || (fh->off_hacc % 128) ||
+                                 hm_end > bufsz || hl_end > bufsz || ha_end > bufsz ||
+                                 (fh->flags & (HTP_FA_FOLD_F_LIVE | HTP_FA_FOLD_F_INSTORE)) ||
+                                 (fh->off_hm < a_end && fh->off_acc < hm_end) || (fh->off_hl < a_end && fh->off_acc < hl_end) ||
+                                 (fh->off_hacc < a_end && fh->off_acc < ha_end) ||
+                                 (fh->off_hacc < m_end && fh->off_m < ha_end) || (fh->off_hacc < l_end && fh->off_l < ha_end);
+                if (bad) {
+                    FARF(ERROR, "fa fold: SPILL regions unusable: hm %u hl %u hacc %u size %u", fh->off_hm, fh->off_hl, fh->off_hacc, octx->src[7]->size);
+                    return HTP_STATUS_INVAL_PARAMS;
+                }
+                factx.het_hm     = (float *) (fb + fh->off_hm);
+                factx.het_hl     = (float *) (fb + fh->off_hl);
+                factx.het_hacc   = fb + fh->off_hacc;
+                factx.fold_spill = true;
+                factx.fold_nomerge = (fh->flags & HTP_FA_FOLD_F_NOMERGE) != 0;
+            }
+
+            // The partial came from another engine either way. With a live producer fa_fold_wait_done
+            // invalidates after `done`; with flags = 0 nobody else will, and a line this DSP kept
+            // from an earlier op through the same allocation is a silently wrong anchor. Must run
+            // after the block above, which is where fold_ready and the three sizes are settled.
+            if (!factx.fold_ready) {
+                fa_fold_inval_range(factx.het_m, factx.fold_m_bytes);
+                fa_fold_inval_range(factx.het_l, factx.fold_l_bytes);
+                fa_fold_inval_range(factx.het_acc, factx.fold_acc_bytes);
+            }
+        }
+    }
+
     factx.q_tile_bytes        = L.q_tile_bytes;
     factx.o_tile_bytes        = L.o_tile_bytes;
     factx.col_vec_bytes       = L.col_vec_bytes;
@@ -2505,6 +3572,13 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     // ======== Skip compute if profiling ========
     if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
         return HTP_STATUS_OK;
+    }
+
+    // ======== Start the live producer ========
+    // As early as the op can: it reads Q, not anything the KV loop below produces, so this is
+    // pure overlap. The matching wait is at the first fold, at the bottom of the first tile.
+    if (factx.fold_ready) {
+        fa_fold_publish_ready(&factx, q, k, v);
     }
 
     // ======== KV block residency map ========
@@ -2528,6 +3602,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     iter_order.n_q_blocks    = (neq1 + Br - 1) / Br;
     iter_order.n_kv_heads    = n_kv_heads;
     iter_order.kv_head_outer = false;
+    iter_order.perm          = NULL;
+    iter_order.n_iter        = 0;
     {
         const uint32_t res_mode = kparams->u.hmx.res_mode;
         const bool     eligible =
@@ -2556,6 +3632,56 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
             factx.res_epoch_kv_head = UINT32_MAX;
             iter_order.kv_head_outer = true;
         }
+    }
+
+    // STAGED fold: exception-free tiles first (plain path, nothing to wait for), then the
+    // exception tiles in the producer's delivery order, KV head ascending and query block
+    // ascending within it. Indices are in the base (query-block-outer) order, so the
+    // permutation is the only order-dependent thing here.
+    // Exact-mask mode: a membership in src[8] with NO fold buffer. Same tensor shape as the
+    // split's exception membership (F32 [NBk, R, NBq/R, n_kv_heads]) but carrying every selected
+    // (sub-block, block) pair; the tile's list is the union and the softmax masks the rest.
+    if (!factx.het_m && octx->src[8] && octx->src[8]->data) {
+        const struct htp_tensor * em     = octx->src[8];
+        const uint32_t            num_sb = (neq1 + HTP_FA_FOLD_EXC_SB - 1) / HTP_FA_FOLD_EXC_SB;
+        const uint32_t            nkvh   = k->ne[2];
+        if (!factx.sel || em->type != HTP_TYPE_F32 || em->nb[0] != sizeof(float) ||
+            (uint64_t) em->ne[1] * em->ne[2] != num_sb || em->ne[3] != nkvh) {
+            FARF(ERROR, "fa exact-mask: membership unusable (sel %d type %u ne %u %u %u %u, want num_sb %u heads %u)",
+                 factx.sel != NULL, em->type, em->ne[0], em->ne[1], em->ne[2], em->ne[3], num_sb, nkvh);
+            return HTP_STATUS_INVAL_PARAMS;
+        }
+        factx.xmask        = (const float *) (uintptr_t) em->data;   // this DSP wrote it: coherent
+        factx.xmask_nbk    = em->ne[0];
+        factx.xmask_num_sb = num_sb;
+    }
+
+    uint16_t iter_perm[FA_ITER_PERM_MAX];
+    if (factx.fold_staged) {
+        const uint32_t n_it = neq3 * iter_order.n_q_blocks * iter_order.n_kv_heads;
+        if (n_it > FA_ITER_PERM_MAX) {
+            FARF(ERROR, "fa fold: STAGED: %u tiles exceed the permutation table (%u)", n_it, FA_ITER_PERM_MAX);
+            return HTP_STATUS_INVAL_PARAMS;
+        }
+        // Exception tiles follow the producer's delivery order: KV head outer when it stages by
+        // head, query block outer (the default order, which keeps the mask cache's cross-head
+        // reuse) when it stages by query block.
+        uint32_t n = 0;
+        for (int pass = 0; pass < 2; ++pass) {
+            const uint32_t n_outer = factx.fold_stage_qb ? iter_order.n_q_blocks : iter_order.n_kv_heads;
+            const uint32_t n_inner = factx.fold_stage_qb ? iter_order.n_kv_heads : iter_order.n_q_blocks;
+            for (uint32_t o = 0; o < n_outer; ++o) {
+                for (uint32_t i = 0; i < n_inner; ++i) {
+                    const uint32_t qb = factx.fold_stage_qb ? o : i, kvh = factx.fold_stage_qb ? i : o;
+                    if (fa_fold_tile_has_exc(&factx, kvh, qb * Br, neq1) == (pass == 1)) {
+                        iter_perm[n++] = (uint16_t) (qb * iter_order.n_kv_heads + kvh);
+                    }
+                }
+            }
+        }
+        iter_order.kv_head_outer = false;
+        iter_order.perm          = iter_perm;
+        iter_order.n_iter        = n_it;
     }
 
     // ======== DMA setup ========
@@ -2595,6 +3721,15 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
             const uint32_t kv_head = cur.kv_head;
             const uint32_t im3     = mask ? fastmodulo(ib3, mask->ne[3], &factx.src3_div3) : 0;
 
+            // Which path this tile takes. Staged: only tiles with exceptions fold (and wait);
+            // the rest run the kernel exactly as without a partial.
+            factx.fold_tile = factx.het_m && !factx.fold_spill &&
+                              (!factx.fold_staged || fa_fold_tile_has_exc(&factx, kv_head, q_start, neq1));
+            // In-store fold: if the partial is already readable, the softmax threads of the first
+            // chunk prefetch it a whole tile ahead of the store; otherwise the store fetches late.
+            factx.fold_pf_early = factx.fold_tile && factx.fold_instore && !(factx.fold_probe & HTP_FA_FOLD_F_PROBE_NOPF) &&
+                                  fa_fold_partial_valid(&factx, q_start, kv_head);
+
             const uint32_t n_rows_q    = hex_smin(Br, neq1 - q_start);
             const size_t   n_rows_g    = n_rows_q * G;
             const size_t   g_br_actual = hex_align_up(n_rows_g, HMX_FP16_TILE_N_ROWS);
@@ -2614,6 +3749,13 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
             const uint32_t row_nsel   = factx.sel ? fa_row_nsel(&factx, qb, kv_head, ib3) : 0;
             const uint32_t row_chunks = factx.sel ? (row_nsel + factx.m - 1) / factx.m
                                                   : factx.n_kv_blocks;
+
+            // The fold builds its diagonal and its het_g weights in the KV-loop epilogue. With no
+            // chunks there is no epilogue, and the store would de-tile against an undefined
+            // het_g -- a wrong tile with no error anywhere.
+            if (factx.het_m && row_chunks == 0) {
+                return fa_fold_bail(dma, "tile has no KV chunks", q_start, kv_head);
+            }
 
             // Trace tag. Both inner axes are in it, because with the KV head outside the
             // query block loop a bare q_start recurs once per head and the phases become
@@ -2635,7 +3777,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                 // 1. Push Q and KV DMAs for the very first iteration.
                 // Subsequent iterations are enqueued early at the end of the previous iteration.
                 if (it == 0) {
-                    const uint8_t * q_ptr = (const uint8_t *) q->data;
+                    // The first tile is (0, 0, 0) only in the base order; a permuted order (STAGED
+                    // fold) may start anywhere, so address Q the way the tail prefetch does.
+                    const uint8_t * q_ptr = (const uint8_t *) q->data + q_start * q->nb[1] + (kv_head * factx.G) * q->nb[2] + ib3 * q->nb[3];
                     const size_t q_row_bytes = q_transposed ? n_rows_q * q_row_bytes_trans_factor : q_row_bytes_untransposed;
                     const size_t n_rows      = q_transposed ? factx.G : n_rows_q;
                     dma_queue_push(dma, dma_make_ptr(factx.vtcm_q_dma, q_ptr), q_row_bytes, hex_smax(q_src_stride, q_row_bytes), q_row_bytes, n_rows);
@@ -2799,6 +3943,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         sargs.kv_head              = kv_head;
                         sargs.kv_start             = kv_start;
                         sargs.is_first_block       = (kv_blk == 0);
+                        sargs.kv_blk               = kv_blk;
                         sargs.q_start              = q_start;
                         sargs.ib3                  = ib3;
                         sargs.has_alibi            = (factx.max_bias != 0.0f);
@@ -2844,7 +3989,27 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                         // Overlapped: run HVX build diag inv L while HMX is busy executing the update
                         htp_trace_event_start(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, iter_tag);
-                        fa_build_d_diag_inv_l(&factx, n_row_tiles, n_row_tiles_g_br);
+                        if (factx.fold_spill) {
+                            // spill: the tile leaves unnormalised, the merge pass normalises
+                        } else if (factx.fold_tile) {
+                            // The latest point the fold allows: everything above this line ran
+                            // while the producer worked.
+                            if (factx.fold_ready && !fa_fold_wait_tile(&factx, q_start, kv_head)) {
+                                // No partial exists. Retire the O update so the HMX queue is not
+                                // left with a job in flight, then fail: dst is still untouched,
+                                // because this wait is taken before the op's first store.
+                                htp_trace_event_stop(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, iter_tag);
+                                hmx_queue_pop(hmx_q);
+                                return fa_fold_bail(dma, "producer late", q_start, kv_head);
+                            }
+                            if (!factx.fold_instore) {   // INSTORE: the store threads merge, no diagonal
+                                fa_build_d_diag_fold(&factx, n_row_tiles, n_rows_g, q_start, kv_head, ib3, neq2);
+                            } else if (factx.fold_probe & HTP_FA_FOLD_F_PROBE_TILEPF) {
+                                fa_fold_prefetch_tile(&factx, n_rows_g, q_start, kv_head, ib3, neq2);
+                            }
+                        } else {
+                            fa_build_d_diag_inv_l(&factx, n_row_tiles, n_row_tiles_g_br);
+                        }
                         htp_trace_event_stop(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, iter_tag);
                         hmx_queue_pop(hmx_q);
 
@@ -2948,6 +4113,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         sargs.kv_head              = kv_head;
                         sargs.kv_start             = kv_start;
                         sargs.is_first_block       = (kv_blk == 0);
+                        sargs.kv_blk               = kv_blk;
                         sargs.q_start              = q_start;
                         sargs.ib3                  = ib3;
                         sargs.has_alibi            = (factx.max_bias != 0.0f);
@@ -2974,7 +4140,24 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                             if (kv_blk + 1 == row_chunks) {
                                 // Overlapped: run HVX build diag inv L while HMX is busy executing the update
                                 htp_trace_event_start(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, iter_tag);
-                                fa_build_d_diag_inv_l(&factx, n_row_tiles, n_row_tiles_g_br);
+                                if (factx.fold_spill) {
+                                    // spill: the tile leaves unnormalised, the merge pass normalises
+                                } else if (factx.fold_tile) {
+                                    if (factx.fold_ready && !fa_fold_wait_tile(&factx, q_start, kv_head)) {
+                                        // See the pipelined path: drain the HMX queue, then fail
+                                        // rather than fold memory no producer wrote.
+                                        htp_trace_event_stop(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, iter_tag);
+                                        hmx_queue_pop(ctx->hmx_queue);
+                                        return fa_fold_bail(dma, "producer late", q_start, kv_head);
+                                    }
+                                    if (!factx.fold_instore) {   // INSTORE: the store threads merge, no diagonal
+                                        fa_build_d_diag_fold(&factx, n_row_tiles, n_rows_g, q_start, kv_head, ib3, neq2);
+                                    } else if (factx.fold_probe & HTP_FA_FOLD_F_PROBE_TILEPF) {
+                                        fa_fold_prefetch_tile(&factx, n_rows_g, q_start, kv_head, ib3, neq2);
+                                    }
+                                } else {
+                                    fa_build_d_diag_inv_l(&factx, n_row_tiles, n_row_tiles_g_br);
+                                }
                                 htp_trace_event_stop(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, iter_tag);
                             }
                             hmx_queue_pop(ctx->hmx_queue);
@@ -3035,7 +4218,10 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                 }
 
                 // ---- Final normalization ----
-                {
+                // Spill mode keeps the accumulator unnormalised: the merge pass divides by the
+                // combined S, so the diag(1/l) multiply would be wrong here, not merely wasted.
+                const bool raw_store = factx.fold_spill || (factx.fold_instore && factx.fold_tile);
+                if (!raw_store) {
                     on_job.o_curr           = o_tile_curr;
                     on_job.o_prev           = o_tile_prev;
                     on_job.d_tiles          = factx.vtcm_d_inv_l;
@@ -3047,10 +4233,18 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                     hmx_queue_pop(ctx->hmx_queue);
                 }
 
-                // ---- Store O block ----
-                fa_phase_o_store(&factx, dst, o_tile_curr, q_start, kv_head, ib3, n_rows_g);
+                // ---- Store O block ---- (spill: the unnormalised accumulator is in o_tile_prev)
+                fa_phase_o_store(&factx, dst, raw_store ? o_tile_prev : o_tile_curr, q_start, kv_head, ib3, neq2, n_rows_g);
             }
         }
+    }
+
+    if (factx.fold_spill && !factx.fold_nomerge) {
+        // The explicit merge, as a separate pass over both partials in DDR.
+        work_queue_run(ctx->work_queue, fa_fold_merge_thread, &factx, factx.n_threads);
+    }
+    if (factx.fold_staged) {
+        fa_fold_staged_status(&factx);
     }
 
     return HTP_STATUS_OK;

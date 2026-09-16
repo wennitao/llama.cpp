@@ -113,6 +113,11 @@ struct htp_context {
     void *                 main_stack;
     atomic_bool            killed;
     size_t                 footprint;
+    // Bumped by every whole-L2 flush-invalidate (batch start/end, the op-start flush above the
+    // threshold). A consumer of externally written memory compares it with the epoch it last read
+    // in to know whether its stale lines are already gone.
+    uint32_t               l2_inval_epoch;
+    uint32_t               fold_l2_epoch_seen;   // flash-attn fold: epoch of the last partial read
 };
 
 int op_matmul(struct htp_ops_context * octx);

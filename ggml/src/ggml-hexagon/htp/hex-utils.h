@@ -37,6 +37,25 @@ static inline void hex_l2fetch_block(const void * addr, size_t size) {
     hex_l2fetch(addr, width, width, height);
 }
 
+// Exact fetch of n_rows contiguous rows of row_bytes each: never touches a byte past the range,
+// which hex_l2fetch_block does by up to 16 KB - 1 (it rounds the size up to whole 16 KB rows).
+// Needed for memory another engine is still writing next door. width/stride/height are 16-bit.
+static inline void hex_l2fetch_rows(const void * addr, uint32_t row_bytes, uint32_t n_rows) {
+    if (row_bytes == 0 || n_rows == 0) return;
+    if (row_bytes <= 65535 && n_rows <= 65535) {
+        hex_l2fetch(addr, row_bytes, row_bytes, n_rows);
+        return;
+    }
+    // wide rows: split each row into 32 KB pieces (contiguous, so one descriptor per piece run)
+    const uint8_t * p = (const uint8_t *) addr;
+    size_t left = (size_t) row_bytes * n_rows;
+    while (left) {
+        const uint32_t n = left > 32768 ? 32768 : (uint32_t) left;
+        hex_l2fetch(p, n, n, 1);
+        p += n; left -= n;
+    }
+}
+
 #define HEX_L2_LINE_SIZE           128
 #define HEX_L2_BLOCK_SIZE          (HEX_L2_LINE_SIZE * 4) // flush granularity (lines per loop iteration)
 #define HEX_L2_FLUSH_WQ_THRESHOLD  (4 * 1024)

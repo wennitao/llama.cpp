@@ -30,6 +30,7 @@ static void flush_all_dcache(struct htp_context * ctx) {
     struct htp_thread_trace * tr = &ctx->trace[0];
     htp_trace_event_start(tr, HTP_TRACE_EVT_L2FLUSH, 0);
     qurt_mem_cache_clean((qurt_addr_t) 0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
+    ctx->l2_inval_epoch++;
     hex_l2fetch_block(ctx, ctx->footprint);
     htp_trace_event_stop(tr, HTP_TRACE_EVT_L2FLUSH, 0);
     memset(ctx->dirty_ranges, 0, sizeof(ctx->dirty_ranges));
