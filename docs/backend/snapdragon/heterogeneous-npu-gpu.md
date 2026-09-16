@@ -19,6 +19,9 @@ GPU, persistent work-groups that finish stages in order, kernel-written done wor
 trimming the fold's own handling makes the attention op 1.17x faster than that control, worth ~2%
 end to end and at the edge of what pp4096 throughput resolves through thermal drift; the split
 also needs a sustained-load guard, because the Adreno throttles before the HTP does.
+One decode asymmetry does hold up (§4l): the HTP gathers scattered KV rows at 9 GB/s, one DMA
+descriptor per row, while the GPU gathers the same rows through index lists at 33-45 GB/s, so
+whole-cluster sparse decode can drop its shadow copy by giving the scattered clusters to the GPU.
 
 Everything below is SM8750 (Hexagon v79 + Adreno 830), Qwen3-1.7B Q4_0, `llama-bench`
 `-fa 1 -ngl 99`, one binary carrying both backends (`GGML_HEXAGON=ON GGML_OPENCL=ON`).
@@ -1533,6 +1536,79 @@ variant), f16 partial (`ACC16=1`), device-scope per-group fences (`WGFENCE=0`). 
 `GGML_HEXAGON_FA_FOLD_CHECK=2` runs the snapshot reference check, `GGML_HEXAGON_FA_FOLD_TRACE=N`
 prints per-stage timelines, `GGML_HEXAGON_FA_FOLD_PROBE=<bits>` ORs `HTP_FA_FOLD_F_PROBE_*` into the
 fold header.
+
+## 4l. Decode: who should gather the scattered rows of a cluster -- measured (2026-09-15, unit f3b4a4c5)
+
+Whole-cluster selection (cluster-sparse-decode.md, Stages 7-8) is the decode policy that keeps
+retrieval quality, and it needs a cluster's keys fetched as one unit. On the HTP that meant the
+cluster-ordered **shadow** copy, because a cluster's keys are scattered positions of llama's cache
+and the HVX kernel fetches with DMA descriptors whose fixed cost is amortized only over contiguous
+rows. The shadow doubles the KV footprint and does not fit at 16k. The prefill split of 4j-4k paid
+because the NPU's compute tile was too coarse for singly wanted blocks; the decode analogue is a
+**fetch-granularity** asymmetry: the NPU fetches efficiently only in contiguous runs, the GPU
+gathers one row per work-item. Two measurements settle whether that asymmetry is real, both in
+`llama-hetero-decode-attn` (Qwen3-1.7B shapes, 8 KV heads, 256-B f16 rows, clusters of 16-48 keys,
+average 32, sorted by position within a cluster, sinks + a 256-key dense window as in runs mode).
+
+**1. The HTP fetching a run's rows from the positional cache, one linked 1D descriptor per K and
+V row** (`--cluster --runs --scatter`, header flag `HTP_FA_CLUSTER_HDR_SCATTER`; the kernel reads
+the run's rows through `pos_map` instead of the shadow, the consumer pops `2 x bsz` descriptors
+per block, the ring was raised to 1024 descriptors). Op-level exact (max err 1.3e-5 .. 3.2e-5,
+the same run set as the shadow arm). FA op median us:
+
+| kv, budget | rows/head | shadow runs (2D block per run) | scatter, chunk-local | scatter, identity perm | scatter, global random | scatter, 4 slots | in-place pages 16 / 64 |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| 4k, 12% | 700 | 174 (16.5 GB/s) | 307 (9.3) | 299 | 302 | 309 | 165 / 109 |
+| 4k, 25% | 1205 | 249 (19.8) | 515 (9.6) | 522 | 539 | 515 | 254 / 154 |
+| 16k, 12% | 2178 | 507 (17.6) | 1061 (8.4) | 1049 | 1044 | 1068 | 445 / 238 |
+| 16k, 25% | 4279 | 831 (21.1) | 1997 (8.8) | 1978 | 1977 | 1995 | 826 / 425 |
+
+The address pattern does not matter (identity, chunk-local and global random are within 2%) and
+neither does the ring depth: the cost is the descriptor, about 0.1 us each, 0.2 us per row on top
+of the ~0.06 us a contiguous row costs. Per-row gathers run at 8.4-9.6 GB/s on six threads, half
+the rate of the shadow's runs and a quarter of the dense stream (36-39 GB/s). The NPU cannot do
+shadow-free clusters alone at a useful rate; the shadow's justification was correct.
+
+**2. The Adreno gathering the same kind of rows through per-head index lists** (`--gpu-gather`,
+kernel `fa_dec_gather`: work-group (KV head, 256-key split), one K row per work-item through the
+list, the V product over the listed rows, split-KV partials in the HVX format; OpenCL profiling
+stamps; lists = clusters of 32 sorted positions taken in random order, either chunk-local (a
+cluster inside one 1024-position window, the sidecar's pattern) or global). Host-merged partials
+match the CPU reference to 1e-8. Kernel median us and GB/s over K+V bytes:
+
+| kv, keys/head | streaming kernel over the same count | gather, identity list | gather, chunk-local clusters | gather, global random clusters |
+|---|--:|--:|--:|--:|
+| 4k, 491 (12%) | 75 (26.8) | 68 (29.5) | 70 (28.8) | 69 (29.1) |
+| 4k, 1024 (25%) | 97 (43.2) | 93 (45.1) | 97 (43.3) | 97 (43.2) |
+| 4k, 4096 (100%) | 371 (45.2) | 349 (48.1) | 372 (45.1) | 374 (44.9) |
+| 16k, 1966 (12%) | 197 (40.9) | 184 (43.8) | 243 (33.1) | 266 (30.3) |
+| 16k, 4096 (25%) | 370 (45.3) | 345 (48.7) | 464 (36.2) | 513 (32.7) |
+| 16k, 16384 (100%) | 1216 (55.2) | 1138 (59.0) | 1651 (40.6) | 1901 (35.3) |
+
+At 4k the scattered gather costs nothing over streaming. At 16k it costs 20-30% (the buffer is
+four times larger; TLB or DRAM-page effects, not the kernel, since the identity list through the
+same code is faster than the streaming kernel), and a 512-key split recovers part of it (222 us,
+36.3 GB/s at 16k/12%). The first version of the kernel read the row index and the softmax weight
+with scalar local loads inside the serial V loop and ran 40% slower than streaming even on an
+identity list; 64-bit address math was not the cause, reading eight offsets and eight weights per
+head as vectors was the fix. Compute added to this kernel is free: it is bandwidth-bound, as the
+user expected.
+
+**What the two measurements establish.** For the rows of a scattered cluster the GPU is 3.5-4x
+faster than the HTP (33-45 GB/s against 8.4-9.6), about 2x faster than the HTP reading the same
+clusters from the shadow, and as fast as the HTP streaming contiguous pages. So the shadow-free
+whole-cluster design is: HTP for the sink page, the dense window, the not-yet-clustered tail and
+whatever contiguous pages remain; GPU for the members of the selected clusters, gathered from
+llama's own cache through the cluster member lists the sidecar already computes, merged by the HTP
+as split-KV partials (the 4h/4i format and merge path). At 16k/12.5% that is a ~245 us gather plus
+the ~80 us per-layer crossing, against 507 us for shadow runs (which do not fit at 16k), 445 us for
+in-place 16-key positional pages (which lose the UUID retrieval) and 1061 us for the HTP gathering
+the rows itself. The design removes the 1.9 GB shadow at 16k and lifts the 6592-position cap at 8k;
+at 4k the token cannot gain (attention after selection is ~5 ms of 39 ms, the crossings ~2 ms), so
+its value is quality and memory at depth, not speed. Not built: the sidecar emitting member lists
+instead of the shadow, the DSP select pass publishing chosen runs to the GPU, the per-layer chain
+(4k's) driving the gather kernel, the Q staleness rule of 4k (a post-write submission before the
+GPU reads Q).
 
 ## 5. What would change the answer
 

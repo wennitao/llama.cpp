@@ -37,6 +37,8 @@
 #define HMX_QUEUE_STACK_SIZE   16384
 #define WORK_QUEUE_CAPACITY    16
 #define WORK_QUEUE_STACK_SIZE  16384
+// descriptors per thread ring; the decode scatter fetch links one per K/V row (up to 8 slots x 2 x 64)
+#define HTP_DMA_QUEUE_CAPACITY 1024
 #define MAIN_THREAD_STACK_SIZE 32768
 
 _Static_assert(WORK_QUEUE_MAX_N_THREADS >= HTP_MAX_NTHREADS,
@@ -377,7 +379,7 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
     size_t size_dma = 0;
     for (uint32_t i = 0; i < n_hvx; i++) {
         size_dma  = hex_align_up(size_dma, dma_queue_alignof());
-        size_dma += dma_queue_sizeof(256);
+        size_dma += dma_queue_sizeof(HTP_DMA_QUEUE_CAPACITY);
         size_dma  = hex_align_up(size_dma, dma_queue_alignof());
         size_dma += dma_queue_alias_sizeof();
     }
@@ -521,12 +523,12 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
 
     // Initialize DMA queues
     uint8_t * dma_ptr_curr = (uint8_t *) ((uintptr_t) block + offset_dma);
-    size_t size_dma_q = dma_queue_sizeof(256);
+    size_t size_dma_q = dma_queue_sizeof(HTP_DMA_QUEUE_CAPACITY);
     size_t size_dma_alias = dma_queue_alias_sizeof();
 
     for (int i = 0; i < ctx->n_threads; i++) {
         dma_ptr_curr = (uint8_t *) hex_align_up((uintptr_t) dma_ptr_curr, dma_queue_alignof());
-        ctx->dma_cached[i] = dma_queue_init(dma_ptr_curr, 256, (uintptr_t) ctx->vtcm_base, ctx->vtcm_size, &ctx->trace[i]);
+        ctx->dma_cached[i] = dma_queue_init(dma_ptr_curr, HTP_DMA_QUEUE_CAPACITY, (uintptr_t) ctx->vtcm_base, ctx->vtcm_size, &ctx->trace[i]);
         dma_ptr_curr += size_dma_q;
 
         dma_ptr_curr = (uint8_t *) hex_align_up((uintptr_t) dma_ptr_curr, dma_queue_alignof());

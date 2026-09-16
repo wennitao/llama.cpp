@@ -114,6 +114,9 @@ struct options {
     int    chunk = 1024;       // keys per chunk-table entry (shadow mode)
     int    runs = 0;           // 1 = whole-cluster runs mode (variable-size clusters, sink run forced)
     int    csize = 32;         // runs mode: average cluster size
+    int    scatter = 0;        // runs mode: the kernel gathers a run's rows from the positional cache (one descriptor per row)
+    int    perm_chunk = 0;     // runs mode: shuffle positions within o.chunk-sized windows (chunk-local clusters)
+    int    gpu_gather = 0;     // GPU gather kernel over per-head index lists vs the streaming kernel (no HTP op)
     int    seed      = 1234;
 };
 
@@ -121,7 +124,9 @@ static void usage() {
     printf("usage: llama-hetero-decode-attn [--kv N] [--gpu-frac F] [--iters N] [--span N] [--nh N] [--nkvh N]\n"
            "         [--cpu N] [--modes htp,gpu,both] [--mask-permille N] [--layers N] [--pad-mb N] [--integrated] [-v]\n"
            "       llama-hetero-decode-attn --cluster [--kv N] [--density PCT] [--sel contig|scatter] [--skew F]\n"
-           "         [--nslots N] [--desc 1d|2d] [--window W] [--perm identity|random] [--pmu] [--select-device] [--page-keys 16|32|64] [--iters N] [--seed N]\n");
+           "         [--nslots N] [--desc 1d|2d] [--window W] [--perm identity|random|chunk] [--pmu] [--select-device] [--page-keys 16|32|64] [--iters N] [--seed N]\n"
+           "       llama-hetero-decode-attn --cluster --runs [--scatter] [--csize N] [--chunk N] [--perm identity|random|chunk] ...\n"
+           "       llama-hetero-decode-attn --gpu-gather [--kv N] [--density PCT] [--span N] [--csize N] [--chunk N] [--iters N] [--seed N]\n");
 }
 
 static bool parse(int argc, char ** argv, options & o) {
@@ -155,7 +160,9 @@ static bool parse(int argc, char ** argv, options & o) {
         else if (a == "--csize")     { if (!next_i(o.csize)) return false; }
         else if (a == "--sel")      { if (i + 1 >= argc) return false; o.sel_scatter = std::string(argv[++i]) != "contig"; }
         else if (a == "--desc")     { if (i + 1 >= argc) return false; o.desc1d = std::string(argv[++i]) == "1d"; }
-        else if (a == "--perm")     { if (i + 1 >= argc) return false; o.perm_identity = std::string(argv[++i]) == "identity"; }
+        else if (a == "--perm")     { if (i + 1 >= argc) return false; const std::string pm = argv[++i]; o.perm_identity = pm == "identity"; o.perm_chunk = pm == "chunk"; }
+        else if (a == "--scatter")  { o.scatter = 1; }
+        else if (a == "--gpu-gather") { o.gpu_gather = 1; }
         else if (a == "-v")         { o.verbose = 1; }
         else if (a == "--modes") {
             if (i + 1 >= argc) return false;
@@ -295,13 +302,125 @@ __kernel void fa_dec_gqa(__global uchar * base,
         part[32 + t] = o_acc[g];
     }
 }
+
+// Gather variant: work-group (kvh, sp) attends keys idx[kvh*idx_stride + sp*span ...), one K/V row per
+// work-item read through the index (the members of selected clusters, sorted by position). No mask.
+__kernel void fa_dec_gather(__global uchar * base,
+                            uint q_off, uint k_off, uint v_off, uint i_off, uint p_off,
+                            uint nbq2, uint nbk1, uint nbk2, uint nbv1, uint nbv2,
+                            uint n_sel, uint idx_stride, uint span, uint nsplit, float scale, uint part_stride) {
+    const int t   = get_local_id(0);
+    const int kvh = get_group_id(1);
+    const int sp  = get_group_id(2);
+
+    __local float Q_l[FA_G][FA_D];
+    __local float S_l[FA_G][FA_D];
+    __local uint  I_l[FA_D];
+    __local float sh_a[FA_G];
+    __local float sh_m[FA_G];
+    __local float sh_l[FA_G];
+
+    for (int g = 0; g < FA_G; ++g) {
+        Q_l[g][t] = ((__global const float *)(base + q_off + (kvh * FA_G + g) * nbq2))[t] * scale;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    __global const uint * idx = (__global const uint *)(base + i_off) + (ulong) kvh * idx_stride;
+    const int kv_begin = sp * span;
+    const int kv_end   = min((int) n_sel, kv_begin + (int) span);
+
+    float m_run = -INFINITY, l_run = 0.0f;
+    float o_acc[FA_G];
+    for (int g = 0; g < FA_G; ++g) o_acc[g] = 0.0f;
+
+    if (kv_begin < kv_end) {
+        for (int bs = kv_begin; bs < kv_end; bs += FA_D) {
+            const int blk_n = min(FA_D, kv_end - bs);
+            // lanes past blk_n point at a valid row; their P is 0 (score -inf), so the V loop may run in multiples of 8
+            I_l[t] = idx[bs + min(t, blk_n - 1)];
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            float s[FA_G];
+            for (int g = 0; g < FA_G; ++g) s[g] = -INFINITY;
+            if (t < blk_n) {
+                // 32-bit offsets: the alias is far below 4 GB and 64-bit integer math is slow on Adreno
+                __global const half * krow = (__global const half *)(base + k_off + I_l[t] * nbk1 + kvh * nbk2);
+                float8 acc[FA_G];
+                for (int g = 0; g < FA_G; ++g) acc[g] = (float8)(0.0f);
+                #pragma unroll
+                for (int d8 = 0; d8 < FA_D / 8; ++d8) {
+                    const float8 k8 = convert_float8(vload8(d8, krow));
+                    for (int g = 0; g < FA_G; ++g) acc[g] += k8 * vload8(d8, Q_l[g]);
+                }
+                for (int g = 0; g < FA_G; ++g) {
+                    const float8 a = acc[g];
+                    s[g] = (a.s0 + a.s1 + a.s2 + a.s3 + a.s4 + a.s5 + a.s6 + a.s7);
+                }
+            }
+            for (int g = 0; g < FA_G; ++g) S_l[g][t] = s[g];
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            if (t < FA_G) {
+                float m_t = -INFINITY;
+                for (int c = 0; c < FA_D; ++c) m_t = fmax(m_t, S_l[t][c]);
+                const float m_new = fmax(m_run, m_t);
+                const float a = (m_run == -INFINITY) ? 0.0f : native_exp(m_run - m_new);
+                float l = 0.0f;
+                for (int c = 0; c < FA_D; ++c) {
+                    const float sc = S_l[t][c];
+                    const float p = (isinf(sc) || m_new == -INFINITY) ? 0.0f : native_exp(sc - m_new);
+                    S_l[t][c] = p;
+                    l += p;
+                }
+                l_run = a * l_run + l;
+                m_run = m_new;
+                sh_a[t] = a;
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            {
+                float pv[FA_G];
+                for (int g = 0; g < FA_G; ++g) pv[g] = 0.0f;
+                __global const uchar * vbase = base + v_off + kvh * nbv2 + t * 2;
+                for (int c = 0; c < blk_n; c += 8) {
+                    // one vector read of 8 row offsets and 8 weights per head instead of 8 scalar local reads each
+                    const uint8 o8 = vload8(c >> 3, I_l);
+                    float8 v8;
+                    v8.s0 = vload_half(0, (__global const half *)(vbase + o8.s0 * nbv1));
+                    v8.s1 = vload_half(0, (__global const half *)(vbase + o8.s1 * nbv1));
+                    v8.s2 = vload_half(0, (__global const half *)(vbase + o8.s2 * nbv1));
+                    v8.s3 = vload_half(0, (__global const half *)(vbase + o8.s3 * nbv1));
+                    v8.s4 = vload_half(0, (__global const half *)(vbase + o8.s4 * nbv1));
+                    v8.s5 = vload_half(0, (__global const half *)(vbase + o8.s5 * nbv1));
+                    v8.s6 = vload_half(0, (__global const half *)(vbase + o8.s6 * nbv1));
+                    v8.s7 = vload_half(0, (__global const half *)(vbase + o8.s7 * nbv1));
+                    for (int g = 0; g < FA_G; ++g) {
+                        const float8 p8 = vload8(c >> 3, S_l[g]) * v8;
+                        pv[g] += p8.s0 + p8.s1 + p8.s2 + p8.s3 + p8.s4 + p8.s5 + p8.s6 + p8.s7;
+                    }
+                }
+                for (int g = 0; g < FA_G; ++g) o_acc[g] = o_acc[g] * sh_a[g] + pv[g];
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+    }
+
+    if (t < FA_G) { sh_m[t] = (kv_begin < kv_end) ? m_run : HTP_M_INIT; sh_l[t] = l_run; }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int g = 0; g < FA_G; ++g) {
+        const int row = kvh * FA_G + g;
+        __global float * part = (__global float *)(base + p_off + ((ulong) row * nsplit + sp) * part_stride);
+        if (t == 0) { part[0] = sh_m[g]; part[1] = sh_l[g]; }
+        part[32 + t] = o_acc[g];
+    }
+}
 )CL";
 
 // ---------------------------------------------------------------------------------------
 
 struct gpu_side {
     cl_platform_id plat = nullptr; cl_device_id dev = nullptr; cl_context ctx = nullptr; cl_command_queue q = nullptr;
-    cl_program prog = nullptr; cl_kernel k_fa = nullptr; cl_mem alias = nullptr; uint32_t * svm = nullptr;
+    cl_program prog = nullptr; cl_kernel k_fa = nullptr; cl_kernel k_ga = nullptr; cl_mem alias = nullptr; uint32_t * svm = nullptr;
 };
 
 static bool cl_check(cl_int err, const char * what) {
@@ -329,6 +448,7 @@ static bool gpu_init(gpu_side & g, const options & o, uint8_t * base, size_t buf
         fprintf(stderr, "OpenCL build failed (%d):\n%s\n", err, log.c_str()); return false;
     }
     g.k_fa = clCreateKernel(g.prog, "fa_dec_gqa", &err); if (!cl_check(err, "kernel")) return false;
+    g.k_ga = clCreateKernel(g.prog, "fa_dec_gather", &err); if (!cl_check(err, "kernel gather")) return false;
 
     cl_uint page = 0; clGetDeviceInfo(g.dev, CL_DEVICE_PAGE_SIZE_QCOM, sizeof(page), &page, nullptr); if (!page) page = 4096;
     cl_mem_ion_host_ptr ion = {};
@@ -351,6 +471,7 @@ struct layout {
     size_t ready = 0, done = 4096, rec1 = 8192, rec2 = 12288, flags_end = 16384;
     size_t q = 65536, mask = 131072, dst = 262144, parts = 524288, parts_size = 1 << 20;
     size_t k = 2 << 20, v = 0, total = 0;
+    size_t idx = 0;                // --gpu-gather: [nkvh][kv] uint32 index lists
     size_t nbk1 = 0, nbk2 = 0;     // K/V: position-major, heads contiguous within a position
     size_t part_stride = 0;
 };
@@ -499,7 +620,14 @@ static int run_cluster_runs(const options & o, ggml_backend_t be, ggml_backend_b
     std::mt19937 rng(o.seed);
     std::vector<int> perm(covered_end - n_sink);
     for (int i = 0; i < (int) perm.size(); ++i) perm[i] = n_sink + i;
-    if (!o.perm_identity) std::shuffle(perm.begin(), perm.end(), rng);
+    if (o.perm_chunk) {
+        // chunk-local clusters: a run's keys lie within one o.chunk-position window (the sidecar clusters per chunk)
+        for (size_t w0 = 0; w0 < perm.size(); w0 += (size_t) o.chunk) {
+            std::shuffle(perm.begin() + w0, perm.begin() + std::min(perm.size(), w0 + (size_t) o.chunk), rng);
+        }
+    } else if (!o.perm_identity) {
+        std::shuffle(perm.begin(), perm.end(), rng);
+    }
     std::vector<std::pair<int, int>> runs;   // (row_first, n_rows) incl. the forced sink run
     runs.push_back({ 0, n_sink });
     {
@@ -512,6 +640,11 @@ static int run_cluster_runs(const options & o, ggml_backend_t be, ggml_backend_b
             row += n;
         }
     }
+    // a run's rows in position order: the scatter fetch then walks ascending addresses, as a real gather would
+    for (size_t i = 1; i < runs.size(); ++i) {
+        std::sort(perm.begin() + (runs[i].first - n_sink), perm.begin() + (runs[i].first - n_sink + runs[i].second));
+    }
+    const char * perm_name = o.perm_identity ? "identity" : o.perm_chunk ? "chunk-local" : "random";
     const int n_runs = (int) runs.size();
     if ((uint32_t) n_runs > hdr.n_runs_max) { fprintf(stderr, "too many runs (%d > %u)\n", n_runs, hdr.n_runs_max); return 1; }
     auto * pos_map = (uint32_t *) (lb + hdr.off_pos_map);
@@ -572,8 +705,9 @@ static int run_cluster_runs(const options & o, ggml_backend_t be, ggml_backend_b
         fa->src[7] = on ? shadow : nullptr;
     };
     const uint32_t budget_rows = (uint32_t) (((uint64_t) (covered_end - n_sink) * o.density * 10 + 999) / 1000);
-    printf("runs mode: kv %d, window %d, %d runs (avg %d keys, sink run of %d), row budget %u/head (%d%%), perm %s\n",
-           o.kv, W, n_runs, o.csize, n_sink, budget_rows, o.density, o.perm_identity ? "identity" : "random");
+    printf("runs mode%s: kv %d, window %d, %d runs (avg %d keys, sink run of %d), row budget %u/head (%d%%), perm %s, nslots %d\n",
+           o.scatter ? " (scatter: rows gathered from the positional cache, one descriptor per row)" : "",
+           o.kv, W, n_runs, o.csize, n_sink, budget_rows, o.density, perm_name, o.nslots);
 
     // host greedy selection per KV head: forced first, then runs by descending max-over-group q.centroid until the budget
     auto host_select = [&](int kvh) {
@@ -656,7 +790,7 @@ static int run_cluster_runs(const options & o, ggml_backend_t be, ggml_backend_b
     };
     arm_res dense, sel;
     run_arm("dense", false, dense);
-    run_arm("runs", true, sel);
+    run_arm(o.scatter ? "scatter" : "runs", true, sel);
     ggml_free(ctx);
     return (dense.worst < 2e-2 && sel.worst < 2e-2) ? 0 : 2;
 }
@@ -886,6 +1020,157 @@ static int run_cluster(const options & o, ggml_backend_t be, ggml_backend_buffer
     return (dense.worst < 2e-2 && list.worst < 2e-2) ? 0 : 2;
 }
 
+// ---------------------------------------------------------------------------------------
+// --gpu-gather: the Adreno reads scattered K/V rows through per-head index lists (the members of
+// selected clusters, sorted by position) and writes split-KV partials; measured against the
+// streaming kernel over the same number of keys. Patterns: identity (the first n keys, through the
+// list), chunk (clusters of csize keys scattered within o.chunk-position windows), random (clusters
+// over the whole range). Kernel time from the OpenCL profiling stamps, no HTP op involved.
+// ---------------------------------------------------------------------------------------
+
+static int run_gpu_gather(const options & o, uint8_t * base, const layout & L, int fd) {
+    gpu_side g;
+    if (!gpu_init(g, o, base, L.total, fd)) return 1;
+    const int n_sel  = std::max(1, (int) ((int64_t) o.kv * o.density / 100));
+    const int nsplit = (n_sel + o.span - 1) / o.span;
+    if ((size_t) o.nh * nsplit * L.part_stride > L.parts_size) { fprintf(stderr, "too many splits for the partial area\n"); return 1; }
+    if (o.kv % o.csize || o.chunk % o.csize) { fprintf(stderr, "--kv and --chunk must be multiples of --csize\n"); return 1; }
+    const size_t bytes = (size_t) n_sel * o.nkvh * 2 * (size_t) o.d * 2;
+    printf("gpu gather: kv %d, %d keys/head (%d%%), span %d -> %d splits, clusters of %d keys, chunk %d, %.2f MB per pass\n",
+           o.kv, n_sel, o.density, o.span, nsplit, o.csize, o.chunk, bytes / 1048576.0);
+
+    uint32_t * idx = (uint32_t *) (base + L.idx);
+    // mode 0: identity; 1: chunk-local clusters; 2: global random clusters. Clusters are csize consecutive
+    // entries of the (window-local or global) permutation, members sorted by position, clusters taken in
+    // random order until n_sel keys.
+    auto build = [&](int mode) {
+        std::mt19937 rng(o.seed);
+        for (int h = 0; h < o.nkvh; ++h) {
+            std::vector<int> perm(o.kv);
+            for (int i = 0; i < o.kv; ++i) perm[i] = i;
+            if (mode == 1) {
+                for (int w0 = 0; w0 < o.kv; w0 += o.chunk) std::shuffle(perm.begin() + w0, perm.begin() + std::min(o.kv, w0 + o.chunk), rng);
+            } else if (mode == 2) {
+                std::shuffle(perm.begin(), perm.end(), rng);
+            }
+            const int n_cl = o.kv / o.csize;
+            std::vector<int> order(n_cl);
+            for (int i = 0; i < n_cl; ++i) order[i] = i;
+            if (mode) std::shuffle(order.begin(), order.end(), rng);
+            uint32_t * list = idx + (size_t) h * o.kv;
+            int n = 0;
+            for (int c = 0; c < n_cl && n < n_sel; ++c) {
+                std::vector<int> mem(perm.begin() + order[c] * o.csize, perm.begin() + (order[c] + 1) * o.csize);
+                std::sort(mem.begin(), mem.end());
+                for (int m : mem) if (n < n_sel) list[n++] = (uint32_t) m;
+            }
+        }
+        dc_cvac(idx, (size_t) o.nkvh * o.kv * 4);
+    };
+
+    auto set_stream_args = [&]() {
+        cl_uint a_q = L.q, a_k = L.k, a_v = L.v, a_m = 0, a_p = L.parts;
+        cl_uint a_nbq2 = o.d * 4, a_nbk1 = L.nbk1, a_nbk2 = L.nbk2, a_nkv = n_sel, a_span = o.span, a_ns = nsplit, a_ps = L.part_stride;
+        cl_float a_scale = 1.0f / sqrtf((float) o.d);
+        cl_uint want = 0, max_spin = 0;
+        int i = 0;
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_mem), &g.alias);
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_q); clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_k);
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_v); clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_m);
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_p);
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_nbq2);
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_nbk1); clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_nbk2);
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_nbk1); clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_nbk2);
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_nkv); clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_span);
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_ns); clSetKernelArg(g.k_fa, i++, sizeof(cl_float), &a_scale);
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &a_ps);
+        clSetKernelArgSVMPointer(g.k_fa, i++, g.svm);
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &want);
+        clSetKernelArg(g.k_fa, i++, sizeof(cl_uint), &max_spin);
+    };
+    auto set_gather_args = [&]() {
+        cl_uint a_q = L.q, a_k = L.k, a_v = L.v, a_i = L.idx, a_p = L.parts;
+        cl_uint a_nbq2 = o.d * 4, a_nbk1 = L.nbk1, a_nbk2 = L.nbk2, a_nsel = n_sel, a_is = o.kv, a_span = o.span, a_ns = nsplit, a_ps = L.part_stride;
+        cl_float a_scale = 1.0f / sqrtf((float) o.d);
+        int i = 0;
+        clSetKernelArg(g.k_ga, i++, sizeof(cl_mem), &g.alias);
+        clSetKernelArg(g.k_ga, i++, sizeof(cl_uint), &a_q); clSetKernelArg(g.k_ga, i++, sizeof(cl_uint), &a_k);
+        clSetKernelArg(g.k_ga, i++, sizeof(cl_uint), &a_v); clSetKernelArg(g.k_ga, i++, sizeof(cl_uint), &a_i);
+        clSetKernelArg(g.k_ga, i++, sizeof(cl_uint), &a_p);
+        clSetKernelArg(g.k_ga, i++, sizeof(cl_uint), &a_nbq2);
+        clSetKernelArg(g.k_ga, i++, sizeof(cl_uint), &a_nbk1); clSetKernelArg(g.k_ga, i++, sizeof(cl_uint), &a_nbk2);
+        clSetKernelArg(g.k_ga, i++, sizeof(cl_uint), &a_nbk1); clSetKernelArg(g.k_ga, i++, sizeof(cl_uint), &a_nbk2);
+        clSetKernelArg(g.k_ga, i++, sizeof(cl_uint), &a_nsel); clSetKernelArg(g.k_ga, i++, sizeof(cl_uint), &a_is);
+        clSetKernelArg(g.k_ga, i++, sizeof(cl_uint), &a_span); clSetKernelArg(g.k_ga, i++, sizeof(cl_uint), &a_ns);
+        clSetKernelArg(g.k_ga, i++, sizeof(cl_float), &a_scale); clSetKernelArg(g.k_ga, i++, sizeof(cl_uint), &a_ps);
+    };
+    auto time_kernel = [&](cl_kernel k, stat_acc & st) -> bool {
+        cl_event ev = nullptr;
+        size_t gsz[3] = { (size_t) o.d, (size_t) o.nkvh, (size_t) nsplit }, lsz[3] = { (size_t) o.d, 1, 1 };
+        if (!cl_check(clEnqueueNDRangeKernel(g.q, k, 3, nullptr, gsz, lsz, 0, nullptr, &ev), "enqueue")) return false;
+        clFinish(g.q);
+        cl_ulong ts = 0, te = 0;
+        clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(ts), &ts, nullptr);
+        clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof(te), &te, nullptr);
+        clReleaseEvent(ev);
+        st.add((double) (te - ts) / 1000.0);
+        return true;
+    };
+    // merge the nsplit partials of head h on the host and compare with the reference over its key list
+    auto check = [&](int mode) -> double {
+        dc_civac(base + L.parts, L.parts_size);
+        double worst = 0;
+        for (int h = 0; h < o.nh; ++h) {
+            const int kvh = h / (o.nh / o.nkvh);
+            std::vector<std::pair<int, bool>> keys(n_sel);
+            for (int i = 0; i < n_sel; ++i) keys[i] = { mode < 0 ? i : (int) idx[(size_t) kvh * o.kv + i], false };
+            std::vector<double> ref;
+            ref_attn_keys(o, base, L, h, keys, ref);
+            double M = -INFINITY;
+            for (int s = 0; s < nsplit; ++s) M = std::max(M, (double) ((const float *) (base + L.parts + ((size_t) h * nsplit + s) * L.part_stride))[0]);
+            std::vector<double> acc(o.d, 0.0); double S = 0;
+            for (int s = 0; s < nsplit; ++s) {
+                const float * part = (const float *) (base + L.parts + ((size_t) h * nsplit + s) * L.part_stride);
+                const double d = (double) part[0] - M;
+                if (d < -80.0) continue;
+                const double w = exp(d);
+                S += w * part[1];
+                for (int dd = 0; dd < o.d; ++dd) acc[dd] += w * part[32 + dd];
+            }
+            for (int dd = 0; dd < o.d; ++dd) worst = std::max(worst, fabs((S > 0 ? acc[dd] / S : 0.0) - ref[dd]));
+        }
+        return worst;
+    };
+
+    struct arm { const char * name; int mode; stat_acc us; double err = 0; };
+    std::vector<arm> arms = { { "stream", -1, {}, 0 }, { "gather identity", 0, {}, 0 }, { "gather chunk-local", 1, {}, 0 }, { "gather random", 2, {}, 0 } };
+    for (int round = 0; round < 2; ++round) {
+        for (auto & a : arms) {
+            if (a.mode >= 0) build(a.mode);
+            memset(base + L.parts, 0, L.parts_size); dc_cvac(base + L.parts, L.parts_size);
+            if (a.mode < 0) set_stream_args(); else set_gather_args();
+            cl_kernel k = a.mode < 0 ? g.k_fa : g.k_ga;
+            stat_acc warm;
+            if (!time_kernel(k, warm)) return 1;
+            for (int it = 0; it < o.iters; ++it) if (!time_kernel(k, a.us)) return 1;
+            if (round == 0) a.err = check(a.mode);
+        }
+    }
+    printf("\n%-20s %9s %9s %9s   %-6s  %s\n", "arm", "median", "min", "max", "GB/s", "max|err| vs CPU");
+    for (auto & a : arms) {
+        printf("%-20s %9.1f %9.1f %9.1f   %6.1f  %.2e %s\n", a.name, a.us.med(), a.us.mn(), a.us.mx(), bytes / (a.us.med() * 1e-6) / 1e9, a.err, a.err < 2e-3 ? "OK" : "MISMATCH");
+    }
+    if (g.svm) clSVMFree(g.ctx, g.svm);
+    if (g.alias) clReleaseMemObject(g.alias);
+    if (g.k_fa) clReleaseKernel(g.k_fa);
+    if (g.k_ga) clReleaseKernel(g.k_ga);
+    if (g.prog) clReleaseProgram(g.prog);
+    if (g.q) clReleaseCommandQueue(g.q);
+    if (g.ctx) clReleaseContext(g.ctx);
+    for (auto & a : arms) if (a.err >= 2e-3) return 2;
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     options o;
     if (!parse(argc, argv, o)) return 1;
@@ -923,13 +1208,18 @@ int main(int argc, char ** argv) {
     if (o.cluster) {
         // one layer's shadow at the front of the buffer; the positional data moves up behind it
         shadow_bytes = (size_t) htp_fa_cluster_layout_v2(&shadow_hdr, 1, (uint32_t) o.kv, (uint32_t) o.nkvh, (uint32_t) o.d, (uint32_t) o.page_keys, (uint32_t) o.csize,
-                                                         HTP_FA_CLUSTER_HDR_HOST_ROWS | (o.inplace ? HTP_FA_CLUSTER_HDR_INPLACE : 0u) | (o.runs ? HTP_FA_CLUSTER_HDR_RUNS : 0u));
+                                                         HTP_FA_CLUSTER_HDR_HOST_ROWS | (o.inplace ? HTP_FA_CLUSTER_HDR_INPLACE : 0u) | (o.runs ? HTP_FA_CLUSTER_HDR_RUNS : 0u) |
+                                                         (o.runs && o.scatter ? HTP_FA_CLUSTER_HDR_SCATTER : 0u));
         shadow_bytes = ((shadow_bytes + (1 << 20) - 1) >> 20) << 20;
         L.q += shadow_bytes; L.mask += shadow_bytes; L.dst += shadow_bytes; L.parts += shadow_bytes; L.k += shadow_bytes;
     }
     L.k += (size_t) o.pad_mb << 20;
     L.v = L.k + kv_bytes;
     L.total = ((L.v + kv_bytes + (1 << 20) - 1) >> 20) << 20;
+    if (o.gpu_gather) {
+        L.idx = L.total;
+        L.total += (((size_t) o.nkvh * o.kv * 4 + (1 << 20) - 1) >> 20) << 20;
+    }
     if ((size_t) o.nh * nsplit * L.part_stride > L.parts_size) { fprintf(stderr, "too many GPU splits for the partial area\n"); return 1; }
 
     // backend + buffer
@@ -960,6 +1250,11 @@ int main(int argc, char ** argv) {
         dc_cvac(base, L.total);
     }
 
+    if (o.gpu_gather) {
+        const int rc = run_gpu_gather(o, base, L, fd);
+        ggml_backend_buffer_free(buf); ggml_backend_free(be);
+        return rc;
+    }
     if (o.cluster) {
         const int rc = o.runs ? run_cluster_runs(o, be, buf, base, L, shadow_hdr, shadow_bytes) : run_cluster(o, be, buf, base, L, shadow_hdr, shadow_bytes);
         ggml_backend_buffer_free(buf); ggml_backend_free(be);
@@ -1271,6 +1566,7 @@ int main(int argc, char ** argv) {
     if (g.svm) clSVMFree(g.ctx, g.svm);
     if (g.alias) clReleaseMemObject(g.alias);
     if (g.k_fa) clReleaseKernel(g.k_fa);
+    if (g.k_ga) clReleaseKernel(g.k_ga);
     if (g.prog) clReleaseProgram(g.prog);
     if (g.q) clReleaseCommandQueue(g.q);
     if (g.ctx) clReleaseContext(g.ctx);

@@ -317,6 +317,8 @@ struct htp_fa_fold_hdr {
                                                // each graph; a reset or rewind lowers it synchronously while the sidecar catches up)
 #define HTP_FA_CLUSTER_HDR_RUNS     (1u << 3)  // header.flags: the selection unit is a whole variable-size cluster -- a run of rows in
                                                // cluster order (off_runs table); the kernel takes runs whole until a row budget
+#define HTP_FA_CLUSTER_HDR_SCATTER  (1u << 4)  // header.flags (with RUNS): a run's rows are fetched from the positional cache at
+                                               // pos_map[row], one linked 1D descriptor per K and V row; the shadow rows are unused
 #define HTP_FA_CLUSTER_RUN_FORCED   (1u << 0)  // run.flags: always attended (the sink tokens), not charged to the budget
 #define HTP_FA_CLUSTER_MAX_LAYERS   128
 

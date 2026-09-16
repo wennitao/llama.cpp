@@ -719,6 +719,14 @@ or clamped synchronously, and the memory problem (a second copy of the K/V of th
 to be paid for with Q8 pages or a partial shadow of the oldest context. The GPU sidecar that
 clusters during prefill is the piece that already exists.
 
+**Update (2026-09-15): the "32 descriptors" cost was measured** (heterogeneous-npu-gpu.md 4l,
+`--cluster --runs --scatter`): the HTP fetching a run's rows from the positional cache one linked
+descriptor per row runs at 8.4-9.6 GB/s, half the shadow's rate and independent of the address
+pattern (about 0.1 us per descriptor). The Adreno gathering the same scattered rows through index
+lists runs at 33-45 GB/s, as fast as the HTP streams contiguous pages. So the memory problem has a
+third answer besides Q8 pages and a partial shadow: no shadow at all, with the GPU gathering the
+selected clusters' rows from llama's cache and the HTP merging its partials.
+
 ## Stage 8 -- whole-cluster selection on the HTP (built 2026-09-08)
 
 `GGML_HEXAGON_CLUSTER_RUNS=1` (with `GGML_HEXAGON_CLUSTER_AVG=32`, `_ATTN=<permille>,64`, sinks default

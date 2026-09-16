@@ -107,6 +107,8 @@ struct htp_fa_context {
     bool            cl_on;
     bool            cl_inplace;        // pages are page_keys consecutive rows of the positional K/V (HTP_FA_CLUSTER_HDR_INPLACE)
     bool            cl_runs;           // whole-cluster runs (HTP_FA_CLUSTER_HDR_RUNS): lists are DMA blocks of selected runs
+    bool            cl_scatter;        // runs mode, rows fetched from the positional cache at cl_pos_map[row] (HTP_FA_CLUSTER_HDR_SCATTER)
+    const uint32_t * cl_pos_map;       // [kvh][cl_rows_max] positional row of each shadow row
     struct htp_fa_cluster_blk * cl_sel_blk;   // VTCM: [nek2][cl_max_blk] blocks (runs mode)
     const uint8_t * cl_runs_tab;       // this layer's run table: [kvh][cl_n_pages_max(=n_runs_max)] x struct htp_fa_cluster_run
     uint32_t        cl_max_blk;        // blocks per head the list can hold
@@ -4287,12 +4289,14 @@ struct hvx_fa_dec_blk {
     uint32_t        bsz;      // rows in this block
     uint32_t        pos;      // absolute KV position of row 0 (mask column); UINT32_MAX = no mask
     bool            contig;   // rows contiguous at row_size stride (shadow page) vs nb[1] stride
+    const uint32_t * rows;    // scatter: positional row of each of the bsz rows (k/v = head base); NULL otherwise
 };
 
 static inline void hvx_fa_dec_blk_src(const struct htp_fa_context * factx, const struct htp_tensor * k, const struct htp_tensor * v,
                                       uint32_t kvh, uint32_t ik2, uint32_t ik3, uint32_t iv2, uint32_t iv3, uint32_t j,
                                       struct hvx_fa_dec_blk * b) {
     uint32_t ib = j;
+    b->rows = NULL;
     if (factx->cl_on) {
         const uint32_t nsel = factx->cl_sel_n[kvh];
         if (j < nsel) {
@@ -4302,6 +4306,16 @@ static inline void hvx_fa_dec_blk_src(const struct htp_fa_context * factx, const
                 uint32_t row = e->row, bsz = e->bsz;
                 if (bsz == 0 || bsz > FLASH_ATTN_BLOCK_SIZE || row + bsz > factx->cl_rows_max) {
                     row = 0; bsz = 1;   // never a wild address
+                }
+                if (factx->cl_scatter) {
+                    // the same rows, gathered from the positional cache: one descriptor per row
+                    b->rows   = factx->cl_pos_map + (size_t) kvh * factx->cl_rows_max + row;
+                    b->k      = (const uint8_t *) k->data + ((size_t) ik2 * k->nb[2] + (size_t) ik3 * k->nb[3]);
+                    b->v      = (const uint8_t *) v->data + ((size_t) iv2 * v->nb[2] + (size_t) iv3 * v->nb[3]);
+                    b->bsz    = bsz;
+                    b->pos    = UINT32_MAX;
+                    b->contig = false;
+                    return;
                 }
                 const size_t off = (size_t) kvh * factx->cl_head_stride + (size_t) row * factx->cl_row_bytes;
                 b->k      = factx->cl_k_pages + off;
@@ -4352,6 +4366,19 @@ static inline bool hvx_fa_dec_stage(dma_queue * dma, dma_cache * mc, const struc
                                     const struct hvx_fa_dec_blk * b, uint8_t * k_dst, uint8_t * v_dst,
                                     size_t size_k_row, size_t size_v_row, uint32_t nbk1, uint32_t nbv1,
                                     const __fp16 * const * mp_base, uint32_t n_mseg, bool mask) {
+    if (b->rows) {
+        // scatter: bsz K rows then bsz V rows, one linked 1D descriptor each (the consumer pops 2 * bsz)
+        const uint32_t nek1 = factx->octx->src[1]->ne[1];
+        for (uint32_t i = 0; i < b->bsz; ++i) {
+            const uint32_t pos = b->rows[i] < nek1 ? b->rows[i] : 0;
+            dma_queue_push_single_1d(dma, dma_make_ptr(k_dst + (size_t) i * factx->size_k_row_padded, b->k + (size_t) pos * nbk1), size_k_row);
+        }
+        for (uint32_t i = 0; i < b->bsz; ++i) {
+            const uint32_t pos = b->rows[i] < nek1 ? b->rows[i] : 0;
+            dma_queue_push_single_1d(dma, dma_make_ptr(v_dst + (size_t) i * factx->size_v_row_padded, b->v + (size_t) pos * nbv1), size_v_row);
+        }
+        return false;
+    }
     if (b->contig && (factx->cl_flags & HTP_FA_CLUSTER_FLAG_DESC1D) &&
         factx->size_k_row_padded == size_k_row && factx->size_v_row_padded == size_v_row) {
         dma_queue_push_single_1d(dma, dma_make_ptr(k_dst, b->k), (size_t) b->bsz * size_k_row);
@@ -4425,6 +4452,7 @@ static void flash_attn_ext_f16_dec_thread(unsigned int nth, unsigned int ith, vo
     // pushed for it so the consumer pops exactly what the pusher pushed.
     bool     slot_has_mask[HTP_FA_CLUSTER_MAX_SLOTS];
     uint32_t slot_bsz[HTP_FA_CLUSTER_MAX_SLOTS];
+    uint32_t slot_ndesc[HTP_FA_CLUSTER_MAX_SLOTS];   // descriptors pushed per tensor: 1, or bsz for a scatter block
     struct hvx_fa_dec_blk blk;
 
     uint32_t next_static = ith;
@@ -4517,7 +4545,8 @@ static void flash_attn_ext_f16_dec_thread(unsigned int nth, unsigned int ith, vo
             hvx_fa_dec_blk_src(factx, k, v, kvh, ik2, ik3, iv2, iv3, j, &blk);
             slot_has_mask[slot] = hvx_fa_dec_stage(dma, &m_cache, factx, &blk, spad_k + slot * factx->size_k_block, spad_v + slot * factx->size_v_block,
                                                    size_k_row, size_v_row, nbk1, nbv1, mp_base, n_mseg, mask != NULL);
-            slot_bsz[slot] = blk.bsz;
+            slot_bsz[slot]   = blk.bsz;
+            slot_ndesc[slot] = blk.rows ? blk.bsz : 1;
         }
 
         for (uint32_t r = 0; r < R; ++r) {
@@ -4530,9 +4559,16 @@ static void flash_attn_ext_f16_dec_thread(unsigned int nth, unsigned int ith, vo
             const uint32_t slot     = (j - j0) % nslots;
             const uint32_t bsz      = slot_bsz[slot];
             const bool     blk_mask = slot_has_mask[slot];
+            const uint32_t ndesc    = slot_ndesc[slot];
 
             uint8_t * k_base = dma_queue_pop(dma).dst;
+            for (uint32_t i = 1; i < ndesc; ++i) {
+                dma_queue_pop(dma);
+            }
             uint8_t * v_base = dma_queue_pop(dma).dst;
+            for (uint32_t i = 1; i < ndesc; ++i) {
+                dma_queue_pop(dma);
+            }
             const __fp16 * m_base[HVX_FA_DEC_R_MAX];
             if (blk_mask) {
                 for (uint32_t m = 0; m < n_mseg; ++m) {
@@ -4626,7 +4662,8 @@ static void flash_attn_ext_f16_dec_thread(unsigned int nth, unsigned int ith, vo
                 hvx_fa_dec_blk_src(factx, k, v, kvh, ik2, ik3, iv2, iv3, j + nslots, &blk);
                 slot_has_mask[slot] = hvx_fa_dec_stage(dma, &m_cache, factx, &blk, k_base, v_base,
                                                        size_k_row, size_v_row, nbk1, nbv1, mp_base, n_mseg, mask != NULL);
-                slot_bsz[slot] = blk.bsz;
+                slot_bsz[slot]   = blk.bsz;
+                slot_ndesc[slot] = blk.rows ? blk.bsz : 1;
             }
         }
 
@@ -4936,6 +4973,8 @@ static bool hvx_fa_cl_setup(struct htp_fa_context * factx, const struct htp_ops_
     factx->cl_flags          = (uint32_t) octx->op_params[HTP_FA_CLUSTER_OPP_FLAGS];
     factx->cl_inplace        = inplace;
     factx->cl_runs           = runs;
+    factx->cl_scatter        = runs && (hdr->flags & HTP_FA_CLUSTER_HDR_SCATTER) != 0;
+    factx->cl_pos_map        = (const uint32_t *) (layer_base + hdr->off_pos_map);
     factx->cl_k_pages        = inplace ? NULL : layer_base + hdr->off_k_pages;
     factx->cl_v_pages        = inplace ? NULL : layer_base + hdr->off_v_pages;
     factx->cl_page_bytes     = hdr->page_bytes;
@@ -5342,6 +5381,8 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     factx.cl_on      = false;
     factx.cl_inplace = false;
     factx.cl_runs    = false;
+    factx.cl_scatter = false;
+    factx.cl_pos_map = NULL;
     factx.cl_flags   = 0;
     struct hvx_fa_cl_setup cls;
     if (dec && !het_base && octx->src[7] && octx->src[7]->data &&
@@ -5352,6 +5393,7 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
             uint32_t ns = 1u << HTP_FA_CLUSTER_FLAG_NSLOTS(factx.cl_flags);
             if (ns < 2) ns = 2;
             if (ns > HTP_FA_CLUSTER_MAX_SLOTS) ns = HTP_FA_CLUSTER_MAX_SLOTS;
+            if (factx.cl_scatter && ns > 4) ns = 4;   // 4 slots x 2 x 64 linked descriptors must fit the ring
             factx.dec_nslots = ns;
         }
     }
