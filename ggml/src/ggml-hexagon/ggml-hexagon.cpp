@@ -62,6 +62,7 @@
 #include <CL/cl_ext.h>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <sched.h>
 #endif
 
@@ -98,6 +99,65 @@ static int    opt_hetero_cpu  = 7;     // relay thread affinity (-1 = none)
 // reports how long it idled waiting for the GPU; the relay moves the share one 64-key block per
 // token toward a few microseconds of wait. Keeps the split useful when the GPU throttles.
 static int    opt_hetero_adapt = 1;
+// Heterogeneous PREFILL split (GGML_HEXAGON_FA_FOLD=1): GPU computes the exception blocks of a
+// sparse prefill FLASH_ATTN_EXT, the HMX op folds the partial (see ggml_hexagon_hfold_*).
+static int    opt_fa_fold     = 0;
+static int    opt_fa_fold_cpu = 7;     // relay thread affinity (-1 = none)
+static int    opt_fa_fold_check = 0;   // GGML_HEXAGON_FA_FOLD_CHECK=1: host-reference a few GPU partial rows per batch
+static int    opt_fa_fold_svmtab = 0;  // GGML_HEXAGON_FA_FOLD_SVMTAB=1: per-op tables in fine-grain SVM instead of the alias (staleness probe)
+static int    opt_fa_fold_svmq = 0;    // GGML_HEXAGON_FA_FOLD_SVMQ=1: copy Q into SVM per op (staleness probe)
+static int    opt_fa_fold_sync = 0;    // GGML_HEXAGON_FA_FOLD_SYNC=1: map/unmap the GPU's inputs per op (probe; not needed on Adreno 830)
+static int    opt_fa_fold_perf = 1;    // GGML_HEXAGON_FA_FOLD_PERF=0: do not pin the GPU clock (cl_qcom_perf_hint)
+static int    opt_fa_fold_flush = 0;   // GGML_HEXAGON_FA_FOLD_FLUSH=1: explicit Q/K/V/mask/membership flush before ready (else the op-start flush)
+static int    opt_fa_fold_stage_qb = 1; // GGML_HEXAGON_FA_FOLD_STAGE_QB=0: stage by KV head instead of query block
+// Control arm: GGML_HEXAGON_FA_FOLD_KEEPALIVE=<busy us> runs a dummy GPU kernel for that long every
+// GGML_HEXAGON_FA_FOLD_KEEPALIVE_PERIOD_US (default 18000) with NO attention work on the GPU, to
+// separate the split's own gain from the bus-clock lift a periodically busy GPU gives the HTP.
+static int    opt_fa_fold_keepalive = 0;
+static int    opt_fa_fold_keepalive_period = 18000;
+// GPU-side chain (GGML_HEXAGON_FA_FOLD_GPUDONE=1, default): gate -> compact -> stage_k -> fa_exc are
+// enqueued as one in-order chain that needs nothing from the host after `ready` (the relay only
+// mirrors ready into SVM); the membership is compacted on the GPU, and the kernel signals each
+// (query block, KV head) stage itself: an ION done word plus a stamp (direct-visibility probe)
+// and a fine-grain SVM word the relay copies to the DSP's done line. PREQ says when the chain is
+// enqueued: 0 = at ready (a fresh launch), -1 = right after the previous op's chain, -2 = every
+// chain of the graph at batch start (the in-order queue serialises them and the gates open on the
+// DSP's own ready word, so a descheduled relay thread costs nothing), N > 0 = N us before the
+// predicted ready (EMA of the ready-to-ready period). CHAIN=2 = one persistent fa_exc launch per
+// op whose work-groups pull (stage, unit) items in stage order; 1 = one plain launch per op; 0 =
+// one launch per stage.
+static int    opt_fa_fold_gpudone = 1;
+static int    opt_fa_fold_preq = -2;
+static int    opt_fa_fold_chain = 2;
+static int    opt_fa_fold_qbh = 1;         // GGML_HEXAGON_FA_FOLD_STAGE_QBH=0: stages stay whole query blocks
+static int    opt_fa_fold_gate_spins = 1000000;   // ~280 ms at ~0.28 us per SVM poll
+static int    opt_fa_fold_pwg = 32;        // CHAIN=2: persistent work-groups per op (each pulls stage-ordered units)
+static int    opt_fa_fold_pwg_stage = 64;  // persistent work-groups for the K^T staging kernel
+static int    opt_fa_fold_trace = 0;       // GGML_HEXAGON_FA_FOLD_TRACE=N: per-stage timeline of the first N jobs of every 16th batch
+static int    opt_fa_fold_ion_ready = 1;   // GGML_HEXAGON_FA_FOLD_ION_READY=0: the gate polls only the SVM mirror, not the DSP's word
+static int    opt_fa_fold_ktbuf = 0;       // GGML_HEXAGON_FA_FOLD_KTBUF=1: K^T through plain buffer loads/stores instead of the image
+static int    opt_fa_fold_probe = 0;       // GGML_HEXAGON_FA_FOLD_PROBE=<bits>: HTP_FA_FOLD_F_PROBE_* bits OR-ed into the header flags (timing only)
+// A GPU kernel that reads DSP-written memory through the alias sees stale lines of what an EARLIER
+// op left at the same address unless a SUBMISSION referencing the buffer is made after the write:
+// fences, atomic loads, migrations, map/unmap and idle time did not help, a one-work-item kernel
+// submitted at ready did (reference check 0 of 204 rows wrong vs 13-26 before). TRIG=2 (default):
+// the relay submits it on a second queue at ready and the gate opens on the relay's SVM word only.
+// TRIG=3 (gate on the trigger's COMPLETION) deadlocks: the second queue does not run concurrently
+// with the first on this device, the trigger lands behind the pre-enqueued chain, and every op
+// times out. The submission itself is what matters (TRIG=2), not the kernel's execution.
+static int    opt_fa_fold_trig = 2;        // GGML_HEXAGON_FA_FOLD_TRIG: 0 = off, 1 = submit but do not wait (probe), 2 = submit and gate on the submission, 3 = gate on its completion (deadlocks; probe)
+static int    opt_fa_fold_acq = 0;         // GGML_HEXAGON_FA_FOLD_ACQ=1: acquire fence (all SVM devices) at kernel entry
+static int    opt_fa_fold_qatomic = 0;     // GGML_HEXAGON_FA_FOLD_QATOMIC=1: Q through atomic loads
+static int    opt_fa_fold_wgfence = 0;     // GGML_HEXAGON_FA_FOLD_WGFENCE=1: per-work-group all-SVM-devices release fence
+static int    opt_fa_fold_acc16 = 1;       // GGML_HEXAGON_FA_FOLD_ACC16=0: the GPU writes the partial accumulator as f32 instead of f16 (f16 halves the fold's reads; exact within f16 rounding)
+// KNAT=1 (K in its natural layout through an image, no staging, first stage ~115 us after ready)
+// is 80-100 us per op faster but its perplexity did not reproduce across runs (19.6350 x2 /
+// 19.7070) with the reference check clean, so it stays opt-in until that is understood.
+static int    opt_fa_fold_knat = 0;        // GGML_HEXAGON_FA_FOLD_KNAT=1: read K in its natural layout through an image of the cache (no K^T staging, no tables)
+static int    opt_fa_fold_preq_idle = 0;   // GGML_HEXAGON_FA_FOLD_PREQ_IDLE_US: PREQ=-3 waits this long after the previous chain before enqueuing
+static int    opt_fa_fold_qmap = 0;        // GGML_HEXAGON_FA_FOLD_QMAP=1: enqueue a map/unmap of Q and the membership in the chain after the gate
+static int    opt_fa_fold_gate_delay = 0;  // GGML_HEXAGON_FA_FOLD_GATE_DELAY=<polls>: diagnostic hold after ready (~30 us per poll)
+static int    opt_fa_fold_notag = 0;       // GGML_HEXAGON_FA_FOLD_NOTAG=1: init the sidecar (keep-alive) but tag no node: the NPU runs the pool alone (timing probe, output lacks the exceptions)
 // Cluster-selected sparse decode attention prototype (GGML_HEXAGON_CLUSTER_ATTN=<density_permille>,<window>[,flags]).
 // The backend owns a cluster-ordered shadow of the KV cache (htp-ops.h, HTP_FA_CLUSTER_*) and tags decode
 // FLASH_ATTN_EXT nodes so the HVX kernel attends over selected 64-key pages plus a dense recent window.
@@ -336,6 +396,9 @@ struct ggml_hexagon_opbatch;
 struct ggml_hexagon_opqueue;
 struct htp_opnode;
 struct ggml_hexagon_hetero;
+struct ggml_hexagon_hfold;
+static void ggml_hexagon_hfold_free(ggml_hexagon_session * sess);
+static void ggml_hexagon_hfold_buffer_freed(ggml_hexagon_session * sess, ggml_backend_buffer_t buffer);
 struct ggml_hexagon_cluster;
 struct ggml_hexagon_session;
 #ifdef GGML_HEXAGON_HETERO
@@ -377,6 +440,7 @@ struct ggml_hexagon_session {
     } cached_graph;
 
     ggml_hexagon_hetero *  hetero  = nullptr;
+    ggml_hexagon_hfold *   hfold   = nullptr;
     ggml_hexagon_cluster * cluster = nullptr;
 
     ggml_hexagon_session(int dev_id, ggml_backend_dev_t dev) noexcept(false);
@@ -504,6 +568,9 @@ static void ggml_backend_hexagon_buffer_free_buffer(ggml_backend_buffer_t buffer
     {
         auto sbuf_ = static_cast<ggml_hexagon_shared_buffer *>(buffer->context);
         ggml_hexagon_cluster_buffer_freed(sbuf_->sess, buffer);
+#ifdef GGML_HEXAGON_HETERO
+        ggml_hexagon_hfold_buffer_freed(sbuf_->sess, buffer);
+#endif
     }
     auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(buffer->context);
     // In async mode a batch that reads this buffer can still be in flight, and the dtor
@@ -1966,6 +2033,7 @@ void ggml_hexagon_session::release() noexcept(true) {
 
 #ifdef GGML_HEXAGON_HETERO
     ggml_hexagon_hetero_free(this);
+    ggml_hexagon_hfold_free(this);
 #endif
     ggml_hexagon_cluster_free(this);
 
@@ -4340,6 +4408,1746 @@ static void ggml_hexagon_hetero_free(ggml_hexagon_session * sess) {
     sess->hetero = nullptr;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Heterogeneous PREFILL split (prototype, GGML_HEXAGON_FA_FOLD=1; the graph side is
+// LLAMA_SPARSE_ATTN=thr:<c> with LLAMA_SPARSE_ATTN_CSTAR>0, optionally LLAMA_SPARSE_ATTN_HEADSTART).
+//
+// The graph hands every prefill FLASH_ATTN_EXT its shared block list (src[5]/src[6]) and the
+// exception membership (src[8], F32 0/1 [NBk, R, NBq/R, n_kv_heads]). This sidecar attaches ONE
+// fold buffer as src[7] (header + the GPU's (m, l, acc) partial + handshake words + the GPU's
+// tables and staged K^T) and runs a relay thread: when the HMX op raises `ready` (after flushing Q,
+// K, V, the mask and the membership), the relay scans the membership into per-head compact block
+// tables, stages the exception blocks' K rows transposed, and launches the exception kernel
+// (examples/fa-exc-gpu's, over ION aliases of the hexagon buffers) once per KV head in ascending
+// order, writing done[head] as each completes. The op folds the partial in its store threads
+// (HTP_FA_FOLD_F_INSTORE), runs exception-free tiles first and waits once per head
+// (HTP_FA_FOLD_F_STAGED). One slot: the DSP runs one op at a time and the next op's ready comes
+// after this op's fold, so the buffer is never live for two ops.
+// ---------------------------------------------------------------------------------------------
+
+static const char * ggml_hexagon_hfold_cl_src = R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#define FA2_BQ  32
+#define FA2_BK  64
+#ifndef FA_D
+#define FA_D 128
+#endif
+#define M_EMPTY (-10000.0f)
+
+// Submission trigger: a one-work-item kernel that references the DSP-written inputs. Submitted at
+// ready on a second queue: it is the SUBMISSION that makes the driver's cache maintenance for
+// these buffers happen (pre-enqueued kernels read stale lines of the previous op's Q otherwise).
+__kernel void touch(__global const uchar * a, __global const uchar * b, __global const uchar * c,
+                    __global const uchar * d, __global const uchar * e, __global uint * out) {
+    if (get_global_id(0) == 0) out[8] = (uint) a[0] + b[0] + c[0] + d[0] + e[0];
+}
+
+// Keep-alive control: touch a buffer for a while. Memory-bound like the exception kernel.
+__kernel void keepalive(__global float4 * p, const int n4, const int iters, __global float * out) {
+    const int g = get_global_id(0), gs = get_global_size(0);
+    float4 acc = (float4)0;
+    for (int it = 0; it < iters; ++it) {
+        for (int i = g; i < n4; i += gs) acc += p[i];
+    }
+    if (acc.s0 == 12345.678f) out[g] = acc.s1 + acc.s2 + acc.s3;   // never true; keeps the loads alive
+}
+
+// The chain's gate: one work-item spins on the SVM ready mirror until it reads `want`, then
+// publishes svm[1] = want (or want | GATE_TIMEOUT after max_spins). The kernels behind it on the
+// in-order queue run only when svm[1] == want, so a chain whose op never came does nothing.
+#define GATE_TIMEOUT 0x80000000u
+#define STAGE_NBK_MAX 256
+#ifndef KT_BUF
+#define KT_BUF 0    // 1: K^T is written and read through the buffer alias (plain loads), not the image
+#endif
+#ifndef ACQ_FENCE
+#define ACQ_FENCE 0 // 1: acquire fence at all-SVM-devices scope at kernel entry (drop stale cached lines of DSP-written inputs)
+#endif
+#if ACQ_FENCE
+#define ENTRY_ACQUIRE() atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE | CLK_IMAGE_MEM_FENCE, memory_order_acquire, memory_scope_all_svm_devices)
+#else
+#define ENTRY_ACQUIRE() do {} while (0)
+#endif
+#ifndef Q_ATOMIC
+#define Q_ATOMIC 0  // 1: Q rows through device-scope atomic loads (bypass stale cached lines of an earlier op's Q)
+#endif
+#ifndef ACC_F16
+#define ACC_F16 0   // 1: the partial's accumulator rows are written as half (HTP_FA_FOLD_F_ACC_F16)
+#endif
+#ifndef K_NAT
+#define K_NAT 0     // 1: read K from the cache in its natural [key][d] layout through an image (no K^T staging, no tables)
+#endif
+#ifndef WG_FENCE
+#define WG_FENCE 0  // 1: every work-group releases at all-SVM-devices scope before its stage count (else device scope; the last group's acq_rel fence covers the rest)
+#endif
+#if Q_ATOMIC
+inline float4 q_load4(__global const float * p) {
+    volatile __global atomic_uint * a = (volatile __global atomic_uint *) p;
+    return (float4)(as_float(atomic_load_explicit(a + 0, memory_order_relaxed, memory_scope_device)),
+                    as_float(atomic_load_explicit(a + 1, memory_order_relaxed, memory_scope_device)),
+                    as_float(atomic_load_explicit(a + 2, memory_order_relaxed, memory_scope_device)),
+                    as_float(atomic_load_explicit(a + 3, memory_order_relaxed, memory_scope_device)));
+}
+#else
+inline float4 q_load4(__global const float * p) { return vload4(0, p); }
+#endif
+// Polls the SVM mirror the relay writes AND the DSP's own ready word through the ION alias
+// (ion_ready, may be null): whichever shows `want` first opens the gate; svm[6] records which.
+__kernel void gate(__global uint * svm, const uint want, const int max_spins,
+                   __global uchar * tabs, const int scnt_off, const int err_off, const int n_stages,
+                   __global uint * ion_ready, const int delay_polls) {
+    if (get_global_id(0) != 0) return;
+    int it = 0;
+    uint won = 1u;   // 1 = SVM mirror, 2 = ION word
+    for (;;) {
+        if (atomic_load_explicit((volatile __global atomic_uint *) svm, memory_order_acquire, memory_scope_all_svm_devices) == want) break;
+        if (ion_ready && atomic_load_explicit((volatile __global atomic_uint *) ion_ready, memory_order_acquire, memory_scope_device) == want) { won = 2u; break; }
+        if (++it >= max_spins) {
+            atomic_store_explicit((volatile __global atomic_uint *)(svm + 2), (uint) it, memory_order_seq_cst, memory_scope_all_svm_devices);
+            atomic_store_explicit((volatile __global atomic_uint *)(svm + 1), want | GATE_TIMEOUT, memory_order_seq_cst, memory_scope_all_svm_devices);
+            return;
+        }
+    }
+    // diagnostic: hold the chain back for delay_polls more polls (~30 us each) after ready; the
+    // loads feed a store so they cannot be dropped
+    if (delay_polls > 0) {
+        uint acc = 0;
+        for (int d = 0; d < delay_polls; ++d) {
+            acc += atomic_load_explicit((volatile __global atomic_uint *) svm, memory_order_acquire, memory_scope_all_svm_devices);
+            if (ion_ready) acc += atomic_load_explicit((volatile __global atomic_uint *) ion_ready, memory_order_acquire, memory_scope_device);
+        }
+        atomic_store_explicit((volatile __global atomic_uint *)(svm + 7), acc, memory_order_relaxed, memory_scope_all_svm_devices);
+    }
+    atomic_store_explicit((volatile __global atomic_uint *)(svm + 6), won, memory_order_seq_cst, memory_scope_all_svm_devices);
+    // this op's counters: per-stage work-group counts, the two persistent unit counters, the error word
+    __global int * sc = (__global int *)(tabs + scnt_off);
+    for (int st = 0; st < n_stages; ++st) sc[st] = 0;
+    sc[64] = 0; sc[65] = 0;
+    *(__global int *)(tabs + err_off) = 0;
+    mem_fence(CLK_GLOBAL_MEM_FENCE);
+    atomic_store_explicit((volatile __global atomic_uint *)(svm + 2), (uint) it, memory_order_seq_cst, memory_scope_all_svm_devices);
+    atomic_store_explicit((volatile __global atomic_uint *)(svm + 1), want, memory_order_seq_cst, memory_scope_all_svm_devices);
+}
+inline int gate_open(__global const uint * svm, const uint want) {
+    return want == 0u || atomic_load_explicit((volatile __global atomic_uint *)(svm + 1), memory_order_acquire, memory_scope_all_svm_devices) == want;
+}
+// timeline stamp: the first work-group of a kernel marks its start (trace only)
+inline void mark_start(__global uint * svm, const uint want, const int word) {
+    if (want != 0u && get_group_id(0) == 0 && get_group_id(1) == 0 && get_group_id(2) == 0 && get_local_id(0) == 0) {
+        atomic_store_explicit((volatile __global atomic_uint *)(svm + word), want, memory_order_seq_cst, memory_scope_all_svm_devices);
+    }
+}
+
+// The membership (one 0/1 f32 row of nbk per (KV head, sub-block)) -> the per-head compact
+// tables the two kernels below read, exactly as the host relay used to build them. One
+// work-group per KV head. Also zeroes the kernel error word and the per-stage counters.
+__kernel __attribute__((reqd_work_group_size(256, 1, 1)))
+void compact(__global const uint * svm, const uint want,
+             __global const uchar * embuf, const int em_off, const int nbk, const int num_sb,
+             __global uchar * tabs, const int idx_off, const int abs_off, const int cnt_off, const int lcnt_off, const int err_off,
+             const int scnt_off, const int n_stages, const int nbk_cap) {
+    if (!gate_open(svm, want)) return;
+    mark_start((__global uint *) svm, want, 3);
+    const int kvh = get_group_id(0);
+    const int t   = get_local_id(0);
+    __local int tc[1024];
+    __global const float * em = (__global const float *)(embuf + em_off) + (long) kvh * num_sb * nbk;
+    for (int b = t; b < nbk; b += 256) {
+        int u = 0;
+        for (int sb = 0; sb < num_sb; ++sb) u |= (em[(long) sb * nbk + b] != 0.0f);
+        tc[b] = u ? 0 : -1;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    __global int * abs_tab = (__global int *)(tabs + abs_off) + (long) kvh * nbk_cap;
+    __global int * cnt     = (__global int *)(tabs + cnt_off);
+    if (t == 0) {
+        int c = 0;
+        for (int b = 0; b < nbk; ++b) if (tc[b] == 0) { abs_tab[c] = b; tc[b] = c++; }
+        for (int i = c; i < nbk_cap; ++i) abs_tab[i] = -1;
+        cnt[kvh] = c * 64;
+        if (kvh == 0) {
+            *(__global int *)(tabs + err_off) = 0;
+            __global int * sc = (__global int *)(tabs + scnt_off);
+            for (int st = 0; st < n_stages; ++st) sc[st] = 0;
+            sc[64] = 0;   // the persistent fa_exc unit counter
+            sc[65] = 0;   // the persistent stage_k unit counter
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    __global int * idx  = (__global int *)(tabs + idx_off);
+    __global int * lcnt = (__global int *)(tabs + lcnt_off);
+    for (int sb = t; sb < num_sb; sb += 256) {
+        __global int *         irow = idx + ((long) kvh * num_sb + sb) * nbk_cap;
+        __global const float * row  = em + (long) sb * nbk;
+        int s = 0;
+        for (int b = 0; b < nbk; ++b) if (row[b] != 0.0f) irow[s++] = tc[b];
+        lcnt[kvh * num_sb + sb] = s;
+    }
+}
+
+inline void stage_k_item(__global const uchar * kbuf, const int k_off, const int k_nb1, const int k_nb2,
+                         __write_only image1d_buffer_t kt_img, const int kt_base_tex,
+                         __global const uchar * tabs, const int abs_off, const int abs_stride, const int n_stage,
+                         const int k4, const int dg, const int kvh) {
+    __global const int * abs_tab = (__global const int *)(tabs + abs_off);
+    half8 kr[4];
+    for (int c = 0; c < 4; ++c) {
+        const int ki  = k4 * 4 + c;
+        const int tok = abs_tab[kvh * abs_stride + (ki >> 6)] * FA2_BK + (ki & (FA2_BK - 1));
+        __global const half * src = (__global const half *)(kbuf + k_off + (long) tok * k_nb1 + (long) kvh * k_nb2);
+        kr[c] = vload8(0, src + dg * 8);
+    }
+    const int M_4 = n_stage >> 2;
+    const int tex = kt_base_tex + kvh * FA_D * M_4 + (dg * 8) * M_4 + k4;
+    write_imageh(kt_img, tex,           (half4)(kr[0].s0, kr[1].s0, kr[2].s0, kr[3].s0));
+    write_imageh(kt_img, tex + 1 * M_4, (half4)(kr[0].s1, kr[1].s1, kr[2].s1, kr[3].s1));
+    write_imageh(kt_img, tex + 2 * M_4, (half4)(kr[0].s2, kr[1].s2, kr[2].s2, kr[3].s2));
+    write_imageh(kt_img, tex + 3 * M_4, (half4)(kr[0].s3, kr[1].s3, kr[2].s3, kr[3].s3));
+    write_imageh(kt_img, tex + 4 * M_4, (half4)(kr[0].s4, kr[1].s4, kr[2].s4, kr[3].s4));
+    write_imageh(kt_img, tex + 5 * M_4, (half4)(kr[0].s5, kr[1].s5, kr[2].s5, kr[3].s5));
+    write_imageh(kt_img, tex + 6 * M_4, (half4)(kr[0].s6, kr[1].s6, kr[2].s6, kr[3].s6));
+    write_imageh(kt_img, tex + 7 * M_4, (half4)(kr[0].s7, kr[1].s7, kr[2].s7, kr[3].s7));
+}
+
+// Kt[kv_head][d][key] over the compacted exception blocks of each KV head, from the K cache.
+// Written THROUGH THE IMAGE (one texel = 4 consecutive keys at one d): a K^T written through the
+// buffer alias and read through an image view returned the previous op's keys, because the
+// texture cache is only invalidated for data the driver knows was written as an image.
+__kernel void stage_k(__global const uchar * kbuf, const int k_off, const int k_nb1, const int k_nb2,
+                      __write_only image1d_buffer_t kt_img, const int kt_base_tex,
+                      __global const uchar * tabs, const int abs_off, const int cnt_off,
+                      const int abs_stride, const int n_stage,
+                      __global const uint * svm, const uint want) {
+    if (!gate_open(svm, want)) return;
+    mark_start((__global uint *) svm, want, 4);
+    const int k4  = get_global_id(0);   // 4 keys
+    const int dg  = get_global_id(1);   // 8 dims
+    const int kvh = get_global_id(2);
+    __global const int * cnt = (__global const int *)(tabs + cnt_off);
+    if (k4 * 4 >= cnt[kvh]) return;
+    stage_k_item(kbuf, k_off, k_nb1, k_nb2, kt_img, kt_base_tex, tabs, abs_off, abs_stride, n_stage, k4, dg, kvh);
+}
+
+// Persistent form: n_pwg work-groups of 128 pull units of (KV head, 8 consecutive k4) from a
+// counter (head-major); a unit past its head's real count costs one atomic. Each work-group
+// compacts the membership of the head it is on in local memory (1K floats), so nothing is
+// needed from the host or an earlier kernel; the work-group that takes a head's first unit
+// also publishes that head's tables for fa_exc, which runs behind the kernel boundary.
+__kernel __attribute__((reqd_work_group_size(128, 1, 1)))
+void stage_k_p(__global const uchar * kbuf, const int k_off, const int k_nb1, const int k_nb2,
+               __write_only image1d_buffer_t kt_img, const int kt_base_tex,
+               __global uchar * tabs, const int abs_off, const int cnt_off,
+               const int abs_stride, const int n_stage, const int nkvh, const int scnt_off,
+               __global const uint * svm, const uint want,
+               __global uchar * embuf, const int em_off, const int nbk, const int num_sb,
+               const int idx_off, const int lcnt_off) {
+    if (!gate_open(svm, want)) return;
+    ENTRY_ACQUIRE();
+    mark_start((__global uint *) svm, want, 4);
+    const int t = get_local_id(0);
+    __local int unit_sh, cur_head, cnt_l;
+    __local int tc[STAGE_NBK_MAX], abs_l[STAGE_NBK_MAX];   // 2 KB: keeps the persistent work-groups resident
+    if (t == 0) cur_head = -1;
+    const int kb_per_head = (n_stage / 4 + 7) / 8;
+    const int n_units = nkvh * kb_per_head;
+    for (;;) {
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (t == 0) unit_sh = atomic_add((volatile __global int *)(tabs + scnt_off) + 65, 1);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        const int unit = unit_sh;
+        if (unit >= n_units) break;
+        const int kvh = unit / kb_per_head;
+        const int kb  = unit % kb_per_head;
+        // membership rows as uint bits through device-scope atomic loads: a plain load may hit a
+        // stale UCHE line left by an earlier op's membership at the same address (the graph
+        // allocator reuses it); atomic loads see the DSP's writes, as the gate's ready poll does
+        volatile __global atomic_uint * em = (volatile __global atomic_uint *)(embuf + em_off) + (long) kvh * num_sb * nbk;
+        if (kvh != cur_head) {
+            for (int b = t; b < nbk; b += 128) {
+                int u = 0;
+                for (int sb = 0; sb < num_sb; ++sb) u |= (atomic_load_explicit(em + (long) sb * nbk + b, memory_order_relaxed, memory_scope_device) != 0u);
+                tc[b] = u ? 0 : -1;
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+            if (t == 0) {
+                int c = 0;
+                for (int b = 0; b < nbk; ++b) if (tc[b] == 0) { abs_l[c] = b; tc[b] = c++; }
+                cnt_l = c * 64; cur_head = kvh;
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        if (kb == 0) {
+            // publish this head's tables (abs, cnt, idx rows, lcnt) exactly as the host relay did
+            __global int * abs_tab = (__global int *)(tabs + abs_off) + (long) kvh * abs_stride;
+            const int c = cnt_l / 64;
+            for (int i = t; i < abs_stride; i += 128) abs_tab[i] = i < c ? abs_l[i] : -1;
+            if (t == 0) ((__global int *)(tabs + cnt_off))[kvh] = cnt_l;
+            __global int * idx  = (__global int *)(tabs + idx_off);
+            __global int * lcnt = (__global int *)(tabs + lcnt_off);
+            for (int sb = t; sb < num_sb; sb += 128) {
+                __global int * irow = idx + ((long) kvh * num_sb + sb) * abs_stride;
+                volatile __global atomic_uint * row = em + (long) sb * nbk;
+                int s = 0;
+                for (int b = 0; b < nbk; ++b) if (atomic_load_explicit(row + b, memory_order_relaxed, memory_scope_device) != 0u) irow[s++] = tc[b];
+                lcnt[kvh * num_sb + sb] = s;
+            }
+        }
+        const int k4 = kb * 8 + t / 16;
+        const int dg = t % 16;
+        if (k4 * 4 < cnt_l) {
+            half8 kr[4];
+            for (int cc = 0; cc < 4; ++cc) {
+                const int ki  = k4 * 4 + cc;
+                const int tok = abs_l[ki >> 6] * FA2_BK + (ki & (FA2_BK - 1));
+                __global const half * src = (__global const half *)(kbuf + k_off + (long) tok * k_nb1 + (long) kvh * k_nb2);
+                kr[cc] = vload8(0, src + dg * 8);
+            }
+            const int M_4 = n_stage >> 2;
+            const int tex = kt_base_tex + kvh * FA_D * M_4 + (dg * 8) * M_4 + k4;
+#if KT_BUF
+            __global half * kt = (__global half *) tabs;   // tabs == the fold buffer alias; texel tex = 4 halves at tex * 4
+            vstore4((half4)(kr[0].s0, kr[1].s0, kr[2].s0, kr[3].s0), 0, kt + (long) (tex          ) * 4);
+            vstore4((half4)(kr[0].s1, kr[1].s1, kr[2].s1, kr[3].s1), 0, kt + (long) (tex + 1 * M_4) * 4);
+            vstore4((half4)(kr[0].s2, kr[1].s2, kr[2].s2, kr[3].s2), 0, kt + (long) (tex + 2 * M_4) * 4);
+            vstore4((half4)(kr[0].s3, kr[1].s3, kr[2].s3, kr[3].s3), 0, kt + (long) (tex + 3 * M_4) * 4);
+            vstore4((half4)(kr[0].s4, kr[1].s4, kr[2].s4, kr[3].s4), 0, kt + (long) (tex + 4 * M_4) * 4);
+            vstore4((half4)(kr[0].s5, kr[1].s5, kr[2].s5, kr[3].s5), 0, kt + (long) (tex + 5 * M_4) * 4);
+            vstore4((half4)(kr[0].s6, kr[1].s6, kr[2].s6, kr[3].s6), 0, kt + (long) (tex + 6 * M_4) * 4);
+            vstore4((half4)(kr[0].s7, kr[1].s7, kr[2].s7, kr[3].s7), 0, kt + (long) (tex + 7 * M_4) * 4);
+#else
+            write_imageh(kt_img, tex,           (half4)(kr[0].s0, kr[1].s0, kr[2].s0, kr[3].s0));
+            write_imageh(kt_img, tex + 1 * M_4, (half4)(kr[0].s1, kr[1].s1, kr[2].s1, kr[3].s1));
+            write_imageh(kt_img, tex + 2 * M_4, (half4)(kr[0].s2, kr[1].s2, kr[2].s2, kr[3].s2));
+            write_imageh(kt_img, tex + 3 * M_4, (half4)(kr[0].s3, kr[1].s3, kr[2].s3, kr[3].s3));
+            write_imageh(kt_img, tex + 4 * M_4, (half4)(kr[0].s4, kr[1].s4, kr[2].s4, kr[3].s4));
+            write_imageh(kt_img, tex + 5 * M_4, (half4)(kr[0].s5, kr[1].s5, kr[2].s5, kr[3].s5));
+            write_imageh(kt_img, tex + 6 * M_4, (half4)(kr[0].s6, kr[1].s6, kr[2].s6, kr[3].s6));
+            write_imageh(kt_img, tex + 7 * M_4, (half4)(kr[0].s7, kr[1].s7, kr[2].s7, kr[3].s7));
+#endif
+        }
+    }
+}
+
+// One work-group = 32 query rows of one head over that sub-block's exception blocks. Emits the
+// UNNORMALISED (m, l, acc) per row; a row without exceptions leaves the empty partial.
+// Work-group mapping: chain == 0: (qb, bh) = (gid1, gid2), a launch per stage or per op with the
+// host's offsets. chain == 1: one launch per op, gid2 = stage (dispatched in stage order), gid1
+// = (32-row block within the stage, head within the stage). gpu_done != 0: the last work-group
+// of a stage (per-stage counter) writes the ION stamp and done word, then the SVM done word.
+__kernel __attribute__((reqd_work_group_size(128, 1, 1)))
+void fa_exc(__read_only image1d_buffer_t kt_img, __read_only image1d_buffer_t v_img,
+            __global const uchar * qbuf, const int q_off, const int q_nb1, const int q_nb2,
+            __global const uchar * mbuf, const int mask_off, const int mask_nb1,
+            __global uchar * hbuf, __global uchar * tabs, const int idx_off, const int abs_off, const int cnt_off, const int lcnt_off, const int err_off,
+            const int f_m, const int f_l, const int f_acc,
+            const int Sq, const int G, const int num_sb, const int qb_per_sb, const int top_k,
+            const int abs_stride, const int n_stage,
+            const int kt_base_tex, const int v_base_tex, const int v_tok_tex, const int v_head_tex,
+            const float scale,
+            __global uint * svm, const uint want, const int chain, const int gpu_done, const int qbh,
+            const int nkvh, const int qb32_per_stage, const int scnt_off, const int done_off, const int stamp_off, const int n_stages_arg,
+            __read_only image1d_buffer_t k_img, const int k_base_tex, const int k_tok_tex, const int k_head_tex,
+            __global uchar * embuf, const int em_off, const int nbk) {
+    if (!gate_open(svm, want)) return;
+    ENTRY_ACQUIRE();
+    mark_start(svm, want, 5);
+    const int t  = get_local_id(0);
+    __local float S_lds[FA2_BQ][FA2_BK];
+    __local float m_run[FA2_BQ]; __local float l_run[FA2_BQ]; __local float a_sh[FA2_BQ];
+    __local int   unit_sh;
+#if K_NAT
+    __local int   list_sh[STAGE_NBK_MAX]; __local int n_list_sh;
+#endif
+    const int hpl     = qbh ? G : G * nkvh;            // heads per stage
+    const int n_units = n_stages_arg * qb32_per_stage * hpl;
+    // chain == 2: persistent work-groups pull units (stage-major) from a counter until none are left
+    for (;;) {
+    int qb, bh;
+    if (chain == 2) {
+        if (t == 0) unit_sh = atomic_add((volatile __global int *)(tabs + scnt_off) + 64, 1);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        const int unit = unit_sh;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (unit >= n_units) break;
+        const int stage = unit / (qb32_per_stage * hpl);
+        const int y     = unit % (qb32_per_stage * hpl);
+        qb = (qbh ? stage / nkvh : stage) * qb32_per_stage + y / hpl;
+        bh = (qbh ? (stage % nkvh) * G : 0) + y % hpl;
+    } else if (chain == 1) {
+        const int stage = get_global_id(2);
+        const int y     = get_global_id(1);
+        qb = (qbh ? stage / nkvh : stage) * qb32_per_stage + y / hpl;
+        bh = (qbh ? (stage % nkvh) * G : 0) + y % hpl;
+    } else {
+        qb = get_global_id(1);
+        bh = get_global_id(2);
+    }
+    const int q0 = qb * FA2_BQ;
+    const int kvh = bh / G;
+    const int sb  = qb / qb_per_sb;
+    if (q0 < Sq) {
+
+#if K_NAT
+    // the exception list of (kvh, sb) straight from the membership row, ascending block order;
+    // the barrier publishes it to the other waves (without it they read the previous unit's list)
+    if (t == 0) {
+        volatile __global atomic_uint * emrow = (volatile __global atomic_uint *)(embuf + em_off) + ((long) kvh * num_sb + sb) * nbk;
+        int s = 0;
+        for (int b = 0; b < nbk && s < STAGE_NBK_MAX; ++b) if (atomic_load_explicit(emrow + b, memory_order_relaxed, memory_scope_device) != 0u) list_sh[s++] = b;
+        n_list_sh = s;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    const int k_head = k_base_tex + kvh * k_head_tex;
+#else
+    __global const int * idx_row = (__global const int *)(tabs + idx_off) + ((long) kvh * num_sb + sb) * top_k;
+    const int cnt_row = ((__global const int *)(tabs + lcnt_off))[(long) kvh * num_sb + sb];
+    __global const int * abs_tab = (__global const int *)(tabs + abs_off);
+    __global const int * cnt     = (__global const int *)(tabs + cnt_off);
+    const int n_blk_kvh = cnt[kvh] >> 6;
+#endif
+
+    const int pv_mt = t % (FA_D / 8); const int pv_nt = t / (FA_D / 8); const int pv_d0 = pv_mt * 8;
+    float8 o0 = (float8)0, o1 = (float8)0, o2 = (float8)0, o3 = (float8)0;
+    if (t < FA2_BQ) { m_run[t] = -INFINITY; l_run[t] = 0.0f; }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int M_4kv   = n_stage >> 2;
+    const int kt_head = kt_base_tex + kvh * FA_D * M_4kv;
+    const int v_head  = v_base_tex + kvh * v_head_tex;
+    __global const float * Qh = (__global const float *)(qbuf + q_off + (long) bh * q_nb2);
+    const int q_row_f = q_nb1 >> 2;
+    __global const half * Mk = (__global const half *)(mbuf + mask_off);
+    const int mask_row_h = mask_nb1 >> 1;
+
+#if K_NAT
+    const int n_list = n_list_sh;   // visible: the barrier above followed thread 0's scan
+#else
+    const int n_list = (cnt_row < top_k) ? cnt_row : top_k;
+#endif
+    for (int s = 0; s < n_list; ++s) {
+#if K_NAT
+        const int cb  = list_sh[s];          // absolute block
+        const int vk0 = cb * FA2_BK;
+#else
+        const int cb = idx_row[s];
+        if (cb < 0) break;
+        if (cb >= n_blk_kvh) {
+            if (t == 0) atomic_inc((volatile __global int *)(tabs + err_off));
+            break;
+        }
+        const int kt0 = cb * FA2_BK;
+        const int vk0 = abs_tab[kvh * abs_stride + cb] * FA2_BK;
+#endif
+        {
+            const int mt = t % (FA2_BK / 8); const int nt = t / (FA2_BK / 8);
+            // rows past Sq (a ragged last ubatch) read a clamped row and are never written
+            const int qr0 = min(q0 + nt * 2,     Sq - 1);
+            const int qr1 = min(q0 + nt * 2 + 1, Sq - 1);
+            float8 c0 = (float8)0, c1 = (float8)0;
+#if K_NAT
+            // natural layout: one texel = 4 dims of one key; this thread's 8 keys are 8 rows of 32 texels
+            {
+                const int kt_row0 = k_head + (vk0 + mt * 8) * k_tok_tex;
+                float c0a[8] = {0, 0, 0, 0, 0, 0, 0, 0}, c1a[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                for (int i = 0; i < FA_D; i += 4) {
+                    const float4 wa = q_load4(Qh + (long) qr0 * q_row_f + i);
+                    const float4 wb = q_load4(Qh + (long) qr1 * q_row_f + i);
+                    #pragma unroll
+                    for (int jj = 0; jj < 8; ++jj) {
+                        const float4 kq = convert_float4(read_imageh(k_img, kt_row0 + jj * k_tok_tex + (i >> 2)));
+                        c0a[jj] += dot(kq, wa); c1a[jj] += dot(kq, wb);
+                    }
+                }
+                c0 = (float8)(c0a[0], c0a[1], c0a[2], c0a[3], c0a[4], c0a[5], c0a[6], c0a[7]);
+                c1 = (float8)(c1a[0], c1a[1], c1a[2], c1a[3], c1a[4], c1a[5], c1a[6], c1a[7]);
+            }
+#else
+            const int kbase = kt_head + (kt0 >> 2) + mt * 2;
+            for (int i = 0; i < FA_D; i += 4) {
+                const int tb = kbase + i * M_4kv;
+                half8 B0, B1, B2, B3;
+#if KT_BUF
+                __global const half * kt = (__global const half *) hbuf;
+                B0 = vload8(0, kt + (long) (tb            ) * 4);
+                B1 = vload8(0, kt + (long) (tb +     M_4kv) * 4);
+                B2 = vload8(0, kt + (long) (tb + 2 * M_4kv) * 4);
+                B3 = vload8(0, kt + (long) (tb + 3 * M_4kv) * 4);
+#else
+                B0.s0123 = read_imageh(kt_img, tb);              B0.s4567 = read_imageh(kt_img, tb + 1);
+                B1.s0123 = read_imageh(kt_img, tb + M_4kv);      B1.s4567 = read_imageh(kt_img, tb + M_4kv + 1);
+                B2.s0123 = read_imageh(kt_img, tb + 2 * M_4kv);  B2.s4567 = read_imageh(kt_img, tb + 2 * M_4kv + 1);
+                B3.s0123 = read_imageh(kt_img, tb + 3 * M_4kv);  B3.s4567 = read_imageh(kt_img, tb + 3 * M_4kv + 1);
+#endif
+                const float8 b0 = convert_float8(B0), b1 = convert_float8(B1), b2 = convert_float8(B2), b3 = convert_float8(B3);
+                const float4 wa = q_load4(Qh + (long) qr0 * q_row_f + i);
+                const float4 wb = q_load4(Qh + (long) qr1 * q_row_f + i);
+                c0 += b0*wa.s0; c0 += b1*wa.s1; c0 += b2*wa.s2; c0 += b3*wa.s3;
+                c1 += b0*wb.s0; c1 += b1*wb.s1; c1 += b2*wb.s2; c1 += b3*wb.s3;
+            }
+#endif
+            const int kb = vk0 + mt * 8;
+            #define EMITS(NN, CV, QR) { float8 v = (CV) * scale; \
+                v += convert_float8(vload8(0, Mk + (long) (QR) * mask_row_h + kb)); \
+                vstore8(v, 0, &S_lds[nt * 2 + (NN)][mt * 8]); }
+            EMITS(0, c0, qr0); EMITS(1, c1, qr1);
+            #undef EMITS
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (t < FA2_BQ) {
+            const int q = t; __local float * row = S_lds[q];
+            float8 mx = (float8)(-INFINITY);
+            for (int k = 0; k < FA2_BK; k += 8) mx = fmax(mx, vload8(0, row + k));
+            float4 m4 = fmax(mx.lo, mx.hi); float2 m2 = fmax(m4.lo, m4.hi); float m_tile = fmax(m2.s0, m2.s1);
+            const float m_old = m_run[q]; const float m_new = fmax(m_old, m_tile);
+            const float a = (m_old == -INFINITY) ? 0.0f : native_exp(m_old - m_new);
+            float8 l8 = (float8)0;
+            for (int k = 0; k < FA2_BK; k += 8) {
+                const float8 s8 = vload8(0, row + k);
+                const float8 p = select(native_exp(s8 - m_new), (float8)0, isinf(s8));
+                vstore8(p, 0, row + k); l8 += p;
+            }
+            float4 l4 = l8.lo + l8.hi; float2 l2 = l4.lo + l4.hi;
+            l_run[q] = a * l_run[q] + (l2.s0 + l2.s1); m_run[q] = m_new; a_sh[q] = a;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        o0 *= a_sh[pv_nt * 4 + 0]; o1 *= a_sh[pv_nt * 4 + 1]; o2 *= a_sh[pv_nt * 4 + 2]; o3 *= a_sh[pv_nt * 4 + 3];
+        for (int kk = 0; kk < FA2_BK; kk += 4) {
+            const int vt = v_head + (vk0 + kk) * v_tok_tex + pv_mt * 2;
+            half8 V0, V1, V2, V3;
+            V0.s0123 = read_imageh(v_img, vt);                   V0.s4567 = read_imageh(v_img, vt + 1);
+            V1.s0123 = read_imageh(v_img, vt + v_tok_tex);       V1.s4567 = read_imageh(v_img, vt + v_tok_tex + 1);
+            V2.s0123 = read_imageh(v_img, vt + 2 * v_tok_tex);   V2.s4567 = read_imageh(v_img, vt + 2 * v_tok_tex + 1);
+            V3.s0123 = read_imageh(v_img, vt + 3 * v_tok_tex);   V3.s4567 = read_imageh(v_img, vt + 3 * v_tok_tex + 1);
+            const float8 v0 = convert_float8(V0), v1 = convert_float8(V1), v2 = convert_float8(V2), v3 = convert_float8(V3);
+            float4 p0 = vload4(0, &S_lds[pv_nt * 4 + 0][kk]); float4 p1 = vload4(0, &S_lds[pv_nt * 4 + 1][kk]);
+            float4 p2 = vload4(0, &S_lds[pv_nt * 4 + 2][kk]); float4 p3 = vload4(0, &S_lds[pv_nt * 4 + 3][kk]);
+            o0 += v0*p0.s0; o0 += v1*p0.s1; o0 += v2*p0.s2; o0 += v3*p0.s3;
+            o1 += v0*p1.s0; o1 += v1*p1.s1; o1 += v2*p1.s2; o1 += v3*p1.s3;
+            o2 += v0*p2.s0; o2 += v1*p2.s1; o2 += v2*p2.s2; o2 += v3*p2.s3;
+            o3 += v0*p3.s0; o3 += v1*p3.s1; o3 += v2*p3.s2; o3 += v3*p3.s3;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+    const long r0 = (long) bh * Sq + q0;
+    __global float * Fm = (__global float *)(hbuf + f_m);
+    __global float * Fl = (__global float *)(hbuf + f_l);
+#if ACC_F16
+    __global half * Fa = (__global half *)(hbuf + f_acc);
+#else
+    __global float * Fa = (__global float *)(hbuf + f_acc);
+#endif
+    if (t < FA2_BQ && q0 + t < Sq) {
+        const float l = l_run[t];
+        Fm[r0 + t] = (l > 0.0f) ? m_run[t] : M_EMPTY;
+        Fl[r0 + t] = l;
+    }
+#if ACC_F16
+    #define OWRITE(NN, OV) { const int q = pv_nt * 4 + (NN); const float l = l_run[q]; \
+        if (q0 + q < Sq) vstore_half8((l > 0.0f) ? (OV) : (float8)0, 0, Fa + (r0 + q) * FA_D + pv_d0); }
+#else
+    #define OWRITE(NN, OV) { const int q = pv_nt * 4 + (NN); const float l = l_run[q]; \
+        if (q0 + q < Sq) vstore8((l > 0.0f) ? (OV) : (float8)0, 0, Fa + (r0 + q) * FA_D + pv_d0); }
+#endif
+    OWRITE(0, o0); OWRITE(1, o1); OWRITE(2, o2); OWRITE(3, o3);
+    #undef OWRITE
+    }   // q0 < Sq
+    if (gpu_done) {
+        // every work-group of the stage counts, ragged ones included, so the host's per-stage
+        // count is simply qb32_per_stage * heads-per-stage
+        barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);
+        if (t == 0) {
+            const int stage = (qb / qb32_per_stage) * (qbh ? nkvh : 1) + (qbh ? kvh : 0);
+            const int n_wg  = qb32_per_stage * (qbh ? G : G * nkvh);
+            // this work-group's rows are in L2 (the barrier above); the last work-group's acq_rel
+            // fence at all-SVM-devices scope pushes every group's rows out before the done word
+#if WG_FENCE
+            atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_release, memory_scope_all_svm_devices);
+#else
+            atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_release, memory_scope_device);
+#endif
+            const int old = atomic_fetch_add_explicit((volatile __global atomic_int *)(tabs + scnt_off) + stage, 1, memory_order_acq_rel, memory_scope_device);
+            if (old == n_wg - 1) {
+                atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_acq_rel, memory_scope_all_svm_devices);
+                atomic_store_explicit((volatile __global atomic_uint *)(hbuf + stamp_off) + stage, want, memory_order_seq_cst, memory_scope_all_svm_devices);
+                atomic_store_explicit((volatile __global atomic_uint *)(hbuf + done_off) + stage, want, memory_order_seq_cst, memory_scope_all_svm_devices);
+                atomic_store_explicit((volatile __global atomic_uint *)(svm + 64 + stage), want, memory_order_seq_cst, memory_scope_all_svm_devices);
+            }
+        }
+    }
+    if (chain != 2) break;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    }   // persistent loop
+}
+)CL";
+
+struct hfold_chain { bool enq = false; std::chrono::steady_clock::time_point t_enq; std::vector<cl_event> ev; };
+
+struct ggml_hexagon_hfold_job {
+    const ggml_tensor * node = nullptr;
+    uint32_t want = 0;
+    cl_mem   q = nullptr, k = nullptr, v_img = nullptr, m = nullptr, k_img = nullptr;
+    uint32_t q_off = 0, q_nb1 = 0, q_nb2 = 0, k_off = 0, k_nb1 = 0, k_nb2 = 0, v_off = 0, v_nb1 = 0, v_nb2 = 0, m_off = 0, m_nb1 = 0;
+    uint32_t Sq = 0, nh = 0, nkvh = 0, G = 0, nbk = 0, num_sb = 0, num_qb = 0;
+    uint32_t br = 0, n_stages = 0;      // the kernel's query tile rows; stages = query blocks or KV heads
+    bool     qbh = false;               // stages are (query block, KV head) pairs
+    cl_mem   em = nullptr;              // src[8] through the compute buffer's alias (the GPU compacts it)
+    uint32_t em_off = 0;
+    const float * em_host = nullptr;   // src[8] in the compute buffer (host VA)
+    size_t   em_bytes = 0;
+    float    scale = 0.0f;
+    const uint8_t * q_base = nullptr, * k_base = nullptr, * v_base = nullptr, * m_base = nullptr;   // host VAs (FOLD_CHECK)
+    hfold_chain chain;                 // GPU chain state (enqueued when; events to release)
+};
+
+struct ggml_hexagon_hfold {
+    ggml_hexagon_session *  sess = nullptr;
+    ggml_backend_buffer_t   buf  = nullptr;   // header + partial + handshake + GPU tables + staged K^T
+    uint8_t *               base = nullptr;
+    size_t                  size = 0;
+    ggml_context *          tctx = nullptr;
+    ggml_tensor *           ctrl = nullptr;   // hand-wired tensor over buf, attached as src[7]
+    // layout (bytes from base)
+    size_t   off_m = 0, off_l = 0, off_acc = 0, off_ctl = 0, off_idx = 0, off_abs = 0, off_cnt = 0, off_lcnt = 0, off_err = 0, off_kt = 0;
+    size_t   off_done = 0, off_scnt = 0, off_stamp = 0;   // GPU-written done words, per-stage counters, visibility stamps
+    uint32_t rows = 0, neq1 = 0, nbk_cap = 0, num_sb_cap = 0, nkvh = 0, D = 0;
+
+    cl_platform_id   plat = nullptr;
+    cl_device_id     dev  = nullptr;
+    cl_context       ctx  = nullptr;
+    cl_command_queue q    = nullptr;
+    cl_program       prog = nullptr;
+    cl_kernel        k_stage = nullptr, k_fa = nullptr, k_keep = nullptr, k_gate = nullptr, k_compact = nullptr, k_stage_p = nullptr, k_touch = nullptr;
+    cl_command_queue q2 = nullptr;                               // trigger submissions at ready (TRIG)
+    uint32_t *       svm_ctl = nullptr;                          // fine-grain SVM: [0] ready mirror, [1] gate status, [2] gate spins, [64..] done words
+    bool             svm_ok = false;
+    // chain path statistics
+    uint64_t n_chain = 0, n_gate_timeouts = 0, n_fallback = 0, n_direct = 0, n_stamp_seen = 0, n_stamp_total = 0, n_preq = 0, n_late = 0;
+    uint64_t n_kernel_err = 0, n_check_rows = 0, n_check_bad = 0;   // GPU list-bound errors; CHECK=2 reference rows / mismatches
+    double   us_first_done = 0, us_last_done = 0, us_gate = 0, us_lead = 0;   // summed over chain jobs (ready -> first/last done, ready -> gate open, enqueue lead before ready)
+    double   period_us = 0;                                                    // EMA of ready-to-ready within a batch
+    cl_mem           keep_buf = nullptr, keep_out = nullptr;
+    std::thread      keeper;
+    std::atomic<bool> keep_stop{false};
+    uint64_t         n_keep = 0;
+    size_t           max_img_texels = 0;
+    cl_mem           hbuf = nullptr, kt_img = nullptr;           // alias + K^T texture view of buf
+    cl_mem           ready_sub = nullptr;                        // sub-buffer of hbuf at the ready word (gate polls it)
+    uint64_t         n_gate_ion = 0;                             // gates opened by the ION word before the SVM mirror
+    uint8_t *        svm_tabs = nullptr;                         // SVMTAB probe: tables here instead of buf
+    uint8_t *        svm_q = nullptr;                            // SVMQ probe: Q copied here per op
+    size_t           svm_tabs_bytes = 0, svm_q_bytes = 0;
+    std::unordered_map<int, cl_mem> aliases;                     // by rpcmem fd
+    std::unordered_map<int, cl_mem> images;                      // RGBA-half view of a whole alias, by fd
+    std::unordered_map<const ggml_tensor *, ggml_hexagon_hfold_job> jobs;
+    uint32_t seq = 0;
+
+    std::thread             relay;
+    std::mutex              mu;
+    std::condition_variable cv;
+    std::deque<std::vector<ggml_hexagon_hfold_job>> batches;
+    bool                    stop = false, busy = false;
+    uint64_t n_batches = 0, n_jobs = 0, n_ready_timeouts = 0, n_gpu_err = 0;
+    double   us_ready = 0, us_gpu = 0;   // summed over jobs: ready wait, GPU (first enqueue -> last head done)
+};
+
+static bool hfold_cl_check(cl_int err, const char * what) {
+    if (err != CL_SUCCESS) {
+        GGML_LOG_ERROR("ggml-hex: fa-fold: %s failed (%d)\n", what, err);
+        return false;
+    }
+    return true;
+}
+
+static cl_mem ggml_hexagon_hfold_alias(ggml_hexagon_hfold * h, ggml_backend_buffer_t buffer) {
+    auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(buffer->context);
+    auto it = h->aliases.find(sbuf->fd);
+    if (it != h->aliases.end()) {
+        return it->second;
+    }
+    cl_mem_ion_host_ptr ion = {};
+    ion.ext_host_ptr.allocation_type   = CL_MEM_ION_HOST_PTR_QCOM;
+    ion.ext_host_ptr.host_cache_policy = CL_MEM_HOST_IOCOHERENT_QCOM;
+    ion.ion_filedesc = sbuf->fd;
+    ion.ion_hostptr  = sbuf->base;
+    const size_t size = sbuf->size & ~(size_t) 4095;
+    cl_int err;
+    cl_mem mem = clCreateBuffer(h->ctx, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR | CL_MEM_EXT_HOST_PTR_QCOM, size, &ion, &err);
+    if (err != CL_SUCCESS) {
+        GGML_LOG_ERROR("ggml-hex: fa-fold: ION alias of buffer fd %d size %zu failed (%d)\n", sbuf->fd, size, err);
+        return nullptr;
+    }
+    HEX_VERBOSE("ggml-hex: fa-fold: aliased buffer fd %d base %p size %zu into OpenCL\n", sbuf->fd, (void *) sbuf->base, size);
+    h->aliases[sbuf->fd] = mem;
+    return mem;
+}
+
+// RGBA-half texture view over a whole alias (the V cache and the staged K^T are read through it).
+static cl_mem ggml_hexagon_hfold_image(ggml_hexagon_hfold * h, ggml_backend_buffer_t buffer) {
+    auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(buffer->context);
+    auto it = h->images.find(sbuf->fd);
+    if (it != h->images.end()) {
+        return it->second;
+    }
+    cl_mem alias = ggml_hexagon_hfold_alias(h, buffer);
+    if (!alias) return nullptr;
+    const size_t texels = (sbuf->size & ~(size_t) 4095) / 8;
+    if (texels > h->max_img_texels) {
+        GGML_LOG_ERROR("ggml-hex: fa-fold: buffer fd %d needs %zu texels, the device caps a 1D image buffer at %zu (~%zu MB); context too long for the alias\n",
+                       sbuf->fd, texels, h->max_img_texels, h->max_img_texels * 8 >> 20);
+        return nullptr;
+    }
+    cl_image_format fmt = { CL_RGBA, CL_HALF_FLOAT };
+    cl_image_desc   dk; memset(&dk, 0, sizeof(dk));
+    dk.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+    dk.image_width = texels;
+    dk.buffer      = alias;
+    cl_int err;
+    cl_mem img = clCreateImage(h->ctx, CL_MEM_READ_WRITE, &fmt, &dk, nullptr, &err);
+    if (!hfold_cl_check(err, "clCreateImage (RGBA half view)")) return nullptr;
+    h->images[sbuf->fd] = img;
+    return img;
+}
+
+static void ggml_hexagon_hfold_relay_main(ggml_hexagon_hfold * h);
+static void ggml_hexagon_hfold_log_summary(ggml_hexagon_hfold * h);
+static void hfold_enqueue_chain(ggml_hexagon_hfold * h, const ggml_hexagon_hfold_job & j, hfold_chain & c);
+
+static bool ggml_hexagon_hfold_init(ggml_hexagon_session * sess) {
+    auto h = new ggml_hexagon_hfold();
+    h->sess = sess;
+    cl_uint n = 0; cl_int err;
+    if (!hfold_cl_check(clGetPlatformIDs(1, &h->plat, &n), "clGetPlatformIDs") || !n) { delete h; return false; }
+    if (!hfold_cl_check(clGetDeviceIDs(h->plat, CL_DEVICE_TYPE_GPU, 1, &h->dev, &n), "clGetDeviceIDs") || !n) { delete h; return false; }
+    {
+        size_t ext_len = 0;
+        clGetDeviceInfo(h->dev, CL_DEVICE_EXTENSIONS, 0, nullptr, &ext_len);
+        std::string ext(ext_len, '\0');
+        clGetDeviceInfo(h->dev, CL_DEVICE_EXTENSIONS, ext_len, ext.data(), nullptr);
+        if (ext.find("cl_qcom_ext_host_ptr") == std::string::npos) {
+            GGML_LOG_ERROR("ggml-hex: fa-fold: GPU lacks cl_qcom_ext_host_ptr (no ION alias)\n");
+            delete h; return false;
+        }
+        clGetDeviceInfo(h->dev, CL_DEVICE_IMAGE_MAX_BUFFER_SIZE, sizeof(h->max_img_texels), &h->max_img_texels, nullptr);
+    }
+    {
+        // The GPU idles between ops and would otherwise run each op's kernels on a ramping clock.
+        // cl_qcom_perf_hint pins it high for this context; ignored where the extension is absent.
+        size_t ext_len = 0;
+        clGetDeviceInfo(h->dev, CL_DEVICE_EXTENSIONS, 0, nullptr, &ext_len);
+        std::string ext(ext_len, '\0');
+        clGetDeviceInfo(h->dev, CL_DEVICE_EXTENSIONS, ext_len, ext.data(), nullptr);
+        const bool perf_hint = ext.find("cl_qcom_perf_hint") != std::string::npos && opt_fa_fold_perf;
+#ifndef CL_CONTEXT_PERF_HINT_QCOM
+#define CL_CONTEXT_PERF_HINT_QCOM 0x40C2
+#define CL_PERF_HINT_HIGH_QCOM    0x40C3
+#endif
+        const cl_context_properties props[] = { CL_CONTEXT_PERF_HINT_QCOM, CL_PERF_HINT_HIGH_QCOM, 0 };
+        h->ctx = clCreateContext(perf_hint ? props : nullptr, 1, &h->dev, nullptr, nullptr, &err);
+        if (!hfold_cl_check(err, "clCreateContext")) { delete h; return false; }
+        if (perf_hint) GGML_LOG_INFO("ggml-hex: fa-fold: GPU perf hint HIGH set on the context\n");
+    }
+    h->q = clCreateCommandQueueWithProperties(h->ctx, h->dev, nullptr, &err);
+    if (!hfold_cl_check(err, "clCreateCommandQueueWithProperties")) { delete h; return false; }
+    h->prog = clCreateProgramWithSource(h->ctx, 1, &ggml_hexagon_hfold_cl_src, nullptr, &err);
+    if (!hfold_cl_check(err, "clCreateProgramWithSource")) { delete h; return false; }
+    {
+        std::string bopts = "-cl-std=CL2.0 -cl-fast-relaxed-math -DFA_D=128";
+        if (opt_fa_fold_ktbuf) bopts += " -DKT_BUF=1";
+        if (opt_fa_fold_acq)   bopts += " -DACQ_FENCE=1";
+        if (opt_fa_fold_qatomic) bopts += " -DQ_ATOMIC=1";
+        if (opt_fa_fold_wgfence) bopts += " -DWG_FENCE=1";
+        if (opt_fa_fold_acc16)   bopts += " -DACC_F16=1";
+        if (opt_fa_fold_knat)    bopts += " -DK_NAT=1";
+        err = clBuildProgram(h->prog, 1, &h->dev, bopts.c_str(), nullptr, nullptr);
+    }
+    if (err != CL_SUCCESS) {
+        size_t len = 0;
+        clGetProgramBuildInfo(h->prog, h->dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &len);
+        std::string log(len, '\0');
+        clGetProgramBuildInfo(h->prog, h->dev, CL_PROGRAM_BUILD_LOG, len, log.data(), nullptr);
+        GGML_LOG_ERROR("ggml-hex: fa-fold: kernel build failed (%d):\n%s\n", err, log.c_str());
+        delete h; return false;
+    }
+    h->k_stage = clCreateKernel(h->prog, "stage_k", &err); if (!hfold_cl_check(err, "clCreateKernel stage_k")) { delete h; return false; }
+    h->k_fa    = clCreateKernel(h->prog, "fa_exc",  &err); if (!hfold_cl_check(err, "clCreateKernel fa_exc"))  { delete h; return false; }
+    h->k_gate  = clCreateKernel(h->prog, "gate",    &err); if (!hfold_cl_check(err, "clCreateKernel gate"))    { delete h; return false; }
+    h->k_compact = clCreateKernel(h->prog, "compact", &err); if (!hfold_cl_check(err, "clCreateKernel compact")) { delete h; return false; }
+    h->k_stage_p = clCreateKernel(h->prog, "stage_k_p", &err); if (!hfold_cl_check(err, "clCreateKernel stage_k_p")) { delete h; return false; }
+    h->k_touch   = clCreateKernel(h->prog, "touch", &err); if (!hfold_cl_check(err, "clCreateKernel touch")) { delete h; return false; }
+    h->q2 = clCreateCommandQueueWithProperties(h->ctx, h->dev, nullptr, &err);
+    if (!hfold_cl_check(err, "clCreateCommandQueueWithProperties (trigger)")) { delete h; return false; }
+    {
+        cl_device_svm_capabilities svm = 0;
+        clGetDeviceInfo(h->dev, CL_DEVICE_SVM_CAPABILITIES, sizeof(svm), &svm, nullptr);
+        if ((svm & CL_DEVICE_SVM_FINE_GRAIN_BUFFER) && (svm & CL_DEVICE_SVM_ATOMICS)) {
+            h->svm_ctl = (uint32_t *) clSVMAlloc(h->ctx, CL_MEM_READ_WRITE | CL_MEM_SVM_FINE_GRAIN_BUFFER | CL_MEM_SVM_ATOMICS, 4096, 64);
+            if (h->svm_ctl) { memset(h->svm_ctl, 0, 4096); h->svm_ok = true; }
+        }
+        if (!h->svm_ok && opt_fa_fold_gpudone) {
+            GGML_LOG_WARN("ggml-hex: fa-fold: no fine-grain SVM atomics; GPU-side chain disabled\n");
+            opt_fa_fold_gpudone = 0;
+        }
+    }
+    if (opt_fa_fold_keepalive > 0) {
+        h->k_keep = clCreateKernel(h->prog, "keepalive", &err); if (!hfold_cl_check(err, "clCreateKernel keepalive")) { delete h; return false; }
+        const size_t bytes = 32u << 20;
+        h->keep_buf = clCreateBuffer(h->ctx, CL_MEM_READ_ONLY, bytes, nullptr, &err); if (!hfold_cl_check(err, "keepalive buffer")) { delete h; return false; }
+        h->keep_out = clCreateBuffer(h->ctx, CL_MEM_WRITE_ONLY, 1u << 20, nullptr, &err); if (!hfold_cl_check(err, "keepalive out")) { delete h; return false; }
+        h->keeper = std::thread([h]() {
+#if defined(__linux__)
+            if (opt_fa_fold_cpu >= 0) { cpu_set_t set; CPU_ZERO(&set); CPU_SET(opt_fa_fold_cpu, &set); sched_setaffinity(0, sizeof(set), &set); }
+#endif
+            cl_command_queue q = clCreateCommandQueueWithProperties(h->ctx, h->dev, nullptr, nullptr);
+            const cl_int n4 = (cl_int) ((32u << 20) / 16);
+            cl_int iters = 1;
+            clSetKernelArg(h->k_keep, 0, sizeof(cl_mem), &h->keep_buf);
+            clSetKernelArg(h->k_keep, 1, sizeof(cl_int), &n4);
+            clSetKernelArg(h->k_keep, 3, sizeof(cl_mem), &h->keep_out);
+            const size_t gsz = 4096 * 64, lsz = 64;
+            // calibrate iters so one launch takes ~the requested busy time
+            for (int c = 0; c < 4 && !h->keep_stop.load(); ++c) {
+                clSetKernelArg(h->k_keep, 2, sizeof(cl_int), &iters);
+                const auto t0 = std::chrono::steady_clock::now();
+                clEnqueueNDRangeKernel(q, h->k_keep, 1, nullptr, &gsz, &lsz, 0, nullptr, nullptr); clFinish(q);
+                const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                if (us > 50.0) iters = std::max<cl_int>(1, (cl_int) (iters * opt_fa_fold_keepalive / us));
+            }
+            GGML_LOG_INFO("ggml-hex: fa-fold keep-alive: %d iterations per launch, period %d us\n", iters, opt_fa_fold_keepalive_period);
+            clSetKernelArg(h->k_keep, 2, sizeof(cl_int), &iters);
+            while (!h->keep_stop.load()) {
+                const auto t0 = std::chrono::steady_clock::now();
+                clEnqueueNDRangeKernel(q, h->k_keep, 1, nullptr, &gsz, &lsz, 0, nullptr, nullptr); clFinish(q);
+                h->n_keep++;
+                const auto el = std::chrono::steady_clock::now() - t0;
+                const auto period = std::chrono::microseconds(opt_fa_fold_keepalive_period);
+                if (el < period) std::this_thread::sleep_for(period - el);
+            }
+            clReleaseCommandQueue(q);
+        });
+        GGML_LOG_INFO("ggml-hex: fa-fold: keep-alive control ON (%d us busy every %d us; no attention work on the GPU)\n",
+                      opt_fa_fold_keepalive, opt_fa_fold_keepalive_period);
+    }
+    h->relay = std::thread(ggml_hexagon_hfold_relay_main, h);
+    sess->hfold = h;
+    GGML_LOG_INFO("ggml-hex: %s hetero prefill split enabled (GPU exceptions folded in-store, staged per KV head; relay cpu %d)\n",
+                  sess->c_name(), opt_fa_fold_cpu);
+    return true;
+}
+
+static void ggml_hexagon_hfold_wait_idle(ggml_hexagon_hfold * h) {
+    std::unique_lock<std::mutex> lk(h->mu);
+    h->cv.wait(lk, [&] { return h->batches.empty() && !h->busy; });
+}
+
+// (Re)build the fold buffer for a node shape. Regions: header | m | l | acc | ctl | idx | abs | cnt | lcnt | err | Kt.
+static bool ggml_hexagon_hfold_ensure_buffer(ggml_hexagon_hfold * h, uint32_t rows, uint32_t neq1, uint32_t nkvh, uint32_t D,
+                                             uint32_t nbk_cap, uint32_t num_sb_cap, bool qbh) {
+    auto al = [](size_t v, size_t a) { return (v + a - 1) & ~(a - 1); };
+    const bool fits = h->buf && rows <= h->rows && neq1 <= h->neq1 && nkvh == h->nkvh && D == h->D &&
+                      nbk_cap <= h->nbk_cap && num_sb_cap <= h->num_sb_cap;
+    if (!fits) {
+        ggml_hexagon_hfold_wait_idle(h);
+        // the old buffer's alias and view go with it
+        if (h->buf) {
+            auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(h->buf->context);
+            if (h->ready_sub) { clReleaseMemObject(h->ready_sub); h->ready_sub = nullptr; }
+            auto ia = h->aliases.find(sbuf->fd); if (ia != h->aliases.end()) { clReleaseMemObject(ia->second); h->aliases.erase(ia); }
+            auto ii = h->images.find(sbuf->fd);  if (ii != h->images.end())  { clReleaseMemObject(ii->second); h->images.erase(ii); }
+            if (h->tctx) { ggml_free(h->tctx); h->tctx = nullptr; }
+            ggml_backend_buffer_free(h->buf); h->buf = nullptr;
+        }
+        rows = std::max(rows, h->rows); neq1 = std::max(neq1, h->neq1);
+        nbk_cap = std::max(nbk_cap, h->nbk_cap); num_sb_cap = std::max(num_sb_cap, h->num_sb_cap);
+        const size_t ml  = al((size_t) rows * sizeof(float), 128);
+        const size_t acc = al((size_t) rows * D * sizeof(float), 128);
+        size_t off = 128;
+        h->off_m = off; off += ml;
+        h->off_l = off; off += ml;
+        h->off_acc = off; off += acc;
+        h->off_ctl = al(off, 4096); off = h->off_ctl + al(HTP_FA_HETERO_STATUS_OFF + HTP_FA_FOLD_ST_N * sizeof(uint32_t), 4096);
+        h->off_idx  = off; off += al((size_t) nkvh * num_sb_cap * nbk_cap * sizeof(int32_t), 128);
+        h->off_abs  = off; off += al((size_t) nkvh * nbk_cap * sizeof(int32_t), 128);
+        h->off_cnt  = off; off += al((size_t) nkvh * sizeof(int32_t), 128);
+        h->off_lcnt = off; off += al((size_t) nkvh * num_sb_cap * sizeof(int32_t), 128);
+        h->off_err  = off; off += 256;
+        h->off_done  = off; off += al(HTP_FA_FOLD_MAX_STAGES * sizeof(uint32_t), 128);
+        h->off_scnt  = off; off += al((HTP_FA_FOLD_MAX_STAGES + 2) * sizeof(uint32_t), 128);   // + the two persistent unit counters
+        h->off_stamp = off; off += al(HTP_FA_FOLD_MAX_STAGES * sizeof(uint32_t), 128);
+        h->off_kt   = al(off, 4096); off = h->off_kt + (size_t) nkvh * D * ((size_t) nbk_cap * 64) * sizeof(uint16_t);
+        h->size = al(off, 1u << 20);
+        h->buf = ggml_backend_buft_alloc_buffer(&h->sess->buffer_type, h->size);
+        if (!h->buf) { GGML_LOG_ERROR("ggml-hex: fa-fold: fold buffer alloc (%zu MB) failed\n", h->size >> 20); return false; }
+        h->base = (uint8_t *) ggml_backend_buffer_get_base(h->buf);
+        memset(h->base, 0, h->size);
+        hetero_dc_civac(h->base, h->size);
+        ggml_init_params ip = { ggml_tensor_overhead() * 2, nullptr, true };
+        h->tctx = ggml_init(ip);
+        h->ctrl = ggml_new_tensor_1d(h->tctx, GGML_TYPE_F32, (int64_t) (h->size / 4));
+        h->ctrl->buffer = h->buf;
+        h->ctrl->data   = h->base;
+        ggml_set_name(h->ctrl, "hexagon_fa_fold");
+        h->hbuf   = ggml_hexagon_hfold_alias(h, h->buf);
+        h->kt_img = h->hbuf ? ggml_hexagon_hfold_image(h, h->buf) : nullptr;
+        if (!h->hbuf || !h->kt_img) return false;
+        if (h->ready_sub) { clReleaseMemObject(h->ready_sub); h->ready_sub = nullptr; }
+        {
+            cl_int err2 = CL_SUCCESS;
+            cl_buffer_region reg = { h->off_ctl, 4096 };
+            h->ready_sub = clCreateSubBuffer(h->hbuf, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &reg, &err2);
+            if (err2 != CL_SUCCESS) { GGML_LOG_WARN("ggml-hex: fa-fold: ready sub-buffer failed (%d); the gate polls SVM only\n", err2); h->ready_sub = nullptr; opt_fa_fold_ion_ready = 0; }
+        }
+        if (opt_fa_fold_svmtab) {
+            if (h->svm_tabs) clSVMFree(h->ctx, h->svm_tabs);
+            h->svm_tabs_bytes = h->off_kt - h->off_idx;
+            h->svm_tabs = (uint8_t *) clSVMAlloc(h->ctx, CL_MEM_READ_WRITE | CL_MEM_SVM_FINE_GRAIN_BUFFER, h->svm_tabs_bytes, 0);
+            if (!h->svm_tabs) { GGML_LOG_ERROR("ggml-hex: fa-fold: clSVMAlloc tables failed\n"); return false; }
+            memset(h->svm_tabs, 0, h->svm_tabs_bytes);
+        }
+        if (opt_fa_fold_svmq) {
+            if (h->svm_q) clSVMFree(h->ctx, h->svm_q);
+            h->svm_q_bytes = (size_t) rows * D * sizeof(float);
+            h->svm_q = (uint8_t *) clSVMAlloc(h->ctx, CL_MEM_READ_WRITE | CL_MEM_SVM_FINE_GRAIN_BUFFER, h->svm_q_bytes, 0);
+            if (!h->svm_q) { GGML_LOG_ERROR("ggml-hex: fa-fold: clSVMAlloc Q failed\n"); return false; }
+        }
+        h->rows = rows; h->neq1 = neq1; h->nkvh = nkvh; h->D = D; h->nbk_cap = nbk_cap; h->num_sb_cap = num_sb_cap;
+        GGML_LOG_INFO("ggml-hex: fa-fold: fold buffer %zu MB (partial %u rows x %u, %u KV heads, up to %u blocks, K^T staging %zu MB)\n",
+                      h->size >> 20, rows, D, nkvh, nbk_cap, ((size_t) nkvh * D * nbk_cap * 64 * 2) >> 20);
+    }
+    // header for THIS shape (the same buffer serves every node of the graph; all share the shape)
+    struct htp_fa_fold_hdr hdr = {};
+    hdr.magic = HTP_FA_FOLD_MAGIC; hdr.rows = rows; hdr.neq1 = neq1; hdr.dv = D;
+    hdr.off_m = (uint32_t) h->off_m; hdr.off_l = (uint32_t) h->off_l; hdr.off_acc = (uint32_t) h->off_acc;
+    hdr.flags = HTP_FA_FOLD_F_LIVE | HTP_FA_FOLD_F_FLUSH_KV | HTP_FA_FOLD_F_STAGED | HTP_FA_FOLD_F_INSTORE |
+                (opt_fa_fold_flush ? 0u : HTP_FA_FOLD_F_NOFLUSH) | (opt_fa_fold_stage_qb ? HTP_FA_FOLD_F_STAGE_QB : 0u) |
+                (qbh ? HTP_FA_FOLD_F_STAGE_QBH : 0u) | (opt_fa_fold_acc16 ? HTP_FA_FOLD_F_ACC_F16 : 0u) | (uint32_t) opt_fa_fold_probe;
+    hdr.slot = 0; hdr.off_ctl = (uint32_t) h->off_ctl; hdr.timeout_us = 2000000;
+    hdr.off_exc = 0; hdr.exc_nbk = 0;   // the membership is src[8]
+    hdr.off_done = (uint32_t) h->off_done;
+    const struct htp_fa_fold_hdr * cur = (const struct htp_fa_fold_hdr *) h->base;
+    if (memcmp(cur, &hdr, sizeof(hdr)) != 0) {
+        ggml_hexagon_hfold_wait_idle(h);
+        memcpy(h->base, &hdr, sizeof(hdr));
+        hetero_dc_civac(h->base, 256);
+    }
+    return true;
+}
+
+static bool ggml_hexagon_hfold_prepare(ggml_hexagon_session * sess, ggml_tensor * n, const struct htp_fa_kernel_params * kp) {
+    ggml_hexagon_hfold * h = sess->hfold;
+    const ggml_tensor * q = n->src[0], * k = n->src[1], * v = n->src[2], * m = n->src[3];
+    const ggml_tensor * sel = n->src[5], * cnt = n->src[6], * em = n->src[8];
+    if (kp->kernel_type != HTP_FA_KERNEL_HMX) return false;
+    if (!sel || !cnt || !em || !m) return false;                       // the graph did not build the split
+    if (q->ne[1] < 2 || q->ne[3] != 1) return false;
+    const int DK = (int) q->ne[0], DV = (int) v->ne[0];
+    if (DK != 128 || DV != 128) return false;
+    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || m->type != GGML_TYPE_F16 || em->type != GGML_TYPE_F32) return false;
+    const uint32_t nkvh = (uint32_t) k->ne[2], nh = (uint32_t) q->ne[2];
+    if (nkvh == 0 || nh % nkvh != 0 || nkvh > HTP_FA_FOLD_MAX_STAGES) return false;
+    const uint32_t G = nh / nkvh, Sq = (uint32_t) q->ne[1], nkv = (uint32_t) k->ne[1];
+    if (nkv % 64 != 0 || (uint32_t) v->ne[1] != nkv) return false;
+    const uint32_t nbk = nkv / 64, num_sb = (Sq + 63) / 64;
+    if ((uint32_t) em->ne[0] != nbk || (uint32_t) (em->ne[1] * em->ne[2]) != num_sb || (uint32_t) em->ne[3] != nkvh || !ggml_is_contiguous(em)) return false;
+    if ((uint32_t) m->ne[0] != nkv || (uint32_t) m->ne[1] < Sq || m->ne[2] != 1) return false;
+    if (q->nb[0] != 4 || q->nb[1] % 16 || q->nb[2] % 16 || k->nb[0] != 2 || k->nb[1] % 8 || k->nb[2] % 8 ||
+        v->nb[0] != 2 || v->nb[1] % 8 || v->nb[2] % 8 || m->nb[1] % 16) return false;
+    if (!ggml_backend_buffer_is_hexagon(q->buffer) || !ggml_backend_buffer_is_hexagon(k->buffer) || !ggml_backend_buffer_is_hexagon(v->buffer) ||
+        !ggml_backend_buffer_is_hexagon(m->buffer) || !ggml_backend_buffer_is_hexagon(em->buffer)) return false;
+    // K^T staging capacity: the whole cache the view sits in, so a longer context later needs no realloc
+    const ggml_tensor * root = k->view_src ? k->view_src : k;
+    const uint32_t kv_cap = (uint32_t) (k->view_src ? root->ne[1] : k->ne[1]);
+    const uint32_t nbk_cap = std::max(nbk, (kv_cap + 63) / 64);
+    if (nbk_cap > 256) return false;    // the staging kernel's local compaction table (kv <= 16384)
+    const uint32_t n_qbt = (Sq + kp->Br - 1) / kp->Br;
+    // (query block, KV head) stages when GPU-side done words are on and they fit the done line
+    const bool qbh = opt_fa_fold_gpudone && opt_fa_fold_qbh && opt_fa_fold_stage_qb && n_qbt * nkvh <= HTP_FA_FOLD_MAX_STAGES;
+    if (!ggml_hexagon_hfold_ensure_buffer(h, Sq * nh, Sq, nkvh, (uint32_t) DK, nbk_cap, num_sb, qbh)) return false;
+
+    ggml_hexagon_hfold_job job;
+    job.node = n;
+    job.q = ggml_hexagon_hfold_alias(h, q->buffer);
+    job.k = ggml_hexagon_hfold_alias(h, k->buffer);
+    job.v_img = ggml_hexagon_hfold_image(h, v->buffer);
+    job.m = ggml_hexagon_hfold_alias(h, m->buffer);
+    job.em = ggml_hexagon_hfold_alias(h, em->buffer);
+    job.k_img = ggml_hexagon_hfold_image(h, k->buffer);
+    if (!job.q || !job.k || !job.v_img || !job.m || !job.em || !job.k_img) return false;
+    auto off = [](const ggml_tensor * t) { return (uint32_t) ((const uint8_t *) t->data - static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context)->base); };
+    job.q_off = off(q); job.q_nb1 = (uint32_t) q->nb[1]; job.q_nb2 = (uint32_t) q->nb[2];
+    job.k_off = off(k); job.k_nb1 = (uint32_t) k->nb[1]; job.k_nb2 = (uint32_t) k->nb[2];
+    job.v_off = off(v); job.v_nb1 = (uint32_t) v->nb[1]; job.v_nb2 = (uint32_t) v->nb[2];
+    job.m_off = off(m); job.m_nb1 = (uint32_t) m->nb[1];
+    job.em_off = off(em);
+    if (job.v_off % 8 || job.k_off % 8) return false;
+    job.Sq = Sq; job.nh = nh; job.nkvh = nkvh; job.G = G; job.nbk = nbk; job.num_sb = num_sb; job.num_qb = (Sq + 31) / 32;
+    job.br = kp->Br; job.qbh = qbh;
+    job.n_stages = qbh ? n_qbt * nkvh : opt_fa_fold_stage_qb ? n_qbt : nkvh;
+    if (job.br % 32 || job.n_stages > (qbh ? HTP_FA_FOLD_MAX_STAGES : HTP_FA_FOLD_LINE_STAGES)) return false;
+    job.em_host = (const float *) em->data; job.em_bytes = ggml_nbytes(em);
+    memcpy(&job.scale, &n->op_params[0], sizeof(float));
+    auto hbase = [](const ggml_tensor * t) { return (const uint8_t *) static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context)->base; };
+    job.q_base = hbase(q); job.k_base = hbase(k); job.v_base = hbase(v); job.m_base = hbase(m);
+    n->src[7] = h->ctrl;
+    h->jobs[n] = job;
+    if (opt_verbose || h->jobs.size() == 1) {
+        GGML_LOG_INFO("ggml-hex: fa-fold: tagged %s: %u tokens x %u heads (%u KV heads, G %u), %u KV blocks, %u sub-blocks\n",
+                      n->name, Sq, nh, nkvh, G, nbk, num_sb);
+    }
+    return true;
+}
+
+// Once per graph_compute with the nodes about to be queued, in execution order.
+static void ggml_hexagon_hfold_post(ggml_hexagon_session * sess, const std::vector<htp_opnode> & nodes) {
+    ggml_hexagon_hfold * h = sess->hfold;
+    std::vector<ggml_hexagon_hfold_job> batch;
+    {
+        std::lock_guard<std::mutex> lk(h->mu);
+        for (const auto & node : nodes) {
+            if (node.opcode != HTP_OP_FLASH_ATTN_EXT) continue;
+            auto it = h->jobs.find(node.node);
+            if (it == h->jobs.end() || node.node->src[7] != h->ctrl) continue;
+            ggml_hexagon_hfold_job job = it->second;
+            job.want = ++h->seq;
+            batch.push_back(job);
+        }
+        if (batch.empty()) return;
+        // The first op's chain goes in from here, before the DSP is even dispatched: the relay
+        // thread's wake-up can lag by milliseconds when the CPU is busy (perplexity's logits),
+        // and the first attention op of a graph is only a few ops of DSP work away.
+        if (opt_fa_fold_gpudone && opt_fa_fold_preq != 0 && h->hbuf) {
+            hfold_enqueue_chain(h, batch[0], batch[0].chain);
+        }
+        h->batches.push_back(std::move(batch));
+    }
+    h->cv.notify_all();
+}
+
+static void hfold_set_tabs(ggml_hexagon_hfold * h, cl_kernel kk, int idx) {
+    if (opt_fa_fold_svmtab) clSetKernelArgSVMPointer(kk, idx, h->svm_tabs); else clSetKernelArg(kk, idx, sizeof(cl_mem), &h->hbuf);
+}
+// the SVM control block; kernels that get want == 0 never read it, so any buffer will do
+static void hfold_set_svm(ggml_hexagon_hfold * h, cl_kernel kk, int idx) {
+    if (h->svm_ok) clSetKernelArgSVMPointer(kk, idx, h->svm_ctl); else clSetKernelArg(kk, idx, sizeof(cl_mem), &h->hbuf);
+}
+struct hfold_tab_offs { cl_int idx, abs, cnt, lcnt, err, scnt; };
+static hfold_tab_offs hfold_tabs_of(ggml_hexagon_hfold * h, bool svm_tabs) {
+    const size_t tab0 = svm_tabs ? h->off_idx : 0;
+    hfold_tab_offs o;
+    o.idx = (cl_int) (h->off_idx - tab0); o.abs = (cl_int) (h->off_abs - tab0); o.cnt = (cl_int) (h->off_cnt - tab0);
+    o.lcnt = (cl_int) (h->off_lcnt - tab0); o.err = (cl_int) (h->off_err - tab0); o.scnt = (cl_int) (h->off_scnt - tab0);
+    return o;
+}
+static void hfold_args_stage_k(ggml_hexagon_hfold * h, const ggml_hexagon_hfold_job & j, const hfold_tab_offs & to, cl_int n_stage, cl_uint want) {
+    const cl_int k_off = (cl_int) j.k_off, k_nb1 = (cl_int) j.k_nb1, k_nb2 = (cl_int) j.k_nb2;
+    const cl_int abs_stride = (cl_int) h->nbk_cap, kt_base_tex = (cl_int) (h->off_kt / 8);
+    int a = 0;
+    clSetKernelArg(h->k_stage, a++, sizeof(cl_mem), &j.k);
+    clSetKernelArg(h->k_stage, a++, sizeof(cl_int), &k_off); clSetKernelArg(h->k_stage, a++, sizeof(cl_int), &k_nb1); clSetKernelArg(h->k_stage, a++, sizeof(cl_int), &k_nb2);
+    clSetKernelArg(h->k_stage, a++, sizeof(cl_mem), &h->kt_img); clSetKernelArg(h->k_stage, a++, sizeof(cl_int), &kt_base_tex);
+    hfold_set_tabs(h, h->k_stage, a++);
+    clSetKernelArg(h->k_stage, a++, sizeof(cl_int), &to.abs); clSetKernelArg(h->k_stage, a++, sizeof(cl_int), &to.cnt);
+    clSetKernelArg(h->k_stage, a++, sizeof(cl_int), &abs_stride); clSetKernelArg(h->k_stage, a++, sizeof(cl_int), &n_stage);
+    hfold_set_svm(h, h->k_stage, a++); clSetKernelArg(h->k_stage, a++, sizeof(cl_uint), &want);
+}
+static void hfold_args_fa(ggml_hexagon_hfold * h, const ggml_hexagon_hfold_job & j, const hfold_tab_offs & to, cl_int n_stage, cl_uint want, cl_int chain, cl_int gpu_done) {
+    const cl_int q_off = opt_fa_fold_svmq ? 0 : (cl_int) j.q_off, q_nb1 = (cl_int) j.q_nb1, q_nb2 = (cl_int) j.q_nb2;
+    const cl_int m_off = (cl_int) j.m_off, m_nb1 = (cl_int) j.m_nb1;
+    const cl_int f_m = (cl_int) h->off_m, f_l = (cl_int) h->off_l, f_acc = (cl_int) h->off_acc;
+    const cl_int Sq = (cl_int) j.Sq, G = (cl_int) j.G, num_sb = (cl_int) j.num_sb, qb_per_sb = 2, top_k = (cl_int) h->nbk_cap;
+    const cl_int abs_stride = (cl_int) h->nbk_cap;
+    const cl_int kt_base_tex = (cl_int) (h->off_kt / 8), v_base_tex = (cl_int) (j.v_off / 8);
+    const cl_int v_tok_tex = (cl_int) (j.v_nb1 / 8), v_head_tex = (cl_int) (j.v_nb2 / 8);
+    const cl_int qbh = j.qbh ? 1 : 0, nkvh = (cl_int) j.nkvh, qb32ps = (cl_int) (j.br / 32);
+    const cl_int done_off = (cl_int) h->off_done, stamp_off = (cl_int) h->off_stamp;
+    int a = 0;
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_mem), &h->kt_img); clSetKernelArg(h->k_fa, a++, sizeof(cl_mem), &j.v_img);
+    if (opt_fa_fold_svmq) clSetKernelArgSVMPointer(h->k_fa, a++, h->svm_q); else clSetKernelArg(h->k_fa, a++, sizeof(cl_mem), &j.q);
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &q_off);
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &q_nb1); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &q_nb2);
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_mem), &j.m); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &m_off); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &m_nb1);
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_mem), &h->hbuf); hfold_set_tabs(h, h->k_fa, a++);
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &to.idx); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &to.abs);
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &to.cnt); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &to.lcnt); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &to.err);
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &f_m); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &f_l); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &f_acc);
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &Sq); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &G); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &num_sb);
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &qb_per_sb); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &top_k);
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &abs_stride); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &n_stage);
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &kt_base_tex); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &v_base_tex);
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &v_tok_tex); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &v_head_tex);
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_float), &j.scale);
+    hfold_set_svm(h, h->k_fa, a++); clSetKernelArg(h->k_fa, a++, sizeof(cl_uint), &want);
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &chain); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &gpu_done); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &qbh);
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &nkvh); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &qb32ps);
+    const cl_int n_stages = (cl_int) j.n_stages;
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &to.scnt); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &done_off); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &stamp_off);
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &n_stages);
+    const cl_int k_base_tex = (cl_int) (j.k_off / 8), k_tok_tex = (cl_int) (j.k_nb1 / 8), k_head_tex = (cl_int) (j.k_nb2 / 8);
+    const cl_int em_off = (cl_int) j.em_off, nbk = (cl_int) j.nbk;
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_mem), &j.k_img);
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &k_base_tex); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &k_tok_tex); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &k_head_tex);
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_mem), &j.em); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &em_off);
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &nbk);
+}
+// one fa_exc launch per stage with the host's offsets (legacy mapping); events out
+static void hfold_launch_fa_stages(ggml_hexagon_hfold * h, const ggml_hexagon_hfold_job & j, std::vector<cl_event> & ev, bool full_qb) {
+    const uint32_t qb32_per_stage = j.br / 32;
+    const size_t lsz[3] = { 128, 1, 1 };
+    for (uint32_t st = 0; st < j.n_stages; ++st) {
+        size_t off3[3], gsz[3];
+        if (j.qbh) {
+            const uint32_t qb = st / j.nkvh, kvh = st % j.nkvh;
+            off3[0] = 0; off3[1] = (size_t) qb * qb32_per_stage; off3[2] = (size_t) kvh * j.G;
+            gsz[0] = 128; gsz[1] = full_qb ? qb32_per_stage : std::min<size_t>(qb32_per_stage, j.num_qb - off3[1]); gsz[2] = j.G;
+        } else if (opt_fa_fold_stage_qb) {
+            off3[0] = 0; off3[1] = (size_t) st * qb32_per_stage; off3[2] = 0;
+            gsz[0] = 128; gsz[1] = full_qb ? qb32_per_stage : std::min<size_t>(qb32_per_stage, j.num_qb - off3[1]); gsz[2] = j.nh;
+        } else {
+            off3[0] = 0; off3[1] = 0; off3[2] = (size_t) st * j.G;
+            gsz[0] = 128; gsz[1] = j.num_qb; gsz[2] = j.G;
+        }
+        const cl_int err = clEnqueueNDRangeKernel(h->q, h->k_fa, 3, off3, gsz, lsz, 0, nullptr, &ev[st]);
+        if (err != CL_SUCCESS) { h->n_gpu_err++; GGML_LOG_ERROR("ggml-hex: fa-fold: enqueue fa_exc stage %u failed (%d)\n", st, err); ev[st] = nullptr; }
+        // one submission per launch: batched into one command buffer the driver reports every
+        // event complete together at the END, and the staging degenerates to a single wait
+        clFlush(h->q);
+    }
+}
+// the membership -> per-head compact tables, on the host (legacy path and the chain's fallback)
+
+static void hfold_enqueue_chain(ggml_hexagon_hfold * h, const ggml_hexagon_hfold_job & j, hfold_chain & c) {
+    const hfold_tab_offs to = hfold_tabs_of(h, false);
+    const cl_uint want = j.want;
+    const cl_int max_spins = opt_fa_fold_gate_spins;
+    const cl_int n_stage = (cl_int) h->nbk_cap * 64;   // capacity: the host does not know the list yet
+    cl_int err;
+    {
+        const cl_int n_stages = (cl_int) j.n_stages;
+        int a = 0;
+        hfold_set_svm(h, h->k_gate, a++); clSetKernelArg(h->k_gate, a++, sizeof(cl_uint), &want); clSetKernelArg(h->k_gate, a++, sizeof(cl_int), &max_spins);
+        clSetKernelArg(h->k_gate, a++, sizeof(cl_mem), &h->hbuf); clSetKernelArg(h->k_gate, a++, sizeof(cl_int), &to.scnt);
+        clSetKernelArg(h->k_gate, a++, sizeof(cl_int), &to.err); clSetKernelArg(h->k_gate, a++, sizeof(cl_int), &n_stages);
+        // the ready word as a sub-buffer of the alias (the kernel takes a bare pointer)
+        if (opt_fa_fold_ion_ready) clSetKernelArg(h->k_gate, a++, sizeof(cl_mem), &h->ready_sub); else { cl_mem nul = nullptr; clSetKernelArg(h->k_gate, a++, sizeof(cl_mem), &nul); }
+        const cl_int delay_polls = opt_fa_fold_gate_delay;
+        clSetKernelArg(h->k_gate, a++, sizeof(cl_int), &delay_polls);
+        const size_t one = 1;
+        err = clEnqueueNDRangeKernel(h->q, h->k_gate, 1, nullptr, &one, &one, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) { h->n_gpu_err++; GGML_LOG_ERROR("ggml-hex: fa-fold: enqueue gate failed (%d)\n", err); }
+    }
+    if (opt_fa_fold_qmap == 3) {
+        // In-order migration of the DSP-written inputs to the host and (implicitly, at next use)
+        // back: the runtime must then treat them as host-modified and invalidate its caches.
+        cl_mem mems[2] = { j.q, j.em };
+        cl_int e2 = clEnqueueMigrateMemObjects(h->q, 2, mems, CL_MIGRATE_MEM_OBJECT_HOST, 0, nullptr, nullptr);
+        if (e2 != CL_SUCCESS) { h->n_gpu_err++; GGML_LOG_ERROR("ggml-hex: fa-fold: chain migrate failed (%d)\n", e2); }
+    } else if (opt_fa_fold_qmap) {
+        // In-order map/unmap of the DSP-written inputs the GPU reads through the alias: executed
+        // on the queue after the gate, so the driver's cache maintenance for these ranges happens
+        // right before the kernels that read them, with no host involvement at run time.
+        auto qmap = [&](cl_mem mem, size_t off, size_t bytes) {
+            cl_int e2 = CL_SUCCESS;
+            void * p = clEnqueueMapBuffer(h->q, mem, CL_FALSE, CL_MAP_WRITE_INVALIDATE_REGION, off, bytes, 0, nullptr, nullptr, &e2);
+            if (e2 != CL_SUCCESS || !p) { h->n_gpu_err++; GGML_LOG_ERROR("ggml-hex: fa-fold: chain map failed (%d)\n", e2); return; }
+            e2 = clEnqueueUnmapMemObject(h->q, mem, p, 0, nullptr, nullptr);
+            if (e2 != CL_SUCCESS) { h->n_gpu_err++; GGML_LOG_ERROR("ggml-hex: fa-fold: chain unmap failed (%d)\n", e2); }
+        };
+        qmap(j.q, j.q_off, (size_t) (j.Sq - 1) * j.q_nb1 + (size_t) (j.nh - 1) * j.q_nb2 + h->D * sizeof(float));
+        qmap(j.em, j.em_off, j.em_bytes);
+        if (opt_fa_fold_qmap > 1) qmap(j.m, j.m_off, (size_t) j.Sq * j.m_nb1);
+    }
+    if (!opt_fa_fold_knat) {
+        const cl_int k_off = (cl_int) j.k_off, k_nb1 = (cl_int) j.k_nb1, k_nb2 = (cl_int) j.k_nb2;
+        const cl_int abs_stride = (cl_int) h->nbk_cap, kt_base_tex = (cl_int) (h->off_kt / 8), nkvh = (cl_int) j.nkvh;
+        const cl_int em_off = (cl_int) j.em_off, nbk = (cl_int) j.nbk, num_sb = (cl_int) j.num_sb;
+        int a = 0;
+        clSetKernelArg(h->k_stage_p, a++, sizeof(cl_mem), &j.k);
+        clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &k_off); clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &k_nb1); clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &k_nb2);
+        clSetKernelArg(h->k_stage_p, a++, sizeof(cl_mem), &h->kt_img); clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &kt_base_tex);
+        clSetKernelArg(h->k_stage_p, a++, sizeof(cl_mem), &h->hbuf);
+        clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &to.abs); clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &to.cnt);
+        clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &abs_stride); clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &n_stage);
+        clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &nkvh); clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &to.scnt);
+        hfold_set_svm(h, h->k_stage_p, a++); clSetKernelArg(h->k_stage_p, a++, sizeof(cl_uint), &want);
+        clSetKernelArg(h->k_stage_p, a++, sizeof(cl_mem), &j.em); clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &em_off);
+        clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &nbk); clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &num_sb);
+        clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &to.idx); clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &to.lcnt);
+        const size_t g = (size_t) std::max(1, opt_fa_fold_pwg_stage) * 128, l = 128;
+        err = clEnqueueNDRangeKernel(h->q, h->k_stage_p, 1, nullptr, &g, &l, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) { h->n_gpu_err++; GGML_LOG_ERROR("ggml-hex: fa-fold: enqueue stage_k_p failed (%d)\n", err); }
+    }
+    if (opt_fa_fold_chain) {
+        hfold_args_fa(h, j, to, n_stage, want, opt_fa_fold_chain, 1);
+        c.ev.assign(1, nullptr);
+        const size_t n_units = (size_t) (j.br / 32) * (j.qbh ? j.G : j.nh) * j.n_stages;
+        const size_t n_pwg   = std::min<size_t>(std::max(1, opt_fa_fold_pwg), n_units);
+        const size_t gsz[3]  = { 128, opt_fa_fold_chain == 2 ? n_pwg : (size_t) (j.br / 32) * (j.qbh ? j.G : j.nh), opt_fa_fold_chain == 2 ? 1 : (size_t) j.n_stages };
+        const size_t lsz[3]  = { 128, 1, 1 };
+        err = clEnqueueNDRangeKernel(h->q, h->k_fa, 3, nullptr, gsz, lsz, 0, nullptr, &c.ev[0]);
+        if (err != CL_SUCCESS) { h->n_gpu_err++; GGML_LOG_ERROR("ggml-hex: fa-fold: enqueue fa_exc chain failed (%d)\n", err); c.ev[0] = nullptr; }
+        clFlush(h->q);
+    } else {
+        hfold_args_fa(h, j, to, n_stage, want, 0, 1);
+        c.ev.assign(j.n_stages, nullptr);
+        hfold_launch_fa_stages(h, j, c.ev, true);
+    }
+    c.enq = true; c.t_enq = std::chrono::steady_clock::now();
+}
+
+static void ggml_hexagon_hfold_relay_main(ggml_hexagon_hfold * h) {
+#if defined(__linux__)
+    if (opt_fa_fold_cpu >= 0) {
+        cpu_set_t set; CPU_ZERO(&set); CPU_SET(opt_fa_fold_cpu, &set);
+        sched_setaffinity(0, sizeof(set), &set);
+    }
+#endif
+    using clock_t = std::chrono::steady_clock;
+    auto us_between = [](clock_t::time_point a, clock_t::time_point b) { return std::chrono::duration<double, std::micro>(b - a).count(); };
+    std::vector<int32_t> to_compact;
+    // the buffer is allocated (and may be reallocated) after this thread starts: refreshed per batch
+    volatile uint32_t * ready = nullptr, * done = nullptr, * stamp = nullptr;
+
+    // ---- kernel argument setters shared by the legacy and the chain path ----
+    auto host_tables = [&](const ggml_hexagon_hfold_job & j, uint32_t & n_stage_blk) {
+        hetero_dc_civac(j.em_host, j.em_bytes);
+        uint8_t * tabs_base = opt_fa_fold_svmtab ? h->svm_tabs : h->base;
+        const size_t tab0   = opt_fa_fold_svmtab ? h->off_idx : 0;
+        int32_t * idx_h  = (int32_t *) (tabs_base + h->off_idx - tab0);
+        int32_t * abs_h  = (int32_t *) (tabs_base + h->off_abs - tab0);
+        int32_t * cnt_h  = (int32_t *) (tabs_base + h->off_cnt - tab0);
+        int32_t * lcnt_h = (int32_t *) (tabs_base + h->off_lcnt - tab0);
+        to_compact.assign(j.nbk, -1);
+        n_stage_blk = 0;
+        for (uint32_t kvh = 0; kvh < j.nkvh; ++kvh) {
+            std::fill(to_compact.begin(), to_compact.end(), -1);
+            for (uint32_t sb = 0; sb < j.num_sb; ++sb) {
+                const float * row = j.em_host + ((size_t) kvh * j.num_sb + sb) * j.nbk;
+                for (uint32_t b = 0; b < j.nbk; ++b) if (row[b] != 0.0f) to_compact[b] = 0;
+            }
+            int32_t c = 0;
+            for (uint32_t b = 0; b < j.nbk; ++b) {
+                if (to_compact[b] == 0) { abs_h[(size_t) kvh * h->nbk_cap + c] = (int32_t) b; to_compact[b] = c++; }
+            }
+            for (int32_t i = c; i < (int32_t) h->nbk_cap; ++i) abs_h[(size_t) kvh * h->nbk_cap + i] = -1;
+            cnt_h[kvh] = c * 64;
+            n_stage_blk = std::max<uint32_t>(n_stage_blk, (uint32_t) c);
+            for (uint32_t sb = 0; sb < j.num_sb; ++sb) {
+                const float * row = j.em_host + ((size_t) kvh * j.num_sb + sb) * j.nbk;
+                int32_t * irow = idx_h + ((size_t) kvh * j.num_sb + sb) * h->nbk_cap;
+                int32_t s = 0;
+                for (uint32_t b = 0; b < j.nbk; ++b) if (row[b] != 0.0f) irow[s++] = to_compact[b];
+                lcnt_h[(size_t) kvh * j.num_sb + sb] = s;
+            }
+        }
+        *(int32_t *) (tabs_base + h->off_err - tab0) = 0;
+        if (opt_fa_fold_check) {
+            uint32_t nz = 0, lsum = 0;
+            for (size_t i = 0; i < (size_t) j.nkvh * j.num_sb * j.nbk; ++i) nz += j.em_host[i] != 0.0f;
+            for (size_t i = 0; i < (size_t) j.nkvh * j.num_sb; ++i) lsum += (uint32_t) lcnt_h[i];
+            GGML_LOG_INFO("ggml-hex: fa-fold relay: want %u: em %p (%u blocks x %u sb x %u heads) nonzero %u -> list entries %u, staged blocks/head max %u, Sq %u nh %u k_off %u q_off %u m_off %u\n",
+                          j.want, (const void *) j.em_host, j.nbk, j.num_sb, j.nkvh, nz, lsum, n_stage_blk, j.Sq, j.nh, j.k_off, j.q_off, j.m_off);
+        }
+        if (!opt_fa_fold_svmtab) {
+            hetero_dc_civac(h->base + h->off_idx, h->off_kt - h->off_idx);
+        }
+        if (opt_fa_fold_svmq) {
+            const size_t qbytes = (size_t) (j.Sq - 1) * j.q_nb1 + (size_t) (j.nh - 1) * j.q_nb2 + h->D * sizeof(float);
+            hetero_dc_civac(j.q_base + j.q_off, qbytes);
+            memcpy(h->svm_q, j.q_base + j.q_off, std::min(qbytes, h->svm_q_bytes));
+        }
+    };
+    // host-driven GPU work after ready: tables, cache sync probe, stage_k, one fa_exc per stage,
+    // done words written here as each event completes (held until the reference ran in check mode)
+    auto legacy_gpu = [&](const ggml_hexagon_hfold_job & j, double & b_tab, double & b_gpu, uint32_t & b_blk, clock_t::time_point t_ready) {
+        uint32_t n_stage_blk = 0;
+        host_tables(j, n_stage_blk);
+        const auto t_tab = clock_t::now();
+        b_tab += us_between(t_ready, t_tab);
+        cl_int err = CL_SUCCESS;
+        auto sync = [&](cl_mem mem, size_t off, size_t bytes) {
+            if (!bytes || !opt_fa_fold_sync) return;
+            void * p = clEnqueueMapBuffer(h->q, mem, CL_TRUE, CL_MAP_WRITE_INVALIDATE_REGION, off, bytes, 0, nullptr, nullptr, &err);
+            if (err != CL_SUCCESS || !p) { h->n_gpu_err++; GGML_LOG_ERROR("ggml-hex: fa-fold: map for sync failed (%d)\n", err); return; }
+            err = clEnqueueUnmapMemObject(h->q, mem, p, 0, nullptr, nullptr);
+            if (err != CL_SUCCESS) { h->n_gpu_err++; GGML_LOG_ERROR("ggml-hex: fa-fold: unmap for sync failed (%d)\n", err); }
+        };
+        sync(j.q, j.q_off, (size_t) (j.Sq - 1) * j.q_nb1 + (size_t) (j.nh - 1) * j.q_nb2 + h->D * sizeof(float));
+        sync(j.m, j.m_off, (size_t) j.Sq * j.m_nb1);
+        sync(j.k, j.k_off, (size_t) (j.nbk * 64 - 1) * j.k_nb1 + (size_t) (j.nkvh - 1) * j.k_nb2 + h->D * sizeof(uint16_t));
+        {
+            auto it = h->aliases.find(static_cast<ggml_hexagon_shared_buffer *>(const_cast<ggml_tensor *>(j.node)->src[2]->buffer->context)->fd);
+            if (it != h->aliases.end()) sync(it->second, j.v_off, (size_t) (j.nbk * 64 - 1) * j.v_nb1 + (size_t) (j.nkvh - 1) * j.v_nb2 + h->D * sizeof(uint16_t));
+        }
+        sync(h->hbuf, h->off_idx, h->off_kt - h->off_idx);
+        sync(h->hbuf, h->off_m, h->off_ctl - h->off_m);
+        const cl_int n_stage = (cl_int) std::max<uint32_t>(n_stage_blk, 1) * 64;
+        const hfold_tab_offs to = hfold_tabs_of(h, opt_fa_fold_svmtab);
+        std::vector<cl_event> ev(j.n_stages, nullptr);
+        if (n_stage_blk > 0) {
+            hfold_args_stage_k(h, j, to, n_stage, 0u);
+            const size_t g_stage[3] = { (size_t) n_stage / 4, (size_t) h->D / 8, (size_t) j.nkvh };
+            err = clEnqueueNDRangeKernel(h->q, h->k_stage, 3, nullptr, g_stage, nullptr, 0, nullptr, nullptr);
+            if (err != CL_SUCCESS) { h->n_gpu_err++; GGML_LOG_ERROR("ggml-hex: fa-fold: enqueue stage_k failed (%d)\n", err); }
+            hfold_args_fa(h, j, to, n_stage, 0u, 0, 0);
+            hfold_launch_fa_stages(h, j, ev, false);
+        }
+        for (uint32_t st = 0; st < j.n_stages; ++st) {
+            if (ev[st]) { clWaitForEvents(1, &ev[st]); clReleaseEvent(ev[st]); }
+            if (!opt_fa_fold_check) {
+                __atomic_store_n(done + st, j.want, __ATOMIC_RELEASE);
+                hetero_dc_civac((const void *) (done + st), sizeof(uint32_t));
+            }
+        }
+        h->us_gpu += us_between(t_ready, clock_t::now());
+        b_gpu += us_between(t_tab, clock_t::now());
+        b_blk += n_stage_blk;
+        if (opt_fa_fold_check) {
+            // Host reference for a few rows: the first sub-block with exceptions of KV heads 0 and 1,
+            // query heads kvh*G, tokens sb*64 + {0, 17}. Reads the same hexagon buffers the GPU did.
+            hetero_dc_civac(h->base + h->off_m, (size_t) j.Sq * j.nh * sizeof(float));
+            hetero_dc_civac(h->base + h->off_l, (size_t) j.Sq * j.nh * sizeof(float));
+            hetero_dc_civac(h->base + h->off_acc, (size_t) j.Sq * j.nh * h->D * sizeof(float));
+            for (uint32_t kvh = 0; kvh < std::min<uint32_t>(2, j.nkvh); ++kvh) {
+                int sb_pick = -1;
+                for (uint32_t sb = 0; sb < j.num_sb && sb_pick < 0; ++sb) {
+                    const float * row = j.em_host + ((size_t) kvh * j.num_sb + sb) * j.nbk;
+                    for (uint32_t b = 0; b < j.nbk; ++b) if (row[b] != 0.0f) { sb_pick = (int) sb; break; }
+                }
+                if (sb_pick < 0) { GGML_LOG_INFO("ggml-hex: fa-fold check: kvh %u has no exceptions\n", kvh); continue; }
+                const float * row = j.em_host + ((size_t) kvh * j.num_sb + sb_pick) * j.nbk;
+                const uint32_t bh = kvh * j.G;
+                for (int tt = 0; tt < 2; ++tt) {
+                    const uint32_t t = (uint32_t) sb_pick * 64 + (tt ? 17 : 0);
+                    if (t >= j.Sq) continue;
+                    const float * qr = (const float *) (j.q_base + j.q_off + (size_t) t * j.q_nb1 + (size_t) bh * j.q_nb2);
+                    hetero_dc_civac(qr, h->D * sizeof(float));
+                    const uint16_t * mr = (const uint16_t *) (j.m_base + j.m_off + (size_t) t * j.m_nb1);
+                    hetero_dc_civac(mr, (size_t) j.nbk * 64 * sizeof(uint16_t));
+                    double m_ref = -INFINITY, l_ref = 0; std::vector<double> acc(h->D, 0.0), sc;
+                    std::vector<uint32_t> keys;
+                    for (uint32_t b = 0; b < j.nbk; ++b) if (row[b] != 0.0f) for (uint32_t i = 0; i < 64; ++i) keys.push_back(b * 64 + i);
+                    for (uint32_t key : keys) {
+                        const float mk = ggml_fp16_to_fp32(mr[key]);
+                        if (std::isinf(mk)) { sc.push_back(-INFINITY); continue; }
+                        const uint16_t * kr = (const uint16_t *) (j.k_base + j.k_off + (size_t) key * j.k_nb1 + (size_t) kvh * j.k_nb2);
+                        hetero_dc_civac(kr, h->D * sizeof(uint16_t));
+                        double dot = 0; for (uint32_t e = 0; e < h->D; ++e) dot += (double) qr[e] * ggml_fp16_to_fp32(kr[e]);
+                        sc.push_back(dot * j.scale + mk); m_ref = std::max(m_ref, sc.back());
+                    }
+                    for (size_t i = 0; i < keys.size(); ++i) {
+                        if (std::isinf(sc[i])) continue;
+                        const uint16_t * vr = (const uint16_t *) (j.v_base + j.v_off + (size_t) keys[i] * j.v_nb1 + (size_t) kvh * j.v_nb2);
+                        hetero_dc_civac(vr, h->D * sizeof(uint16_t));
+                        const double pw = exp(sc[i] - m_ref); l_ref += pw;
+                        for (uint32_t e = 0; e < h->D; ++e) acc[e] += pw * ggml_fp16_to_fp32(vr[e]);
+                    }
+                    const size_t r = (size_t) bh * j.Sq + t;
+                    const float m_g = ((const float *) (h->base + h->off_m))[r], l_g = ((const float *) (h->base + h->off_l))[r];
+                    std::vector<float> a_g(h->D);
+                    for (uint32_t e = 0; e < h->D; ++e) a_g[e] = opt_fa_fold_acc16 ? ggml_fp16_to_fp32(((const uint16_t *) (h->base + h->off_acc))[r * h->D + e]) : ((const float *) (h->base + h->off_acc))[r * h->D + e];
+                    double da = 0, na = 0; for (uint32_t e = 0; e < h->D; ++e) { da = std::max(da, fabs(a_g[e] - acc[e])); na = std::max(na, fabs(acc[e])); }
+                    GGML_LOG_INFO("ggml-hex: fa-fold check: want %u kvh %u sb %d tok %u (%zu exc keys, %zu unmasked): m gpu %.5f ref %.5f | l gpu %.4f ref %.4f | acc max|diff| %.3e of %.3e%s\n",
+                                  j.want, kvh, sb_pick, t, keys.size(), (size_t) std::count_if(sc.begin(), sc.end(), [](double x) { return !std::isinf(x); }),
+                                  m_g, m_ref, l_g, l_ref, da, na, (fabs(m_g - m_ref) > 1e-3 || fabs(l_g - l_ref) > 1e-3 * std::max(1.0, l_ref)) ? "  MISMATCH" : "");
+                }
+            }
+            for (uint32_t st = 0; st < j.n_stages; ++st) {
+                __atomic_store_n(done + st, j.want, __ATOMIC_RELEASE);
+                hetero_dc_civac((const void *) (done + st), sizeof(uint32_t));
+            }
+        }
+        if (opt_verbose > 1) {
+            if (!opt_fa_fold_svmtab) hetero_dc_civac(h->base + h->off_err, 4);
+            GGML_LOG_DEBUG("ggml-hex: fa-fold relay: job want %u: %u staged blocks, GPU %u stages done %.0f us after ready, kernel errors %d\n",
+                           j.want, n_stage_blk, j.n_stages, us_between(t_ready, clock_t::now()),
+                           *(volatile int32_t *) ((opt_fa_fold_svmtab ? h->svm_tabs - h->off_idx : h->base) + h->off_err));
+        }
+    };
+    // poll the DSP's ready word up to 3 s; tight for 200 us, then 20 us naps. `poll_hook` runs
+    // each turn (the chain path enqueues the next chain from here when its time comes).
+    // `t_tight`: from this time on (the predicted ready minus a margin) poll without napping
+    auto wait_ready = [&](uint32_t want, const std::function<void()> & poll_hook, clock_t::time_point t_tight) {
+        const auto t0 = clock_t::now();
+        for (;;) {
+            hetero_dc_civac((const void *) ready, 4);
+            if (__atomic_load_n(ready, __ATOMIC_ACQUIRE) == want) return true;
+            const auto now = clock_t::now();
+            const auto el  = now - t0;
+            if (el > std::chrono::milliseconds(3000)) return false;
+            if (poll_hook) poll_hook();
+            if (el > std::chrono::microseconds(200) && now < t_tight) std::this_thread::sleep_for(std::chrono::microseconds(20));
+        }
+    };
+
+    // CHECK=2 (chain path): at `ready`, snapshot the membership row and the Q row of a few
+    // exception rows (the DSP does not touch them again during the op, the next layer's ops do);
+    // after the last stage, recompute those rows on the host from the snapshot plus K, V and the
+    // mask (stable for the graph) and compare with the GPU's (m, l, acc).
+    struct check_pick { uint32_t kvh, sb, tok, bh; std::vector<float> em_row, q_row; };
+    std::vector<check_pick> picks;
+    auto check_snapshot = [&](const ggml_hexagon_hfold_job & j, int n_rows) {
+        picks.clear();
+        hetero_dc_civac(j.em_host, j.em_bytes);
+        for (uint32_t kvh = 0; kvh < j.nkvh && (int) picks.size() < n_rows; kvh += 3) {
+            for (uint32_t sb = 1; sb < j.num_sb; sb += 2) {
+                const float * row = j.em_host + ((size_t) kvh * j.num_sb + sb) * j.nbk;
+                bool any = false; for (uint32_t b = 0; b < j.nbk; ++b) any |= row[b] != 0.0f;
+                if (!any) continue;
+                // two rows per pick, one in each wave of the kernel's 32-row block (offsets 37 and 53)
+                for (uint32_t off = 37; off <= 53; off += 16) {
+                    check_pick p; p.kvh = kvh; p.sb = sb; p.tok = sb * 64 + off; p.bh = kvh * j.G + 1;
+                    if (p.tok >= j.Sq) break;
+                    p.em_row.assign(row, row + j.nbk);
+                    const float * qr = (const float *) (j.q_base + j.q_off + (size_t) p.tok * j.q_nb1 + (size_t) p.bh * j.q_nb2);
+                    hetero_dc_civac(qr, h->D * sizeof(float));
+                    p.q_row.assign(qr, qr + h->D);
+                    picks.push_back(std::move(p));
+                }
+                break;
+            }
+        }
+    };
+    auto check_verify = [&](const ggml_hexagon_hfold_job & j) {
+        for (const auto & p : picks) {
+            const uint16_t * mr = (const uint16_t *) (j.m_base + j.m_off + (size_t) p.tok * j.m_nb1);
+            hetero_dc_civac(mr, (size_t) j.nbk * 64 * sizeof(uint16_t));
+            double m_ref = -INFINITY, l_ref = 0; std::vector<double> acc(h->D, 0.0), sc; std::vector<uint32_t> keys;
+            for (uint32_t b = 0; b < j.nbk; ++b) if (p.em_row[b] != 0.0f) for (uint32_t i = 0; i < 64; ++i) keys.push_back(b * 64 + i);
+            for (uint32_t key : keys) {
+                const float mk = ggml_fp16_to_fp32(mr[key]);
+                if (std::isinf(mk)) { sc.push_back(-INFINITY); continue; }
+                const uint16_t * kr = (const uint16_t *) (j.k_base + j.k_off + (size_t) key * j.k_nb1 + (size_t) p.kvh * j.k_nb2);
+                hetero_dc_civac(kr, h->D * sizeof(uint16_t));
+                double dot = 0; for (uint32_t e = 0; e < h->D; ++e) dot += (double) p.q_row[e] * ggml_fp16_to_fp32(kr[e]);
+                sc.push_back(dot * j.scale + mk); m_ref = std::max(m_ref, sc.back());
+            }
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (std::isinf(sc[i])) continue;
+                const uint16_t * vr = (const uint16_t *) (j.v_base + j.v_off + (size_t) keys[i] * j.v_nb1 + (size_t) p.kvh * j.v_nb2);
+                hetero_dc_civac(vr, h->D * sizeof(uint16_t));
+                const double pw = exp(sc[i] - m_ref); l_ref += pw;
+                for (uint32_t e = 0; e < h->D; ++e) acc[e] += pw * ggml_fp16_to_fp32(vr[e]);
+            }
+            const size_t r = (size_t) p.bh * j.Sq + p.tok;
+            hetero_dc_civac(h->base + h->off_m + r * 4, 4); hetero_dc_civac(h->base + h->off_l + r * 4, 4);
+            const size_t acc_esz = opt_fa_fold_acc16 ? 2 : 4;
+            hetero_dc_civac(h->base + h->off_acc + r * h->D * acc_esz, h->D * acc_esz);
+            const float m_g = ((const float *) (h->base + h->off_m))[r], l_g = ((const float *) (h->base + h->off_l))[r];
+            std::vector<float> a_g(h->D);
+            for (uint32_t e = 0; e < h->D; ++e) a_g[e] = opt_fa_fold_acc16 ? ggml_fp16_to_fp32(((const uint16_t *) (h->base + h->off_acc))[r * h->D + e]) : ((const float *) (h->base + h->off_acc))[r * h->D + e];
+            double da = 0, na = 0; for (uint32_t e = 0; e < h->D; ++e) { da = std::max(da, fabs(a_g[e] - acc[e])); na = std::max(na, fabs(acc[e])); }
+            // f16 rows carry ~1e-3 relative rounding of the accumulator itself
+            const double acc_tol = opt_fa_fold_acc16 ? 4e-3 : 1e-2;
+            const bool bad = fabs(m_g - m_ref) > 1e-3 || fabs(l_g - l_ref) > 1e-3 * std::max(1.0, l_ref) || da > acc_tol * std::max(1.0, na);
+            h->n_check_rows++; h->n_check_bad += bad;
+            if (bad || opt_verbose > 1) {
+                double qn = 0; for (uint32_t e = 0; e < h->D; ++e) qn += (double) p.q_row[e] * p.q_row[e];
+                size_t imax = 0; for (size_t i = 1; i < sc.size(); ++i) if (sc[i] > sc[imax]) imax = i;
+                // the same Q row as the host sees it NOW (vs the snapshot at ready)
+                const float * qr_now = (const float *) (j.q_base + j.q_off + (size_t) p.tok * j.q_nb1 + (size_t) p.bh * j.q_nb2);
+                hetero_dc_civac(qr_now, h->D * sizeof(float));
+                double dq = 0; for (uint32_t e = 0; e < h->D; ++e) dq = std::max(dq, (double) fabs(qr_now[e] - p.q_row[e]));
+                GGML_LOG_INFO("ggml-hex: fa-fold check2: want %u kvh %u sb %u tok %u (%zu keys): m gpu %.5f ref %.5f | l gpu %.4f ref %.4f | acc max|diff| %.3e of %.3e | |q|^2 %.1f argmax key %u (sq %.2f) | Q now vs snapshot max|diff| %.3e%s\n",
+                              j.want, p.kvh, p.sb, p.tok, keys.size(), m_g, m_ref, l_g, l_ref, da, na, qn, keys.empty() ? 0u : keys[imax], sc.empty() ? 0.0 : sc[imax], dq, bad ? "  MISMATCH" : "");
+            }
+        }
+        picks.clear();
+    };
+
+    for (;;) {
+        std::vector<ggml_hexagon_hfold_job> batch;
+        {
+            std::unique_lock<std::mutex> lk(h->mu);
+            h->cv.wait(lk, [&] { return h->stop || !h->batches.empty(); });
+            if (h->stop && h->batches.empty()) return;
+            batch = std::move(h->batches.front());
+            h->batches.pop_front();
+            h->busy = true;
+        }
+        double b_ready = 0, b_gpu = 0, b_tab = 0; uint32_t b_blk = 0;
+        ready = (volatile uint32_t *) (h->base + h->off_ctl);
+        done  = (volatile uint32_t *) (h->base + h->off_done);
+        stamp = (volatile uint32_t *) (h->base + h->off_stamp);
+
+        if (!opt_fa_fold_gpudone) {
+            // ---- legacy: everything after ready is driven from here ----
+            for (const auto & j : batch) {
+                const auto t0 = clock_t::now();
+                const bool seen = wait_ready(j.want, nullptr, clock_t::time_point::max());
+                const auto t_ready = clock_t::now();
+                h->us_ready += us_between(t0, t_ready);
+                b_ready += us_between(t0, t_ready);
+                if (!seen) { h->n_ready_timeouts++; continue; }   // the op times out on its own and fails loudly
+                if (opt_fa_fold_check == 2 && (h->n_jobs % 2) == 0) check_snapshot(j, 2);
+                legacy_gpu(j, b_tab, b_gpu, b_blk, t_ready);
+                if (opt_fa_fold_check == 2 && !picks.empty()) check_verify(j);
+                h->n_chain++;   // counts checked jobs for the summary line
+            }
+        } else {
+            // ---- chain: gate -> compact -> stage_k -> fa_exc, enqueued ahead of ready ----
+            auto release_chain = [&](hfold_chain & c) {
+                for (auto & e : c.ev) if (e) { clWaitForEvents(1, &e); clReleaseEvent(e); e = nullptr; }
+            };
+            // the next chain's enqueue time: -1 = at once, N = N us before the predicted ready
+            clock_t::time_point t_ready_prev; bool have_prev = false;
+            size_t next_ji = 0; clock_t::time_point t_next = clock_t::now(); bool next_armed = false;
+            auto arm_next = [&](size_t ji, clock_t::time_point t_ref) {
+                if (ji >= batch.size() || batch[ji].chain.enq || opt_fa_fold_preq == 0 || opt_fa_fold_preq == -3) { next_armed = false; return; }
+                next_ji = ji; next_armed = true;
+                t_next = t_ref;
+                if (opt_fa_fold_preq > 0 && h->period_us > 0) {
+                    const double lead = (double) opt_fa_fold_preq;
+                    if (h->period_us > lead) t_next = t_ref + std::chrono::microseconds((int64_t) (h->period_us - lead));
+                }
+            };
+            auto poll_hook = [&]() {
+                if (next_armed && clock_t::now() >= t_next) { hfold_enqueue_chain(h, batch[next_ji], batch[next_ji].chain); next_armed = false; }
+            };
+            if (opt_fa_fold_preq == -2) {
+                for (size_t ji = 0; ji < batch.size(); ++ji) if (!batch[ji].chain.enq) hfold_enqueue_chain(h, batch[ji], batch[ji].chain);
+            } else if (opt_fa_fold_preq != 0) {   // -1, -3, N: the first chain now, the rest as their turn comes
+                if (!batch[0].chain.enq) hfold_enqueue_chain(h, batch[0], batch[0].chain);   // the first op is several ops of DSP work away
+            }
+
+            for (size_t ji = 0; ji < batch.size(); ++ji) {
+                const ggml_hexagon_hfold_job & j = batch[ji];
+                hfold_chain & c = batch[ji].chain;
+                if (!c.enq) arm_next(ji, clock_t::now());
+                const auto t0 = clock_t::now();
+                clock_t::time_point t_tight = clock_t::time_point::max();
+                if (have_prev && h->period_us > 500) t_tight = t_ready_prev + std::chrono::microseconds((int64_t) (h->period_us - 400));
+                const bool seen = wait_ready(j.want, poll_hook, t_tight);
+                const auto t_ready = clock_t::now();
+                h->us_ready += us_between(t0, t_ready);
+                b_ready += us_between(t0, t_ready);
+                if (!seen) {
+                    h->n_ready_timeouts++;
+                    if (c.enq) release_chain(c);   // the gate times out on its own
+                    continue;
+                }
+                if (!c.enq) {
+                    hfold_enqueue_chain(h, j, c);
+                    if (opt_fa_fold_preq != 0) h->n_late++;
+                } else {
+                    h->n_preq++; h->us_lead += us_between(c.t_enq, t_ready);
+                }
+                next_armed = false;
+                if (have_prev) {
+                    const double p = us_between(t_ready_prev, t_ready);
+                    h->period_us = h->period_us > 0 ? 0.7 * h->period_us + 0.3 * p : p;
+                }
+                t_ready_prev = t_ready; have_prev = true;
+                if (opt_fa_fold_check == 2 && (h->n_chain % 2) == 0) check_snapshot(j, 2);
+                if (opt_fa_fold_trig) {
+                    // a submission that references the DSP-written inputs, after they were written
+                    int a = 0;
+                    clSetKernelArg(h->k_touch, a++, sizeof(cl_mem), &j.q); clSetKernelArg(h->k_touch, a++, sizeof(cl_mem), &j.em);
+                    clSetKernelArg(h->k_touch, a++, sizeof(cl_mem), &j.k); clSetKernelArg(h->k_touch, a++, sizeof(cl_mem), &j.m);
+                    auto itv = h->aliases.find(static_cast<ggml_hexagon_shared_buffer *>(const_cast<ggml_tensor *>(j.node)->src[2]->buffer->context)->fd);
+                    cl_mem valias = itv != h->aliases.end() ? itv->second : j.k;
+                    clSetKernelArg(h->k_touch, a++, sizeof(cl_mem), &valias);
+                    hfold_set_svm(h, h->k_touch, a++);
+                    const size_t one = 1;
+                    cl_event ev_trig = nullptr;
+                    cl_int e2 = clEnqueueNDRangeKernel(h->q2, h->k_touch, 1, nullptr, &one, &one, 0, nullptr, opt_fa_fold_trig >= 3 ? &ev_trig : nullptr);
+                    if (e2 != CL_SUCCESS) { h->n_gpu_err++; GGML_LOG_ERROR("ggml-hex: fa-fold: trigger enqueue failed (%d)\n", e2); }
+                    clFlush(h->q2);
+                    if (ev_trig) {
+                        // TRIG=3: the maintenance the submission carries runs on the GPU's own
+                        // timeline; a kernel that starts reading 60 us after the gate can still
+                        // precede it (bimodal perplexity with the natural-layout kernel). Wait for
+                        // the trigger to complete before the word that opens the gate.
+                        clWaitForEvents(1, &ev_trig); clReleaseEvent(ev_trig);
+                    }
+                }
+                // open the gate
+                __atomic_store_n(h->svm_ctl + 0, j.want, __ATOMIC_SEQ_CST);
+                arm_next(ji + 1, t_ready);
+                bool gate_to = false, failed = false;
+                for (;;) {
+                    const uint32_t v = __atomic_load_n(h->svm_ctl + 1, __ATOMIC_ACQUIRE);
+                    if (v == j.want) break;
+                    if (v == (j.want | 0x80000000u)) { gate_to = true; break; }
+                    poll_hook();
+                    if (us_between(t_ready, clock_t::now()) > 3e6) { failed = true; break; }
+                }
+                const auto t_gate = clock_t::now();
+                h->us_gate += us_between(t_ready, t_gate);
+                if (!gate_to && !failed && __atomic_load_n(h->svm_ctl + 6, __ATOMIC_ACQUIRE) == 2u) h->n_gate_ion++;
+                const bool trace_job = opt_fa_fold_trace > 0 && (h->n_batches % 16) == 0 && ji < (size_t) opt_fa_fold_trace;
+                double trace_t[HTP_FA_FOLD_MAX_STAGES] = {};
+                if (gate_to || failed) {
+                    // the chain did nothing (every kernel behind the gate checks it): host path
+                    h->n_gate_timeouts += gate_to; h->n_fallback++;
+                    release_chain(c);
+                    legacy_gpu(j, b_tab, b_gpu, b_blk, t_ready);
+                    h->n_chain++;
+                    continue;
+                }
+                // stages arrive in order; relay each SVM done word to the DSP's done line unless the
+                // kernel's own ION write is already visible there (the direct-visibility probe)
+                double t_k[3] = { -1, -1, -1 };   // compact / stage_k / fa_exc start, us after ready
+                for (uint32_t st = 0; st < j.n_stages; ++st) {
+                    for (;;) {
+                        if (__atomic_load_n(h->svm_ctl + 64 + st, __ATOMIC_ACQUIRE) == j.want) break;
+                        if (trace_job) {
+                            for (int k = 0; k < 3; ++k) if (t_k[k] < 0 && __atomic_load_n(h->svm_ctl + 3 + k, __ATOMIC_ACQUIRE) == j.want) t_k[k] = us_between(t_ready, clock_t::now());
+                        }
+                        poll_hook();
+                        if (us_between(t_ready, clock_t::now()) > 3e6) { failed = true; break; }
+                    }
+                    if (failed) break;
+                    const auto t_st = clock_t::now();
+                    if (st == 0) h->us_first_done += us_between(t_ready, t_st);
+                    if (st + 1 == j.n_stages) h->us_last_done += us_between(t_ready, t_st);
+                    hetero_dc_civac((const void *) (done + st), sizeof(uint32_t));
+                    if (__atomic_load_n(done + st, __ATOMIC_ACQUIRE) == j.want) {
+                        h->n_direct++;
+                    } else {
+                        __atomic_store_n(done + st, j.want, __ATOMIC_RELEASE);
+                        hetero_dc_civac((const void *) (done + st), sizeof(uint32_t));
+                    }
+                    hetero_dc_civac((const void *) (stamp + st), sizeof(uint32_t));
+                    h->n_stamp_total++;
+                    if (__atomic_load_n(stamp + st, __ATOMIC_ACQUIRE) == j.want) h->n_stamp_seen++;
+                    if (trace_job) trace_t[st] = us_between(t_ready, t_st);
+                }
+                if (trace_job) {
+                    std::string line;
+                    char tmp[32];
+                    for (uint32_t st = 0; st < j.n_stages; ++st) { snprintf(tmp, sizeof(tmp), " %.0f", trace_t[st]); line += tmp; }
+                    GGML_LOG_INFO("ggml-hex: fa-fold trace: want %u: enqueued %.0f us before ready, gate open +%.0f us (%u gate polls), stage_k starts +%.0f (compact %.0f), fa_exc +%.0f; stage done (us after ready):%s\n",
+                                  j.want, us_between(c.t_enq, t_ready), us_between(t_ready, t_gate), __atomic_load_n(h->svm_ctl + 2, __ATOMIC_ACQUIRE), t_k[1], t_k[0], t_k[2], line.c_str());
+                }
+                if (failed) {
+                    GGML_LOG_ERROR("ggml-hex: fa-fold chain: want %u: stages not delivered within 3 s (gate %u)\n", j.want, __atomic_load_n(h->svm_ctl + 1, __ATOMIC_ACQUIRE));
+                    h->n_gpu_err++;
+                }
+                release_chain(c);
+                // -3: the next chain goes in only now, with nothing of ours left on the GPU: a
+                // submission after idle is what makes the driver drop the previous op's cached
+                // lines of Q (same address, new content) -- pre-enqueued chains read them stale
+                if (opt_fa_fold_preq == -3 && ji + 1 < batch.size() && !batch[ji + 1].chain.enq) {
+                    if (opt_fa_fold_preq_idle > 0) std::this_thread::sleep_for(std::chrono::microseconds(opt_fa_fold_preq_idle));
+                    hfold_enqueue_chain(h, batch[ji + 1], batch[ji + 1].chain);
+                }
+                h->us_gpu += us_between(t_ready, clock_t::now());
+                b_gpu += us_between(t_gate, clock_t::now());
+                h->n_chain++;
+                hetero_dc_civac(h->base + h->off_err, 4);
+                h->n_kernel_err += (uint64_t) *(volatile int32_t *) (h->base + h->off_err);
+                if (opt_fa_fold_check == 2 && !picks.empty()) check_verify(j);
+                if (opt_verbose > 1) {
+                    hetero_dc_civac(h->base + h->off_err, 4);
+                    GGML_LOG_DEBUG("ggml-hex: fa-fold chain: want %u: enqueued %.0f us before ready, gate open +%.0f us, last done +%.0f us, kernel errors %d\n",
+                                   j.want, us_between(c.t_enq, t_ready), us_between(t_ready, t_gate), us_between(t_ready, clock_t::now()),
+                                   *(volatile int32_t *) (h->base + h->off_err));
+                }
+            }
+            for (auto & jb : batch) release_chain(jb.chain);
+        }
+        if (opt_verbose) {
+            volatile uint32_t * st = (volatile uint32_t *) (h->base + h->off_ctl + HTP_FA_HETERO_STATUS_OFF);
+            hetero_dc_civac((const void *) st, 64);
+            GGML_LOG_DEBUG("ggml-hex: fa-fold relay: batch %llu: %zu jobs; per job: ready wait %.0f us, tables %.0f us, GPU %.0f us, staged blocks/head %.1f; DSP: ops that blocked %u, stage waits that spun %u, last op blocked %u us (max %u), timeouts %u; relay ready timeouts %llu\n",
+                           (unsigned long long) h->n_batches, batch.size(), b_ready / batch.size(), b_tab / batch.size(), b_gpu / batch.size(), (double) b_blk / batch.size(),
+                           st[HTP_FA_FOLD_ST_WAITS], st[HTP_FA_FOLD_ST_TILES_BLOCKED],
+                           st[HTP_FA_FOLD_ST_WAIT_US], st[HTP_FA_FOLD_ST_WAIT_US_MAX], st[HTP_FA_FOLD_ST_TIMEOUTS], (unsigned long long) h->n_ready_timeouts);
+        }
+        {
+            std::lock_guard<std::mutex> lk(h->mu);
+            h->n_batches++; h->n_jobs += batch.size(); h->busy = false;
+        }
+        h->cv.notify_all();
+        if ((h->n_batches % 8) == 0) ggml_hexagon_hfold_log_summary(h);
+    }
+}
+
+// A hexagon buffer is going away. Its ION alias and texture view must go with it: the dmabuf fd
+// (the alias cache key) is recycled by the next allocation, and an alias keeps the OLD pages alive
+// -- so a graph whose compute buffer grew (a longer ubatch of the same prompt) would otherwise
+// read Q and the mask from the freed allocation. Seen as NaNs from the first layer of the third
+// ubatch on.
+static void ggml_hexagon_hfold_buffer_freed(ggml_hexagon_session * sess, ggml_backend_buffer_t buffer) {
+    ggml_hexagon_hfold * h = sess->hfold;
+    if (!h || !buffer || buffer == h->buf) return;
+    auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(buffer->context);
+    const bool had = h->aliases.count(sbuf->fd) || h->images.count(sbuf->fd);
+    if (!had) return;
+    ggml_hexagon_hfold_wait_idle(h);
+    clFinish(h->q);
+    auto ii = h->images.find(sbuf->fd);  if (ii != h->images.end())  { clReleaseMemObject(ii->second); h->images.erase(ii); }
+    auto ia = h->aliases.find(sbuf->fd); if (ia != h->aliases.end()) { clReleaseMemObject(ia->second); h->aliases.erase(ia); }
+    // jobs that referenced this buffer are stale; the next graph build re-prepares them
+    for (auto it = h->jobs.begin(); it != h->jobs.end();) {
+        const ggml_tensor * n = it->first;
+        bool uses = false;
+        for (int i = 0; i < GGML_MAX_SRC && !uses; ++i) uses = n->src[i] && n->src[i]->buffer == buffer;
+        it = uses ? h->jobs.erase(it) : std::next(it);
+    }
+    HEX_VERBOSE("ggml-hex: fa-fold: dropped the alias of freed buffer fd %d base %p\n", sbuf->fd, (void *) sbuf->base);
+}
+
+static void ggml_hexagon_hfold_log_summary(ggml_hexagon_hfold * h) {
+    uint32_t st[HTP_FA_FOLD_ST_N] = {};
+    if (h->base) {
+        hetero_dc_civac(h->base + h->off_ctl + HTP_FA_HETERO_STATUS_OFF, sizeof(st));
+        memcpy(st, h->base + h->off_ctl + HTP_FA_HETERO_STATUS_OFF, sizeof(st));
+    }
+    GGML_LOG_INFO("ggml-hex: fa-fold: %llu graphs, %llu GPU jobs; relay ready timeouts %llu, GPU errors %llu; DSP ops that blocked %u, stage waits that spun %u, max blocked %u us, mean blocked %.0f us/op, DSP timeouts %u; per job: ready wait %.0f us, GPU %.0f us\n",
+                  (unsigned long long) h->n_batches, (unsigned long long) h->n_jobs,
+                  (unsigned long long) h->n_ready_timeouts, (unsigned long long) h->n_gpu_err,
+                  st[HTP_FA_FOLD_ST_WAITS], st[HTP_FA_FOLD_ST_TILES_BLOCKED], st[HTP_FA_FOLD_ST_WAIT_US_MAX],
+                  h->n_jobs ? (double) st[HTP_FA_FOLD_ST_WAIT_US_SUM] / (double) h->n_jobs : 0.0, st[HTP_FA_FOLD_ST_TIMEOUTS],
+                  h->n_jobs ? h->us_ready / (double) h->n_jobs : 0.0, h->n_jobs ? h->us_gpu / (double) h->n_jobs : 0.0);
+    if (h->n_chain) {
+        const double n = (double) h->n_chain;
+        GGML_LOG_INFO("ggml-hex: fa-fold chain: %llu jobs (preq %d, chain %d): pre-enqueued %llu, late %llu, gate timeouts %llu, fallbacks %llu; per job: enqueue lead %.0f us before ready, gate open %.0f us after ready, first done %.0f us, last done %.0f us; ION done already visible at the SVM word %llu of %llu stages, stamp visible %llu; gates opened by the DSP's own word %llu; kernel list errors %llu; check rows %llu bad %llu; period %.0f us\n",
+                      (unsigned long long) h->n_chain, opt_fa_fold_preq, opt_fa_fold_chain, (unsigned long long) h->n_preq, (unsigned long long) h->n_late,
+                      (unsigned long long) h->n_gate_timeouts, (unsigned long long) h->n_fallback,
+                      h->us_lead / n, h->us_gate / n, h->us_first_done / n, h->us_last_done / n,
+                      (unsigned long long) h->n_direct, (unsigned long long) h->n_stamp_total, (unsigned long long) h->n_stamp_seen, (unsigned long long) h->n_gate_ion,
+                      (unsigned long long) h->n_kernel_err, (unsigned long long) h->n_check_rows, (unsigned long long) h->n_check_bad, h->period_us);
+    }
+}
+
+static void ggml_hexagon_hfold_free(ggml_hexagon_session * sess) {
+    ggml_hexagon_hfold * h = sess->hfold;
+    if (!h) return;
+    {
+        std::lock_guard<std::mutex> lk(h->mu);
+        h->stop = true;
+    }
+    h->cv.notify_all();
+    if (h->relay.joinable()) h->relay.join();
+    h->keep_stop = true;
+    if (h->keeper.joinable()) h->keeper.join();
+    if (h->k_keep) { clReleaseKernel(h->k_keep); clReleaseMemObject(h->keep_buf); clReleaseMemObject(h->keep_out); GGML_LOG_INFO("ggml-hex: fa-fold keep-alive: %llu launches\n", (unsigned long long) h->n_keep); }
+    if (h->q) clFinish(h->q);
+    ggml_hexagon_hfold_log_summary(h);
+    if (h->ready_sub) clReleaseMemObject(h->ready_sub);
+    for (auto & kv : h->images)  clReleaseMemObject(kv.second);
+    for (auto & kv : h->aliases) clReleaseMemObject(kv.second);
+    if (h->svm_tabs) clSVMFree(h->ctx, h->svm_tabs);
+    if (h->svm_q) clSVMFree(h->ctx, h->svm_q);
+    if (h->svm_ctl) clSVMFree(h->ctx, h->svm_ctl);
+    if (h->k_fa) clReleaseKernel(h->k_fa);
+    if (h->k_stage) clReleaseKernel(h->k_stage);
+    if (h->k_gate) clReleaseKernel(h->k_gate);
+    if (h->k_compact) clReleaseKernel(h->k_compact);
+    if (h->k_stage_p) clReleaseKernel(h->k_stage_p);
+    if (h->k_touch) clReleaseKernel(h->k_touch);
+    if (h->q2) { clFinish(h->q2); clReleaseCommandQueue(h->q2); }
+    if (h->prog) clReleaseProgram(h->prog);
+    if (h->q) clReleaseCommandQueue(h->q);
+    if (h->ctx) clReleaseContext(h->ctx);
+    if (h->tctx) ggml_free(h->tctx);
+    if (h->buf) ggml_backend_buffer_free(h->buf);
+    delete h;
+    sess->hfold = nullptr;
+}
+
 #endif // GGML_HEXAGON_HETERO
 
 // ---------------------------------------------------------------------------------------
@@ -5776,6 +7584,21 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                         hetero_slot++;
                     }
                 }
+                if (opt_fa_fold > 0 && opt_hetero_frac <= 0.0f) {
+                    // (init happens on the first FA node even if it is not tagged: the keep-alive control needs it)
+                    if (!sess->hfold && !ggml_hexagon_hfold_init(sess)) {
+                        GGML_LOG_WARN("ggml-hex: hetero prefill split disabled (init failed)\n");
+                        opt_fa_fold = 0;
+                    }
+                    if (sess->hfold && !opt_fa_fold_notag) {
+                        // a node the graph built for the split (src[8] set) that the sidecar cannot
+                        // take would run the pool alone and silently lose its exceptions: say so
+                        if (!ggml_hexagon_hfold_prepare(sess, n, (const struct htp_fa_kernel_params *) node.kernel_params) && n->src[8]) {
+                            static int warned = 0;
+                            if (!warned++) GGML_LOG_WARN("ggml-hex: fa-fold: %s has an exception membership but cannot be tagged (shape/alignment): its output lacks the exceptions\n", n->name);
+                        }
+                    }
+                }
 #endif
                 if (opt_cluster_density >= 0 && opt_hetero_frac <= 0.0f) {
                     if (!sess->cluster) {
@@ -5827,6 +7650,9 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
 #ifdef GGML_HEXAGON_HETERO
     if (sess->hetero) {
         ggml_hexagon_hetero_post(sess, *nodes_ptr);
+    }
+    if (sess->hfold) {
+        ggml_hexagon_hfold_post(sess, *nodes_ptr);
     }
 #endif
 
@@ -6537,6 +8363,38 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_hetero_span = getenv("GGML_HEXAGON_HETERO_SPAN");
     const char * str_hetero_cpu  = getenv("GGML_HEXAGON_HETERO_CPU");
     const char * str_hetero_adapt = getenv("GGML_HEXAGON_HETERO_ADAPT");
+    const char * str_fa_fold      = getenv("GGML_HEXAGON_FA_FOLD");
+    const char * str_fa_fold_cpu  = getenv("GGML_HEXAGON_FA_FOLD_CPU");
+    const char * str_fa_fold_check = getenv("GGML_HEXAGON_FA_FOLD_CHECK");
+    const char * str_fa_fold_svmtab = getenv("GGML_HEXAGON_FA_FOLD_SVMTAB");
+    const char * str_fa_fold_svmq   = getenv("GGML_HEXAGON_FA_FOLD_SVMQ");
+    const char * str_fa_fold_sync   = getenv("GGML_HEXAGON_FA_FOLD_SYNC");
+    const char * str_fa_fold_perf   = getenv("GGML_HEXAGON_FA_FOLD_PERF");
+    const char * str_fa_fold_flush  = getenv("GGML_HEXAGON_FA_FOLD_FLUSH");
+    const char * str_fa_fold_stage  = getenv("GGML_HEXAGON_FA_FOLD_STAGE_QB");
+    const char * str_fa_fold_keep   = getenv("GGML_HEXAGON_FA_FOLD_KEEPALIVE");
+    const char * str_fa_fold_keepp  = getenv("GGML_HEXAGON_FA_FOLD_KEEPALIVE_PERIOD_US");
+    const char * str_fa_fold_gpudone = getenv("GGML_HEXAGON_FA_FOLD_GPUDONE");
+    const char * str_fa_fold_preq   = getenv("GGML_HEXAGON_FA_FOLD_PREQ");
+    const char * str_fa_fold_chain  = getenv("GGML_HEXAGON_FA_FOLD_CHAIN");
+    const char * str_fa_fold_qbh    = getenv("GGML_HEXAGON_FA_FOLD_STAGE_QBH");
+    const char * str_fa_fold_gspins = getenv("GGML_HEXAGON_FA_FOLD_GATE_SPINS");
+    const char * str_fa_fold_pwg    = getenv("GGML_HEXAGON_FA_FOLD_PWG");
+    const char * str_fa_fold_pwgs   = getenv("GGML_HEXAGON_FA_FOLD_PWG_STAGE");
+    const char * str_fa_fold_trace  = getenv("GGML_HEXAGON_FA_FOLD_TRACE");
+    const char * str_fa_fold_ionr   = getenv("GGML_HEXAGON_FA_FOLD_ION_READY");
+    const char * str_fa_fold_ktbuf  = getenv("GGML_HEXAGON_FA_FOLD_KTBUF");
+    const char * str_fa_fold_notag  = getenv("GGML_HEXAGON_FA_FOLD_NOTAG");
+    const char * str_fa_fold_probe  = getenv("GGML_HEXAGON_FA_FOLD_PROBE");
+    const char * str_fa_fold_gdelay = getenv("GGML_HEXAGON_FA_FOLD_GATE_DELAY");
+    const char * str_fa_fold_acq    = getenv("GGML_HEXAGON_FA_FOLD_ACQ");
+    const char * str_fa_fold_trig   = getenv("GGML_HEXAGON_FA_FOLD_TRIG");
+    const char * str_fa_fold_qatom  = getenv("GGML_HEXAGON_FA_FOLD_QATOMIC");
+    const char * str_fa_fold_wgf    = getenv("GGML_HEXAGON_FA_FOLD_WGFENCE");
+    const char * str_fa_fold_acc16  = getenv("GGML_HEXAGON_FA_FOLD_ACC16");
+    const char * str_fa_fold_knat   = getenv("GGML_HEXAGON_FA_FOLD_KNAT");
+    const char * str_fa_fold_pidle  = getenv("GGML_HEXAGON_FA_FOLD_PREQ_IDLE_US");
+    const char * str_fa_fold_qmap   = getenv("GGML_HEXAGON_FA_FOLD_QMAP");
     const char * str_cluster  = getenv("GGML_HEXAGON_CLUSTER_ATTN");
     const char * str_cluster_cpu = getenv("GGML_HEXAGON_CLUSTER_CPU");
     const char * str_cluster_verify = getenv("GGML_HEXAGON_CLUSTER_VERIFY");
@@ -6612,10 +8470,48 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_hetero_span = str_hetero_span ? atoi(str_hetero_span)                : opt_hetero_span;
     opt_hetero_cpu  = str_hetero_cpu  ? atoi(str_hetero_cpu)                 : opt_hetero_cpu;
     opt_hetero_adapt = str_hetero_adapt ? atoi(str_hetero_adapt)             : opt_hetero_adapt;
+    opt_fa_fold      = str_fa_fold      ? atoi(str_fa_fold)                  : opt_fa_fold;
+    opt_fa_fold_cpu  = str_fa_fold_cpu  ? atoi(str_fa_fold_cpu)              : opt_fa_fold_cpu;
+    opt_fa_fold_check = str_fa_fold_check ? atoi(str_fa_fold_check)          : opt_fa_fold_check;
+    opt_fa_fold_svmtab = str_fa_fold_svmtab ? atoi(str_fa_fold_svmtab)       : opt_fa_fold_svmtab;
+    opt_fa_fold_svmq   = str_fa_fold_svmq   ? atoi(str_fa_fold_svmq)         : opt_fa_fold_svmq;
+    opt_fa_fold_sync   = str_fa_fold_sync   ? atoi(str_fa_fold_sync)         : opt_fa_fold_sync;
+    opt_fa_fold_perf   = str_fa_fold_perf   ? atoi(str_fa_fold_perf)         : opt_fa_fold_perf;
+    opt_fa_fold_flush  = str_fa_fold_flush  ? atoi(str_fa_fold_flush)        : opt_fa_fold_flush;
+    opt_fa_fold_stage_qb = str_fa_fold_stage ? atoi(str_fa_fold_stage)       : opt_fa_fold_stage_qb;
+    opt_fa_fold_keepalive = str_fa_fold_keep ? atoi(str_fa_fold_keep)        : opt_fa_fold_keepalive;
+    opt_fa_fold_keepalive_period = str_fa_fold_keepp ? atoi(str_fa_fold_keepp) : opt_fa_fold_keepalive_period;
+    opt_fa_fold_gpudone = str_fa_fold_gpudone ? atoi(str_fa_fold_gpudone)     : opt_fa_fold_gpudone;
+    opt_fa_fold_preq    = str_fa_fold_preq    ? atoi(str_fa_fold_preq)        : opt_fa_fold_preq;
+    opt_fa_fold_chain   = str_fa_fold_chain   ? atoi(str_fa_fold_chain)       : opt_fa_fold_chain;
+    opt_fa_fold_qbh     = str_fa_fold_qbh     ? atoi(str_fa_fold_qbh)         : opt_fa_fold_qbh;
+    opt_fa_fold_gate_spins = str_fa_fold_gspins ? atoi(str_fa_fold_gspins)    : opt_fa_fold_gate_spins;
+    opt_fa_fold_pwg     = str_fa_fold_pwg     ? atoi(str_fa_fold_pwg)         : opt_fa_fold_pwg;
+    opt_fa_fold_pwg_stage = str_fa_fold_pwgs  ? atoi(str_fa_fold_pwgs)        : opt_fa_fold_pwg_stage;
+    opt_fa_fold_trace   = str_fa_fold_trace   ? atoi(str_fa_fold_trace)       : opt_fa_fold_trace;
+    opt_fa_fold_ion_ready = str_fa_fold_ionr  ? atoi(str_fa_fold_ionr)        : opt_fa_fold_ion_ready;
+    opt_fa_fold_ktbuf   = str_fa_fold_ktbuf   ? atoi(str_fa_fold_ktbuf)       : opt_fa_fold_ktbuf;
+    opt_fa_fold_notag   = str_fa_fold_notag   ? atoi(str_fa_fold_notag)       : opt_fa_fold_notag;
+    opt_fa_fold_probe   = str_fa_fold_probe   ? atoi(str_fa_fold_probe)       : opt_fa_fold_probe;
+    opt_fa_fold_gate_delay = str_fa_fold_gdelay ? atoi(str_fa_fold_gdelay)    : opt_fa_fold_gate_delay;
+    opt_fa_fold_acq     = str_fa_fold_acq     ? atoi(str_fa_fold_acq)         : opt_fa_fold_acq;
+    opt_fa_fold_trig    = str_fa_fold_trig    ? atoi(str_fa_fold_trig)        : opt_fa_fold_trig;
+    if (opt_fa_fold_trig >= 2) opt_fa_fold_ion_ready = 0;   // the gate must wait for the relay's word, written after the trigger
+    opt_fa_fold_qatomic = str_fa_fold_qatom   ? atoi(str_fa_fold_qatom)       : opt_fa_fold_qatomic;
+    opt_fa_fold_wgfence = str_fa_fold_wgf     ? atoi(str_fa_fold_wgf)         : opt_fa_fold_wgfence;
+    opt_fa_fold_acc16   = str_fa_fold_acc16   ? atoi(str_fa_fold_acc16)       : opt_fa_fold_acc16;
+    opt_fa_fold_knat    = str_fa_fold_knat    ? atoi(str_fa_fold_knat)        : opt_fa_fold_knat;
+    opt_fa_fold_preq_idle = str_fa_fold_pidle ? atoi(str_fa_fold_pidle)       : opt_fa_fold_preq_idle;
+    opt_fa_fold_qmap    = str_fa_fold_qmap    ? atoi(str_fa_fold_qmap)        : opt_fa_fold_qmap;
+    if (opt_fa_fold_check == 1) opt_fa_fold_gpudone = 0;   // the check holds the done words until the reference ran (CHECK=2: post-hoc rows on the chain path)
 #ifndef GGML_HEXAGON_HETERO
     if (opt_hetero_frac > 0.0f) {
         GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_HETERO_FRAC set but the backend was built without OpenCL; ignored\n");
         opt_hetero_frac = 0.0f;
+    }
+    if (opt_fa_fold > 0) {
+        GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_FA_FOLD set but the backend was built without OpenCL; ignored\n");
+        opt_fa_fold = 0;
     }
 #endif
     if (str_cluster) {
