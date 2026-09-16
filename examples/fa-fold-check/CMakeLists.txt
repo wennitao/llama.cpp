@@ -1,0 +1,5 @@
+set(TARGET llama-fa-fold-check)
+add_executable(${TARGET} fa-fold-check.cpp)
+target_link_libraries(${TARGET} PRIVATE ggml ${CMAKE_THREAD_LIBS_INIT})
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-hexagon/htp)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)

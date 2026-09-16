@@ -1,0 +1,8 @@
+set(TARGET llama-fa-hetero-live)
+find_package(OpenCL REQUIRED)
+add_executable(${TARGET} fa-hetero-live.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE ggml OpenCL::OpenCL ${CMAKE_THREAD_LIBS_INIT} ${CMAKE_DL_LIBS})
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-hexagon/htp)
+target_compile_definitions(${TARGET} PRIVATE CL_TARGET_OPENCL_VERSION=300)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
