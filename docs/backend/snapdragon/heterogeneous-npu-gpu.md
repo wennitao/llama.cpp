@@ -9,6 +9,16 @@ two *serially* (neither backend implements events), and decode at depth ~0 is ba
 DRAM the two units share, so the GPU measures the **same** decode rate as the NPU. At real
 context depth decode is bound by the NPU's own attention kernel instead (§4c) — and moving
 that kernel to the GPU loses to crossings before it starts (§4e); the fix is on the NPU.
+For prefill, the natural split — the NPU takes a query tile's *shared* KV blocks, the GPU the
+blocks only one or two sub-blocks wanted, merged by an online-softmax fold — was built end to end
+and is exact (§4j), but the GPU spends 4-5x the time on a block pair that the NPU saves by
+shedding it; the +2-4% the model showed with the split on was reproduced by a *dummy* GPU kernel
+on the same duty cycle (the bus-clock lift of §4i). Taking the host out of the GPU's critical path
+(§4k: a pre-enqueued gate that polls the DSP's `ready` word itself, compaction and staging on the
+GPU, persistent work-groups that finish stages in order, kernel-written done words) and then
+trimming the fold's own handling makes the attention op 1.17x faster than that control, worth ~2%
+end to end and at the edge of what pp4096 throughput resolves through thermal drift; the split
+also needs a sustained-load guard, because the Adreno throttles before the HTP does.
 
 Everything below is SM8750 (Hexagon v79 + Adreno 830), Qwen3-1.7B Q4_0, `llama-bench`
 `-fa 1 -ngl 99`, one binary carrying both backends (`GGML_HEXAGON=ON GGML_OPENCL=ON`).
@@ -582,7 +592,8 @@ again.
   7-9, done visibility ~3) instead of the >=250 us of a fresh launch that Section 4e's budget
   assumed. The usable GPU share is no longer dispatch-bound.
 - Each layer's GPU kernel must be **already running** when the HTP raises `ready`: the GPU
-  cannot poll HTP memory, so a host thread on a big core relays the flag into SVM, and the
+  cannot poll HTP memory with plain loads (§4k later found device-scope *atomic* loads through the
+  ION alias do see the DSP's writes), so a host thread on a big core relays the flag into SVM, and the
   per-layer kernels are enqueued as a chain (0-1 us between them). The kernel spins while it
   waits -- ~1 ms per layer at 4k -- which is power, not latency.
 - The HTP side is the existing split-KV merge with extra partial slots, plus: flush Q and the
@@ -997,6 +1008,532 @@ GPU or CPU side) would bank that for free; until then every HTP+GPU number in th
 is read net of it.
 
 
+## 4j. Built and measured: the prefill split (shared blocks on the NPU, exceptions on the GPU)
+
+The block-sparse prefill kernel (`docs/backend/snapdragon/sparse-attention.md`) serves one
+256-row query tile with the UNION of what its four 64-row sub-blocks selected. The union costs
+recall nothing but costs work: a block wanted by one sub-block is computed for all 256 rows. The
+split idea: count, per tile and KV head, how many sub-blocks wanted each block, `c(b)`; blocks
+with `c(b) >= c*` stay on the NPU as the tile's shared list, blocks below are *exceptions* that the
+GPU computes for exactly the sub-blocks that wanted them, and the two partials are merged by the
+online-softmax identity. `c* = 2` is the operating point: with the deployed threshold scorer
+(`LLAMA_SPARSE_ATTN=thr:1.0`) the union is ~16 blocks per tile and the shared list ~12, so the NPU
+sheds a quarter of its attention work — about 400-530 us of a 2.3-2.6 ms op at `ub=1024`,
+kv=4096, Qwen3-1.7B — if the GPU's part is hidden and the merge is free.
+
+### What was built
+
+Everything below is on the branch, off by default, and exact where a check exists.
+
+- **The fold** (`HTP_FA_FOLD_MAGIC` in `src[7]`, `ggml/src/ggml-hexagon/htp/flash-attn-ops.c`):
+  the HMX op merges another engine's unnormalised `(m, l, acc)` partial into its own output. Three
+  realisations were built and priced: re-aiming the final HMX normalisation diagonal at
+  `w_htp/S_total` (the "diagonal fold"); merging in the store threads against the raw
+  accumulator, whose column-major tile order the store now addresses directly
+  (`HTP_FA_FOLD_F_INSTORE`); and, for comparison only, spilling the HTP's own partial and merging
+  in a separate HVX pass (`HTP_FA_FOLD_F_SPILL`). A finding that decides correctness for any
+  external merge: `vtcm_m_vec` does not hold `m`, it holds `(m + scale) * log2(e)`; the extra
+  term cancels in `O/l` and is invisible to the shipped kernel.
+- **The handshake** (`HTP_FA_FOLD_F_LIVE`, `HTP_FA_FOLD_F_STAGED`, `HTP_FA_FOLD_F_STAGE_QB`): the
+  op publishes `ready` at entry and, instead of one wait before its first tile, takes one wait per
+  *stage* (a 256-row query block across all heads) at the first tile that needs it, runs the
+  tiles without exceptions first, skips the fold on them, and per-stage-invalidates only the rows
+  it is about to read. A head start (`LLAMA_SPARSE_ATTN_HEADSTART=K`) leaves the first K tiles on
+  the union so the GPU's launch latency lands in their shadow.
+- **The GPU side**: mllm's `bs_fa2_fused` exception kernel ported to llama.cpp's tensor layouts
+  (`examples/fa-exc-gpu`), reading Q, V and the mask in place through an ION alias of the hexagon
+  buffers and a `image1d_buffer` view for V, staging only the exception blocks' K transposed, and
+  emitting the C1 triple. Standalone harnesses (`examples/fa-fold-check`, `examples/fa-hetero-live`)
+  run the NPU op, the GPU kernel and the merge over one rpcmem buffer against a double-precision
+  reference, with arms for NPU-only, serial, single-wait live and staged live.
+- **The graph** (`src/llama-graph.cpp`, `src/llama-sparse-attn.h`): `LLAMA_SPARSE_ATTN_CSTAR`
+  cuts the shared list from `c(b)`, hands the exception *membership* (a 0/1 row per sub-block,
+  no packing) to the attention node as `src[8]` (`ggml_flash_attn_ext_set_sparse_exc`), and
+  implements head start and an optional per-tile cap (`LLAMA_SPARSE_ATTN_GPU_CAP`) with HTP-native
+  ops only.
+- **The backend sidecar** (`ggml_hexagon_hfold_*` in `ggml-hexagon.cpp`, `GGML_HEXAGON_FA_FOLD=1`):
+  one fold buffer attached as `src[7]`, per-buffer ION aliases dropped when the buffer is freed,
+  and a relay thread that, per attention op, waits for `ready`, scans the membership into
+  per-head compact block tables, stages K^T through an image write, launches the exception kernel
+  once per query block and publishes `done[stage]` as each completes. A host-reference check of
+  GPU partial rows (`GGML_HEXAGON_FA_FOLD_CHECK=1`) and a keep-alive control
+  (`GGML_HEXAGON_FA_FOLD_KEEPALIVE=<us>`) are built in. `HTP_OP_MAX_INPUTS` went from 8 to 12.
+
+### Op level (harness, unit f3b4a4c5/9aed338b, lq=1024, kv=4096, 16 heads / 8 KV heads)
+
+The merge. Cost over the dense op of the same shape, min of 3 interleaved:
+
+| merge realisation | cost per op | exact |
+|---|---|---|
+| diagonal fold (in the HMX normalisation) | +290 to +350 us | yes, nmse 1.1e-7 |
+| in-store fold, partial prefetched a tile ahead | +113 to +186 us | yes, nmse 7.0e-8 |
+| in-store fold without the prefetch | +980 us | yes |
+| explicit merge on the NPU (spill + HVX pass) | +890 to +920 us | yes |
+| explicit merge on the GPU (earlier, `merge_bench`) | 0.38 ms quiet, 0.61 under HTP load | yes |
+| HTP read-read-write floor for the same 24.6 MB (f32 ADD) | 278 us | — |
+
+The in-store fold is about 4-6 us per tile and is only paid on tiles with exceptions. Its
+prefetch had to be issued from the first chunk's softmax workers, one *linear* l2fetch each: the
+64-bit l2fetch descriptor's stride field is 16 bits (v75 PRM `Rtt[47:32]`), so a 2D fetch cannot
+span GQA heads (512 KB apart) or the two merge regions (8 MB apart) — the first attempts were
+walking the wrong addresses — and requests queue three deep per thread rather than cancelling.
+
+The overlap. Live arms at the deployed-like split (union 16 -> pool 12, exceptions on every head),
+in-store fold, GPU staged per query block:
+
+| arm | attention op | NPU blocked | note |
+|---|---|---|---|
+| A npu-only (union, real sparse kernel) | 3.59 to 3.87 ms | — | the baseline shape |
+| C live, single wait | ~4.9 ms | 1.3 to 2.0 ms | the GPU hides 0% |
+| D staged, head start 0 | 3.9 to 4.1 ms | 0.5 to 0.6 ms | first-stage stall: launch + first stage + event wake-up |
+| D staged, head start 6 | 3.30 ms | 0 | GPU hidden 100%, 1.09x |
+| D staged, half the heads exception-free | −8% to −16% | 0 | reorder buys a clean shadow |
+
+The GPU exception kernel: 0.84-0.86 ms back-to-back for 128 pairs with mllm's mapping (32-row
+work-groups, 2 rows x 8 keys per thread). A 64-row work-group ran 1.87 ms (12 float8 accumulators
+per thread; occupancy collapses) and a 4-rows x 4-keys mapping 1.10 ms (half the texel reads per
+FMA, still slower): the kernel is issue/latency-bound at these launch sizes, not texture-bound,
+and the original mapping is the floor. Under a concurrent HTP prefill it runs 36-38% slower; the
+HTP under a full GPU stream changes <1%.
+
+### Model level (`llama-bench` pp4096, `llama-perplexity` wikitext-2, ctx 4096, ub 1024)
+
+Correctness: 896 GPU partial rows against a double-precision reference, 0 mismatches; perplexity
+on the same two chunks: union 19.6745, split with head start 12 at 19.6362, split with head start
+0 at 19.7034 (the split is a slightly different policy, not bit-equal to the union by design;
+`c* = 0` is bit-identical to the shipped path).
+
+Speed, alternating arms in one session (thermal drift between consecutive runs is 10-20%; only
+adjacent pairs count, see §6):
+
+| configuration | pp4096 | attention op | SWIGLU | fused projection |
+|---|---|---|---|---|
+| union (`CSTAR=0`) | 2388-2397 t/s | 2318 us | 1248 us | 1618 us |
+| union + keep-alive (dummy 1.2 ms GPU kernel / 18 ms, no attention on the GPU) | 2435-2531 t/s | 2242 us | 1147 us | 1563 us |
+| split, head start 12, per-query-block staging | 2400-2408 t/s | 2235-2242 us | 1130 us | 1548 us |
+| split, head start 8 | ≈ union | 2335 us | | |
+| split, GPU cap 4, head start 4 / 6 | below union | 2605 / 2487 us | | |
+
+The dummy kernel alone gives +2 to +6% and shortens every memory-bound DSP op — including the
+union's own attention op — to exactly the numbers the split reaches. The split never beats that
+control. Its own contribution is zero within noise. The mechanism is §4i's: a periodically busy
+GPU raises the shared bus/DDR clocks. Before that control was run, two host-side effects had
+masked and then mimicked a gain: the membership tensor marked as a graph output made
+`ggml_backend_sched` cut one split per layer (76 ms per forward outside DSP ops), and
+`GGML_HEXAGON_VERBOSE=1` costs ~85 ms per forward of logging.
+
+### Why it does not pay
+
+Per (sub-block, block) exception pair the NPU saves ~3 us by shedding it and the GPU spends
+~12 us computing it under contention (~9 us quiet, 5-6.5 us in mllm's large-launch measurement).
+The GPU can only run in the NPU's shadow — the exception work needs this layer's Q, K and V,
+produced immediately before the attention op, and its output is needed immediately after — so it
+can absorb at most ~60% of the pairs the deployed scorer produces (~5.4 per tile per head, ~173
+per op, twice the harness's assumption), and the head start that buys its lead hands the rest of
+the saving back. A per-tile cap does worse: pairs over the cap rejoin the shared list and grow
+the pool. Memory contention is a third of the GPU's cost, small launches another third, the
+kernel the rest; even at zero contention and full launches the GPU would need about twice the NPU
+time it saves per pair. The kernel remaps confirmed the current mapping is the floor. The design
+is complete, exact and shelved.
+
+### Lessons that cost device time
+
+1. ION aliases must be dropped when a hexagon buffer is freed: the compute buffer is reallocated
+   when the ubatch grows, the dmabuf fd is recycled, and an alias keyed by fd keeps the OLD pages
+   alive — the GPU read stale Q and mask from the third ubatch on, deterministically.
+2. K^T written through a buffer alias and read through an image view returns the previous op's
+   keys; the texture cache is only invalidated for image writes. Stage through `write_imageh`.
+3. `ARANGE` and `SUB` are not HTP ops; one CPU node per layer splits the graph (-15%). Build
+   index vectors from `scale_bias(0,1) -> cumsum` and differences from `mul`/`scale_bias`.
+4. A tensor consumed by the backend must not be a graph output once a node depends on it: one
+   `ggml_set_output` per layer = one scheduler split per layer.
+5. Host reference checks after `done` are racy (the next layer overwrites Q at the same
+   address); hold the done words until the reference ran.
+6. The explicit pre-ready flushes of Q/K/V/mask/membership (~32 MB of `dccleaninva` per op) are
+   redundant with the op-start dirty flush (`htp_tensor_flush_all`, whole-L2 above 4 MB).
+7. The raw HMX accumulator is in column-major tile order; only the norm pass makes it row-major.
+8. Staging by KV head reorders the tiles so the mask DMA cache no longer dedups the 8 heads of a
+   query block: ~12 MB of mask per op instead of ~1.6. Stage by query block.
+9. Decompose wall time into profiled DSP-op time and the remainder before blaming either engine;
+   and run the keep-alive control before believing any HTP+GPU gain.
+
+### Status
+
+The prefill split is a working, exact prototype: `LLAMA_SPARSE_ATTN=thr:1.0
+LLAMA_SPARSE_ATTN_CSTAR=2 LLAMA_SPARSE_ATTN_HEADSTART=12 GGML_HEXAGON_FA_FOLD=1
+GGML_HEXAGON_FA_FOLD_PERF=0`. As built here it is not faster than the union baseline once the
+GPU's bus-clock lift is controlled for; §4k removes the launch stall this section blamed and gets
+the attention op to 1.09x over that control, which is the ceiling. What is worth
+carrying forward from it: the in-store fold contract and its findings (the `m` domain, the
+l2fetch descriptor limits, the accumulator layout), the per-stage handshake, and the keep-alive
+observation — a GPU that merely stays busy is worth 2-4% of prefill throughput on any
+configuration, dense included, at the cost of GPU power; whether a bus or DDR performance vote
+gets the same lift without a GPU kernel is the open question.
+
+## 4k. The launch overhead removed: a GPU chain that needs nothing from the host
+
+§4j's ledger left one line the design could still move: the first-stage stall (GPU launch, host
+tables, K^T staging, first stage, event wake-up) was 0.5-1.0 ms, so the head start had to be 12 of
+32 tiles and handed back ~190 us of the ~500 us the pool saves. This section removes that stall.
+Everything is measured on unit f3b4a4c5, Qwen3-1.7B Q4_0, pp4096 at `ub=1024`, the deployed
+scorer (`thr:1.0`, `c* = 2`), and stays exact (perplexity below).
+
+### What changed
+
+- **A gate kernel in front of the chain.** Every attention op's GPU work is one in-order chain,
+  `gate -> stage_k_p -> fa_exc`, enqueued at graph-post time for the whole graph (the first chain
+  from the posting thread itself, the rest from the relay). The gate is a single work-item that
+  spins until it reads the op's sequence number in the DSP's own `ready` word, through the ION
+  alias with device-scope atomic loads, or in a fine-grain SVM mirror the relay writes as a
+  fallback; it then zeroes the op's counters and publishes the sequence, and every kernel behind
+  it checks that word and does nothing if the gate timed out (the relay then runs the old
+  host-driven path). `GGML_HEXAGON_FA_FOLD_PREQ` selects when chains are enqueued (-2 whole graph
+  at post, default; -1 after the previous op's chain; N us before the predicted ready; 0 at ready).
+- **Compaction on the GPU.** The staging kernel builds each KV head's compact exception table in
+  local memory from the membership rows the graph already produces, and the work-group that takes
+  a head's first unit publishes the tables `fa_exc` reads. Nothing is computed on the host after
+  `ready`.
+- **Persistent work-groups.** Both kernels run a fixed number of 128-thread work-groups (64 for
+  staging, 32 for attention, `GGML_HEXAGON_FA_FOLD_PWG*`) that pull units from a counter: staging
+  units head-major, attention units stage-major. Attention stages are (256-row query block, KV
+  head) pairs, `HTP_FA_FOLD_F_STAGE_QBH`, 32 per op at `ub=1024`; the done line moved out of the
+  slot to `hdr.off_done` (up to 64 words). The last work-group of a stage (per-stage atomic count)
+  writes an ION stamp, the ION done word the DSP polls, and an SVM copy for the relay's bookkeeping.
+- **The relay thread is off the critical path.** It mirrors `ready` into SVM, copies SVM done
+  words to the DSP's line (never needed, see below), keeps statistics, and runs the fallback.
+
+### Findings, each measured
+
+1. **GPU writes through the ION alias are visible mid-kernel.** The stamp the kernel writes just
+   before its SVM done word was already visible on the host at the moment the SVM word flipped,
+   for every one of 6528-9728 stages in every run. The DSP polls done words the kernel itself
+   wrote; the host is not in the done path.
+2. **The GPU can poll the DSP's `ready` word.** With device-scope atomic loads on the ION alias the
+   gate opened on the DSP's own word in 194-203 of 204 ops, before the relay (20 us naps) had seen
+   it. §4g's "the GPU cannot poll rpcmem" was true of plain loads, which stay cached. The host is
+   not in the ready path either; gate open is 0-8 us after the relay's own detection.
+3. **Launch shape decides progressive completion.** One plain launch per op (512 work-groups) had
+   the first of 32 stages complete at 2.5 ms of 3.9: every work-group shares the GPU and finishes
+   with the rest. One launch per stage cost ~65 us per boundary and the last stage landed 4.4-5.3
+   ms after ready. Persistent work-groups pulling stage-ordered units complete a stage every 27-30
+   us; 32 work-groups match 64, 128 is slower.
+4. **The real bottleneck behind the gate was the K^T staging**, 1.6 ms when launched over the
+   staging capacity with early exits: the trace showed `stage_k` starting at +115 us and `fa_exc`
+   at +1700. The persistent, count-bounded form takes 110-190 us. Kernel boundaries inside the
+   chain cost 30-100 us each, variable.
+5. **The relay's wake-up matters only for the first op of a graph**, and it matters a lot when the
+   CPU is busy: `llama-perplexity` (logits on the CPU between graphs) blocked the DSP 620 us per op
+   because the first chain went in after `ready`. Enqueuing that chain from the posting thread,
+   before the DSP is dispatched, brought it to 54 us per op (18-22 in `llama-bench`).
+6. **K^T through buffer loads instead of the texture is 25% slower** in the attention units
+   (stage spacing 40 vs 30 us), which rules out merging staging into the attention kernel with
+   per-head readiness (image writes are not coherent with image reads inside one kernel).
+
+Timeline per op (trace, us after `ready`, head start 6): gate open 0-8, `stage_k_p` starts 16-90,
+`fa_exc` starts 175-300, first stage done 196-300, last stage done 1100-1300; the DSP's mean
+blocked time 18-22 us per op.
+
+### Results
+
+Attention op, `GGML_HEXAGON_PROFILE=1`, mean of 224 ops per run, two interleaved repetitions:
+
+| arm | FLASH_ATTN_EXT us | DSP blocked us/op |
+|---|---|---|
+| union (`CSTAR=0`) | 2311 / 2305 | - |
+| union + keep-alive (dummy GPU kernel, §4j control) | 2254 / 2235 | - |
+| split, chain, head start 3 | 2118 / 2134 | 116 |
+| split, chain, head start 4 | 2080 / 2097 | 63 |
+| split, chain, head start 5 | 2063 / 2073 | 38 |
+| split, chain, head start 6 | 2054 / 2066 | 15 |
+
+The split now beats the keep-alive control on the attention op by ~190 us, 1.09x (1.12x against the
+plain union), which §4j's pipeline never did. It sits at the design's own ceiling for this GPU:
+pool ~1800 + in-store fold ~150 + head start 6 ~90. Below 6 tiles the DSP blocks on the first
+stage; above, each tile hands back ~15 us of pool saving.
+
+Correctness: perplexity on the same two wikitext chunks, union 19.6745, split head start 4 19.6065,
+head start 6 19.5747 (the sub-block policy; `c* = 0` stays bit-identical to the shipped path).
+
+End to end (`llama-bench` pp4096, three interleaved rounds, thermal drift between rounds):
+
+| round | union | union + keep-alive | split, head start 6 |
+|---|---|---|---|
+| 1 | 2441 | 2523 | 2470 |
+| 2 | 2321 | 2307 | 2271 |
+| 3 | 2173 | 2170 | 2173 |
+
+The device cooled between the earlier sweeps and heated through this one (-11% over three rounds),
+and the three arms are within that drift of each other in every round. The ~1.3% the profile
+predicts for the split beyond the keep-alive lift is below what pp4096 throughput can resolve here;
+the per-op profile above is the measurement.
+
+### The ledger, measured (unit 9aed338b, every arm with the GPU keep-alive so the bus clock is equal)
+
+`GGML_HEXAGON_FA_FOLD_NOTAG=1` initialises the sidecar (keep-alive) but tags no node, so the NPU
+runs the pool alone: a timing floor whose output lacks the exceptions. Mean FLASH_ATTN_EXT per op,
+two interleaved repetitions:
+
+| arm | us | note |
+|---|---|---|
+| union | 2234 / 2260 | ~15.7 blocks per tile and KV head |
+| pool only, c* = 2, head start 0 | 1614 / 1636 | the split's ceiling; 620 us below the union |
+| pool only, head start 6 | 1730 / 1727 | the head start costs ~100 |
+| split, chain, head start 6 | 2056 / 2056 | DSP blocked 18 us/op |
+| split, chain, head start 0 | 2272 / 2290 | DSP blocked ~300 us/op |
+| pool only, c* = 3 | 1173 / 1149 | |
+| forced blocks only (`thr:99`, sink + own blocks, ~5 per tile) | 819 / 820 | |
+
+From the union, pool and forced-only points: ~4.2 us per (256-token tile, KV head, 64-key block)
+on the NPU, the harness's number, and ~150 us per op that does not scale with blocks. The split
+at head start 6 decomposes as pool 1614 + head start 100 + fold and partial handling ~310 +
+blocked 18. The fold's ~310-355 is well above the harness's 113-186. Timing-only probes
+(`GGML_HEXAGON_FA_FOLD_PROBE=<HTP_FA_FOLD_F_PROBE_* bits>`) split it: skipping the per-stage line
+invalidation of the partial (~8.3 MB of range `dcinva` per op) takes the op from 2063/2071 to
+1947/1958 us, so that invalidation costs ~115 us per op; the rest, ~220 us, is the partial itself
+(7 MB per op read through L2: weights, gathers, the accumulator add). The l2fetch is essential:
+without it the store reads DDR synchronously and the op is 2538/2540 us. Since the op-start flush
+is a whole-L2 flush-invalidate whenever more than 4 MB of inputs are dirty (Q alone is 8 MB at
+`ub=1024`), the per-stage invalidation is redundant at this shape and only needs a cheap guard for
+small ubatches.
+
+### Correctness: the stale-read trap between the DSP and the GPU
+
+Pushing the ledger further first cost a day of correctness work, and the findings matter more than
+the microseconds. Every arm below is `llama-perplexity` on the same two wikitext chunks; the union
+reproduces to four decimals on every unit, so the split has to as well.
+
+- **The GPU read the previous layer's Q.** Pre-enqueued chains read the inputs of the *previous*
+  op that had occupied the same address (the graph allocator reuses buffers layer to layer), for
+  10-20% of the rows checked, and the fold's result changed run to run (19.53 to 19.72 across
+  eight runs). Host reference reads of the same Q rows at `ready` were correct and stable, the
+  values were plausible activations, and neither an acquire fence at all-SVM-devices scope, nor
+  atomic loads, nor a 5 ms hold after `ready`, nor an in-order map/unmap or a migration, nor GPU
+  idle time before the submission changed it. What did: **a submission made after the DSP wrote
+  the data, referencing the buffer**. A one-work-item kernel that takes Q, the mask, the
+  membership, K and V as arguments, submitted by the relay on a second queue when it sees
+  `ready`, with the gate opening only on the relay's word written after that submission, gives
+  0 wrong rows in 204 and a perplexity of 19.5647 on three consecutive runs
+  (`GGML_HEXAGON_FA_FOLD_TRIG=2`, the default). The same kernel submitted but not waited for
+  leaves the mismatches, so it is the submission's cache maintenance that does it. The host is
+  back on the `ready` path for one tiny enqueue (~40 us after the relay's detection).
+- **`hex_l2fetch_block` over-fetches by up to 16 KB.** It rounds every fetch up to whole 16 KB
+  rows, so the partial prefetch pulled the first rows of the *next* query block's stage into the
+  DSP's L2 before the GPU had written them. The per-stage range invalidation happened to clean
+  that up; without it the stale rows were folded. `hex_l2fetch_rows` fetches exact row runs and is
+  what every partial prefetch uses now.
+- **The per-stage invalidation is redundant when a whole-L2 flush-invalidate ran since the last
+  fold read.** The DSP context now carries an epoch bumped by every whole-L2 flush (batch start
+  and end, the op-start flush above 4 MB of dirty inputs); the fold skips the 8 MB of range
+  `dcinva` when the epoch moved and does one whole-L2 invalidate itself otherwise. Doing that
+  whole-L2 flush unconditionally before `ready` cost 18% of pp4096 and fixed nothing, because the
+  stale reads were on the GPU's side.
+- **Determinism is the test.** A split that is "close to the union" can be wrong; two identical
+  runs that disagree to the fourth decimal always are. The check that found the cause snapshots
+  the membership row and the Q row at `ready` and recomputes a few exception rows on the host
+  after the chain finishes (`GGML_HEXAGON_FA_FOLD_CHECK=2`); a reference computed later from the
+  live buffers reads the next layer's inputs and is garbage itself.
+
+Two of the ledger's items landed on top of that, both exact: the fold skips a 32-row group whose
+partial is empty (about a fifth of the groups), and the GPU can write the partial's accumulator as
+f16 (`GGML_HEXAGON_FA_FOLD_ACC16=1`, `HTP_FA_FOLD_F_ACC_F16`), halving the 7 MB per op the fold
+reads, 0 wrong rows in 204 at the f16 tolerance and perplexity 19.5164 twice at head start 8.
+
+### Pushing the ledger: what landed and what it measured
+
+With the correctness settled, the ledger's items went in one by one (unit 9aed338b, attention op
+per call, pp4096, ub 1024, every arm with GPU activity so the bus clock is equal):
+
+- **Epoch-guarded invalidation** (above): 2063 to 1969 us at head start 6 on the same device state.
+- **No K^T staging.** The exception kernel reads K in its natural `[key][d]` layout through an
+  image view of the K cache, exactly as it already read V, and builds each work-group's block list
+  from the membership row with atomic loads. The staging kernel and every table are gone, the
+  chain is gate plus one persistent kernel, and the first stage lands 115-150 us after `ready`
+  instead of 370-390. On an unthrottled GPU its stages also complete sooner (last done 1.24-1.28
+  ms against 1.44-1.50). `GGML_HEXAGON_FA_FOLD_KNAT=1`, **opt-in**: its perplexity did not
+  reproduce (19.6350 twice, then 19.7070) although the reference check passed on every row it
+  probed, including a second-wave row added for it; the staged-K^T path reproduces to four
+  decimals across five runs. One real race was found and fixed (the block list scanned by one
+  thread was read by the other wave before a barrier); whatever remains is not in the rows the
+  check covers. Gating the chain on the trigger's *completion* to rule out a read racing the
+  trigger's maintenance deadlocks instead: the second command queue does not run concurrently
+  with the first on this device, so the trigger lands behind the pre-enqueued chain and every op
+  times out. The submission, not the trigger's execution, is what makes the data visible.
+- **f16 partial accumulator**: 2021 to 1987-2001 us at head start 8, 0 wrong rows in 204 at the
+  f16 tolerance. Default.
+- **Empty 32-row groups skip the accumulator**, bit-exact.
+
+One interleaved round on a device warming from cold (the MUL_MAT mean drifted 855 to 1257 us
+across it, so the later arms carry a thermal handicap):
+
+| arm | FLASH_ATTN_EXT us | DSP blocked us/op |
+|---|---|---|
+| union + keep-alive | 2263 | - |
+| split, staged K^T, f32 partial, head start 6 | 2039 | 89 |
+| split, staged K^T, f32 partial, head start 8 | 2021 | 37 |
+| split, staged K^T, f16 partial, head start 8 | 2001 | 41 |
+| pool only, head start 8 (the floor) | 1766 | - |
+| split, natural K, f32 partial, head start 8 | 1987 | 12 |
+| split, natural K, f32 partial, head start 6 | 1952 | 11 |
+
+The natural-layout kernel with the f16 partial (trigger-gated chain, epoch-guarded invalidation,
+empty groups skipped), two interleaved rounds after an eight-minute cool-down (the MUL_MAT mean
+read 837 us at the start and 1126 at the end, so the later arms carry the handicap). These are
+the fastest numbers measured, and they are the opt-in configuration for the reason above:
+
+| arm | FLASH_ATTN_EXT us, round 1 / 2 | DSP blocked us/op | first stage done after ready |
+|---|---|---|---|
+| union + keep-alive | 2251 / 2251 | - | - |
+| split, natural K, head start 6 | 1931 / 1925 | 16 / 7 | 111-114 us |
+| split, natural K, head start 4 | 1911 / 1921 | 20 / 25 | 110-112 us |
+| split, natural K, head start 3 | 1908 / 1905 | 31 / 27 | 111-113 us |
+
+With the natural-layout kernel the attention op is 1.17x the bus-lifted union's, ~340 us per op;
+end to end the adjacent pairs read +1.2% (2516 vs 2487 t/s) in the cool round and are inside the
+drift in the hot one, as the ~2% the op gain predicts would be. The **shipped default** is the
+staged-K^T path with the f16 partial at head start 8, the configuration that reproduces:
+perplexity 19.5164 on three consecutive runs with the reference check clean, attention op 1995 us
+at head start 8 (DSP blocked 42 us/op) and 2011 at head start 6 (94 us/op) against the union's
+2251, i.e. 1.13x, with the first stage 372 us after `ready` and the last 1.47-1.52 ms.
+
+**A deployment caveat the same sweep exposed.** In its second round the Adreno throttled harder
+than the HTP: the GPU's own time per op went from 1.2-1.5 ms to 2.3-2.8 ms while the union's
+attention op stayed at 2269 us, the NPU stalled behind the GPU for 470-1000 us per op and the
+split's attention op became 2554-3036 us, far worse than the union. The split's gain depends on
+the GPU keeping pace; a sustained-load guard (fall back to the union when the DSP's blocked time
+climbs) would be needed before shipping it.
+
+### Union against split over the prompt length
+
+The shipped defaults (staged K^T, f16 partial, head start 8) against the union, `llama-bench`
+pp512 to pp8192 at `ub=1024`, two interleaved rounds after a cool-down (round 1 / round 2). No
+keep-alive control in this sweep, so the throughput column carries the bus-clock lift of §4i as
+well as the attention gain; the attention-op column is the split's own contribution.
+
+| prompt | union t/s | split t/s | union FLASH_ATTN_EXT us | split FLASH_ATTN_EXT us | split DSP blocked us/op | GPU first / last done after ready |
+|---|---|---|---|---|---|---|
+| 512 | 2382 / 2392 | 2501 / 2550 | 808 / 812 | 766 / 767 | - | - |
+| 1024 | 2516 / 2546 | 2698 / 2687 | 1561 / 1554 | 1405 / 1407 | - | - |
+| 2048 | 2457 / 2427 | 2673 / 2538 | 1793 / 1798 | 1596 / 1588 | 55 / 51 | 347 / 1270 us |
+| 4096 | 2387 / 2263 | 2524 / 2287 | 2301 / 2304 | 1993 / 1994 | 38 / 42 | 371 / 1468 us |
+| 8192 | 2203 / 2004 | 2194 / 1995 | 3345 / 3337 | 3115 / 3118 | 218 / 218 | 480 / 2205 us |
+
+(The per-graph statistics print every eighth graph, so the two-graph runs at 512 and 1024 show
+none.) The attention op gains 5% at 512, 10% at 1024, 11% at 2048, 13% at 4096 and 7% at 8192.
+At 8192 the GPU stops hiding: its per-op time grows to 2.2 ms (more exception blocks per tile
+with 128 KV blocks), the DSP blocks 218 us per op behind it at head start 8, and the union's
+MUL_MAT runs 7% slower under the GPU's heavier K/V traffic (867 to 933 us), so the DSP's total
+time drops 1.5% while throughput is flat. Throughput below 8192 is +5 to +9% in the cool round
+and +1 to +6% in the hot one; the attention gain alone predicts +1 to +2% of that, the rest is
+the bus-clock lift.
+
+### Dense, naive block-64, union and split
+
+The finest sparse granularity the kernel offers is one list per 64-query block with no union
+(`LLAMA_SPARSE_ATTN_BQ` built as 64: `Br 64`, 128 rows per tile), which is the policy the split
+reproduces with pool plus exceptions; dense is the shipped HMX flash attention with no selection.
+Four arms interleaved, two rounds, same protocol (round 1 / round 2; the second round ran hot,
+the dense arm at 8192 dropped 9% between rounds):
+
+| prompt | dense FLASH_ATTN_EXT us | naive bq=64 | union | split |
+|---|---|---|---|---|
+| 512 | 1029 / 1031 | 775 / 780 | 809 / 814 | 766 / 765 |
+| 1024 | 2713 / 2716 | 1716 / 1706 | 1554 / 1562 | 1417 / 1404 |
+| 2048 | 3826 / 3820 | 2011 / 2017 | 1779 / 1785 | 1592 / 1589 |
+| 4096 | 6185 / 6210 | 2658 / 2664 | 2305 / 2325 | 1999 / 1993 |
+| 8192 | 11982 / 12028 | 3917 / 3919 | 3338 / 3343 | 3123 / 3120 |
+
+| prompt | dense t/s | naive bq=64 | union | split |
+|---|---|---|---|---|
+| 512 | 2441 / 2310 | 2384 / 2350 | 2364 / 2320 | 2525 / 2472 |
+| 1024 | 2455 / 2208 | 2488 / 2350 | 2512 / 2348 | 2715 / 2428 |
+| 2048 | 2311 / 2001 | 2445 / 2188 | 2467 / 2202 | 2657 / 2256 |
+| 4096 | 1996 / 1730 | 2310 / 2028 | 2290 / 2003 | 2327 / 2029 |
+| 8192 | 1474 / 1340 | 1965 / 1779 | 1924 / 1764 | 1911 / 1771 |
+
+Attention op relative to dense (round 1): naive 1.33x, 1.58x, 1.90x, 2.33x, 3.06x from 512 to
+8192; union 1.27x, 1.75x, 2.15x, 2.68x, 3.59x; split 1.34x, 1.91x, 2.40x, 3.09x, 3.84x. The
+split is 2% below the naive baseline at 512 and 18-25% below it from 1024 up (25% at 4096); the
+union sits between the two (9-14% below naive from 1024 up, 4% above it at 512, where forced
+blocks dominate and the union's over-compute is pure loss). The naive baseline costs only 1.15x
+the union with the threshold scorer, not the 1.7x of the fixed-u measurement in
+`dynamic-sparse-attention.md` §5.3: its per-block lists are exact and shorter, which pays back
+part of the small-tile inefficiency. End to end, naive and union are equal (the R = 1 selection
+has no union step, so it skips the per-tile argsort and buys back its slower attention); the
+split leads both below 8192 and matches them at 8192, where its GPU stops hiding (see above).
+Against dense, throughput is +3%, +11%, +15%, +17%, +30% for the split and -3%, +2%, +7%, +15%,
++31% for the union, from 512 to 8192 in the cool round. Perplexity on the two wikitext chunks:
+dense 20.1955, naive 19.9329, union 19.6745, split 19.5164 (standard error about 1.1 on each;
+two chunks are a smoke test, not a quality measurement); the naive arm was expected to match the
+split's policy, so its gap points at a selection-side difference of the `BQ=64` build rather
+than at the kernel, and was not chased.
+
+### The controlled experiment: one set of wanted pairs, three executions
+
+Everything above compares *policies* as much as executions: the union attends more pairs than the
+block-64 build, and the split, whose rows also see the pool blocks that two or more *other*
+sub-blocks selected, sits between them (its perplexity differs from the exact policy's for that
+reason, 19.52 against 19.93-19.99 on the two chunks). To isolate execution, the wanted set is
+held fixed (the same threshold scorer, one list per 64-query block) and executed three ways:
+
+- **small-tile NPU**: the `bq=64` build, `Br 64`, computes exactly the wanted pairs;
+- **large-tile NPU, unwanted pairs masked**: `LLAMA_SPARSE_ATTN_EXACT=1`, the 256-query tile runs
+  its union list and the HMX softmax sets every (32-row group, KV block) the group's sub-block did
+  not select to `-inf` (one bit per 64-key vector, the chunk's block ids hoisted), so it computes
+  the union's pairs and keeps the exact result. Reproducible (19.9962 twice, 19.9887 after the
+  hoist; the block-64 build reads 19.9329);
+- **heterogeneous**: the split, pool on the NPU and the sub-blocks' own exceptions on the GPU.
+
+Unit f3b4a4c5 after a redeploy, round 1 / round 2; the masked arm's hoisted numbers are one
+round of a separate cool run against a union rerun (the unhoisted masking, 13-20% over the union,
+was my bookkeeping and not the execution):
+
+| prompt | small-tile NPU (bq=64) | large-tile NPU masked | union (same compute as masked) | heterogeneous split |
+|---|---|---|---|---|
+| 512 | 779 / 784 | 858 | 820 / 829 | 767 / 772 |
+| 1024 | 1711 / 1713 | 1612 | 1542 / 1549 | 1409 / 1412 |
+| 2048 | 2017 / 2019 | 1890 | 1785 / 1790 | 1585 / 1591 |
+| 4096 | 2665 / 2668 | 2512 | 2324 / 2333 | 1995 / 2006 |
+| 8192 | 3932 / 3933 | 3636 | 3353 / 3356 | 3238 / 3132 |
+
+Throughput (t/s, round 1 / round 2): small-tile 2454 / 2403, 2524 / 2544, 2489 / 2425, 2332 /
+2260, 2102 / 1985; union 2427 / 2397, 2586 / 2558, 2507 / 2401, 2401 / 2204, 2091 / 1951; split
+2565 / 2566, 2762 / 2680, 2652 / 2483, 2500 / 2265, 2061 / 1968.
+
+Reading: for the same wanted pairs, cooperation is the fastest execution on this SoC. The split
+is 18-25% below the small-tile NPU from 1024 to 4096 and 18-20% below it at 8192, and 13-14%
+below the large-tile NPU at 4096 and 8192 whether the unwanted pairs are masked (2512, 3636) or
+simply kept (2324, 3353). The small tile loses to the large tile even though it computes 42%
+fewer units: re-streaming K and V per 64 rows and running the HMX at four row tiles cost more than
+the compute it saves, and the masked large tile cannot recover that because masking discards
+results, not work. What the split removes is the union's over-compute on the c = 1 blocks, and it
+does so at a GPU rate that only pays because the GPU runs in the NPU's shadow: at 8192 the shadow
+is no longer long enough (DSP blocked 222-345 us per op) and the three executions converge.
+
+### What it means
+
+The launch overhead is gone in the sense that matters: between the DSP's `ready` and the GPU's
+first stage there is one tiny host submission (the trigger the correctness section made
+necessary), the first stage lands 115-150 us later, and the DSP stops blocking at a head start
+of a few tiles instead of 12. With the fold's own handling trimmed (epoch-guarded invalidation,
+f16 partial, empty groups skipped) the attention op is 1.16x faster than the bus-lifted union
+(1911 vs 2251 us at head start 4 with the natural-layout kernel, cooled device, two rounds; the
+reproducible default lands near 1.12x), against 1.09x for §4k's first chain and 1.0x for §4j.
+That is ~340 us per op at best, ~38 ms per pp4096 forward, about +2% end to end beyond the
+keep-alive lift; the pool-only floor (1766 us at head start 8, ~1700 at 4) says ~200 us of fold
+and partial handling remain, and the GPU's per-pair rate is the same ~7 us against ~3 us of NPU saving, so
+this is close to the whole prize on this SoC, as §4j predicted. The gate work-item spins for ~90%
+of the op period; that is the same GPU duty the keep-alive control uses, and the same power
+caveat, plus the throttling caveat above.
+
+Settings: `LLAMA_SPARSE_ATTN=thr:1.0 LLAMA_SPARSE_ATTN_CSTAR=2 LLAMA_SPARSE_ATTN_HEADSTART=8
+GGML_HEXAGON_FA_FOLD=1 GGML_HEXAGON_FA_FOLD_PERF=0`. Defaults: the chain with persistent
+work-groups and whole-graph pre-enqueue, the gate opened by the relay's word after its trigger
+submission (`TRIG=2`), staged K^T (`KNAT=0`; `KNAT=1` is the faster, not yet reproducible
+variant), f16 partial (`ACC16=1`), device-scope per-group fences (`WGFENCE=0`). `GGML_HEXAGON_FA_FOLD_GPUDONE=0` restores §4j's host-driven path,
+`GGML_HEXAGON_FA_FOLD_CHECK=2` runs the snapshot reference check, `GGML_HEXAGON_FA_FOLD_TRACE=N`
+prints per-stage timelines, `GGML_HEXAGON_FA_FOLD_PROBE=<bits>` ORs `HTP_FA_FOLD_F_PROBE_*` into the
+fold header.
+
 ## 5. What would change the answer
 
 - **Events in both backends.** OpenCL already uses `cl_event` throughout (its `synchronize` is a
@@ -1039,6 +1576,16 @@ is read net of it.
   touches no memory makes HTP-only decode 5-10% faster (DSP batch 24.3 -> 22.2 ms/token at d0).
   Every HTP+GPU comparison in that configuration needs an HTP-only + `llama-gpu-keepalive` arm;
   with the lm-head on the CPU the token-level effect is ~1%. A busy CPU core does not do it.
+- `GGML_HEXAGON_VERBOSE=1` costs ~85 ms per pp4096 forward of host logging; never leave it on in a
+  timed arm, and read the per-op DSP profile (`GGML_HEXAGON_PROFILE=1`) for op times instead.
+- Thermal drift between consecutive pp4096 runs on the QDC units is 10-20% (MUL_MAT 858 -> 1111 us
+  across four runs), and memory-bound ops speed up while HMX ops slow down, which looks exactly
+  like GPU contention. Only adjacent A/B pairs count; use `-r 2` or `-r 3`.
+- The QDC pod's adb server is reached through an ssh forward on local 5037; `adb kill-server`
+  kills the pod's server and only a new session brings it back. Units and their `/data/local/tmp`
+  rotate between sessions (9aed338b <-> f3b4a4c5).
+- Host library and HTP skeleton must be pushed as a pair (again): the op descriptor now carries
+  12 inputs (`src[8]` is the exception membership).
 - `/sys/devices/system/cpu/bus_dcvs/DDR/cur_freq` is the CPU cluster's DDR vote, not the DDR
   clock (no readable aggregate without root), and `kgsl-3d0/gpuclk` reads 900 MHz even with the
   GPU idle on this unit. The KV the decode op sees is the padded cache (768 keys at d512, 4352
