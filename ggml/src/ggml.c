@@ -5527,6 +5527,21 @@ void ggml_flash_attn_ext_set_sparse_cnt(
     a->src[6] = cnt;
 }
 
+void ggml_flash_attn_ext_set_sparse_exc(
+        struct ggml_tensor * a,
+        struct ggml_tensor * exc) {
+    if (!exc) {
+        a->src[8] = NULL;
+        return;
+    }
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] != NULL);   // exceptions qualify a selection
+    GGML_ASSERT(a->src[8] == NULL);
+    GGML_ASSERT(exc->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(exc));
+    a->src[8] = exc;
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {

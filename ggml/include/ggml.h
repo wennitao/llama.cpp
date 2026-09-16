@@ -2441,6 +2441,14 @@ extern "C" {
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 
+    // Optional exception membership for a heterogeneous sparse flash-attention op (src[8]):
+    // F32 0/1 [n_kv_blocks, R, NBq/R, n_kv_heads], the KV blocks each 64-token sub-block wants
+    // that the shared selection in src[5] does not carry. A backend that can hand those to a
+    // second engine folds that engine's partial into the op; every other backend ignores it.
+    GGML_API void ggml_flash_attn_ext_set_sparse_exc(
+            struct ggml_tensor * a,
+            struct ggml_tensor * exc);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

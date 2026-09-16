@@ -14457,6 +14457,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // ---------------------------------------------------------------------------------
+    // THE HETERO SPLIT: what one 64-row query sub-block costs on each engine.
+    //
+    // A fused query tile of k=4 sub-blocks runs ONE union list of u blocks. Splitting it
+    // gives the NPU the SHARED blocks -- a smaller u at bq=256, already priced by the grid
+    // above -- and the GPU the per-sub-block EXCEPTIONS: 64 query rows over n_exc blocks of
+    // 64 keys each. Dense FA at kv = n_exc*64, nb = 64 IS that unit of work, so the same
+    // rows run on GPUOpenCL and on HTP0 give both the GPU's rate and what the NPU pays to
+    // keep the exceptions itself (its bq=64 tax regime). nb=256 at the same kv prices the
+    // other candidate split: whole query tiles to the GPU, no partial merge at all.
+    //
+    // Gather is not modelled here. A real exception kernel indexes scattered KV blocks;
+    // these rows read a contiguous kv, so they are a LOWER bound on both engines.
+    for (int n_exc : { 1, 2, 3, 4, 6, 8, 12, 16, 24, 32 }) {
+        for (int nb : { 64, 256 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {2, 1}, n_exc*64, nb, /*mask=*/false, false, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+
     // MEANPOOL against the XAttention and QUOKA scorers already measured, same shapes.
     // kmean=0 is the deployable form (K pooled at cache-write time); kmean=1 prices doing
     // it inline so the amortisation is measured rather than assumed.
