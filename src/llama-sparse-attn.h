@@ -134,6 +134,14 @@ static inline bool llama_sparse_attn_debug() {
     return s && atoi(s) != 0;
 }
 
+// Block scorer for threshold selection. LLAMA_SPARSE_ATTN_SCORER=reps4 scores every query
+// head's four sampled rows against four K representatives per block; the default is the
+// sampled mean.
+static inline bool llama_sparse_attn_reps4() {
+    const char * s = getenv("LLAMA_SPARSE_ATTN_SCORER");
+    return s && strcmp(s, "reps4") == 0;
+}
+
 // n_kv_blocks the HMX kernel will choose for a given u. Transcribed from
 // hmx_fa_find_chunk_size (ggml/src/ggml-hexagon/htp/flash-attn-ops.h:370+) and checked
 // against the device's own fa-params line at 20 values of u: 20/20 exact.

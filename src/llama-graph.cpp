@@ -2703,6 +2703,83 @@ static ggml_tensor * llama_sparse_halve1(ggml_context * ctx, ggml_tensor * a, in
     return a;
 }
 
+// Sum over ne[1] by halving, without the copy: the add of two strided views is already contiguous.
+static ggml_tensor * llama_sparse_halve1_views(ggml_context * ctx, ggml_tensor * a, int64_t n) {
+    for (; n > 1; n /= 2) {
+        ggml_tensor * lo = ggml_view_4d(ctx, a, a->ne[0], n/2, a->ne[2], a->ne[3],
+                                        a->nb[1], a->nb[2], a->nb[3], 0);
+        ggml_tensor * hi = ggml_view_4d(ctx, a, a->ne[0], n/2, a->ne[2], a->ne[3],
+                                        a->nb[1], a->nb[2], a->nb[3], (size_t)(n/2)*a->nb[1]);
+        a = ggml_add(ctx, lo, hi);
+    }
+    return a;
+}
+
+// The block reach bias b3 [NBk, NBq] repeated over the representatives of a block and the sampled rows of
+// a query block: [nr*NBk, nqs*NBq]. It depends only on positions, so the caller shares it across layers.
+// Blocks padded so the 4*NBk representative axis fills whole 32-lane rows: Hexagon's HMX batched
+// product takes only whole 32-row tiles of src0 and its softmax only 32-aligned rows.
+static int64_t llama_sparse_reps4_padded(int64_t NBk) {
+    return GGML_PAD(NBk, 8);
+}
+
+static ggml_tensor * llama_sparse_reps4_mask(ggml_context * ctx, ggml_tensor * b3, int64_t NBq, int64_t NBk) {
+    const int64_t nqs = LLAMA_SPARSE_ATTN_QSUB;
+    const int64_t nr  = 4;
+    const int64_t NBp = llama_sparse_reps4_padded(NBk);
+    ggml_tensor * m = ggml_reshape_4d(ctx, ggml_cont(ctx, b3), 1, NBk, 1, NBq);
+    if (NBp != NBk) {
+        // padding blocks take the unreachable bias -1e9 (set_input_sparse_bias): shifted by 1e9, the
+        // zero padding lands there, and 0 / -1e9 entries shift back exactly
+        m = ggml_scale_bias(ctx, ggml_pad(ctx, ggml_scale_bias(ctx, m, 1.0f, 1e9f), 0, (int) (NBp - NBk), 0, 0), 1.0f, -1e9f);
+    }
+    return ggml_reshape_2d(ctx, ggml_repeat_4d(ctx, m, nr, NBp, nqs, NBq), nr*NBp, nqs*NBq);
+}
+
+// Four-representative block probabilities, [NBk, NBq, Hkv], one row per fine query block.
+//
+// Every query head keeps its QSUB sampled rows per block, and every K block becomes four
+// representatives, the means of adjacent pairs of its KSUB sampled rows. Each sampled row is
+// normalized over all visible representatives, the probabilities are summed within each block,
+// and the sampled rows and the G heads of a group are averaged. The ops are those of the
+// validated standalone graph (variant 19): Q as a strided view, representatives unpacked.
+static ggml_tensor * llama_sparse_reps4_probs(ggml_context * ctx, ggml_tensor * q_cur, ggml_tensor * k_samples,
+                                              ggml_tensor * m, int64_t Hkv, int64_t NBq, int64_t NBk, int64_t bq) {
+    const int64_t d   = q_cur->ne[0];
+    const int64_t Hq  = q_cur->ne[1];
+    const int64_t G   = Hq / Hkv;
+    const int64_t nqs = LLAMA_SPARSE_ATTN_QSUB;
+    const int64_t nks = LLAMA_SPARSE_ATTN_KSUB;
+    const int64_t nr  = 4;
+
+    // K: [d*Hkv, nks, NBk] -> pairs [d*Hkv, nks/nr, nr*NBk] -> means [d, nr*NBk, Hkv], representative
+    // index nr*block + r. Rounded to F16: Hexagon's HMX takes a batched (GQA) product only with an
+    // F16 src0, and its F32 fallback does not fit VTCM with the strided Q view.
+    const int64_t NBp = llama_sparse_reps4_padded(NBk);
+    ggml_tensor * k = ggml_reshape_3d(ctx, ggml_cast(ctx, k_samples, GGML_TYPE_F32), d*Hkv, nks/nr, nr*NBk);
+    k = ggml_scale(ctx, llama_sparse_halve1_views(ctx, k, nks/nr), (float) nr / (float) nks);
+    if (NBp != NBk) {
+        k = ggml_pad(ctx, ggml_reshape_2d(ctx, k, d*Hkv, nr*NBk), 0, (int) (nr*(NBp - NBk)), 0, 0);  // zero, masked in m
+    }
+    k = ggml_cast(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, k, d, Hkv, nr*NBp), 0, 2, 1, 3), GGML_TYPE_F16);
+
+    // Q: rows 0, bq/nqs, ... of every fine block, [d, nqs*NBq, Hq], row index nqs*block + s
+    ggml_tensor * q = ggml_view_3d(ctx, q_cur, d, nqs*NBq, Hq, (size_t)(bq/nqs)*q_cur->nb[2], q_cur->nb[1], 0);
+
+    ggml_tensor * s = ggml_mul_mat(ctx, k, q);                   // [nr*NBp, nqs*NBq, Hq]
+    ggml_mul_mat_set_prec(s, GGML_PREC_F32);
+
+    ggml_tensor * p = ggml_soft_max_ext(ctx, s, m, 1.0f / sqrtf((float) d), 0.0f);
+    p = ggml_sum_rows(ctx, ggml_reshape_4d(ctx, p, nr, NBp, nqs*NBq, Hq));                  // [1, NBp, nqs*NBq, Hq]
+    if (NBp != NBk) {
+        p = ggml_reshape_2d(ctx, p, NBp, nqs*NBq*Hq);
+        p = ggml_cont(ctx, ggml_view_2d(ctx, p, NBk, nqs*NBq*Hq, p->nb[1], 0));
+    }
+    p = llama_sparse_halve1_views(ctx, ggml_reshape_4d(ctx, p, NBk, nqs, NBq, Hq), nqs);     // [NBk, 1, NBq, Hq]
+    p = llama_sparse_halve1_views(ctx, ggml_reshape_3d(ctx, p, NBk*NBq, G, Hkv), G);        // [NBk*NBq, 1, Hkv]
+    return ggml_scale(ctx, ggml_reshape_3d(ctx, p, NBk, NBq, Hkv), 1.0f / (float) (nqs*G));
+}
+
 // meanpool block scoring: mean(Q rows of a query block) . mean(K rows of a KV block).
 //
 // Both reductions use the WHOLE ROW as the unit -- [n_embd_gqa, rows, blocks] -- because in
@@ -2762,30 +2839,43 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
         return nullptr;
     }
 
-    // K: [n_embd_k_gqa, ksub, NBk] -> [n_embd_k_gqa, 1, NBk] -> [d, NBk, Hkv]
-    ggml_tensor * km = llama_sparse_halve1(ctx0, mctx_cur->get_k_pool_src(ctx0, il, bs, ksub), ksub);
-    km = ggml_reshape_3d(ctx0, km, d, Hkv, NBk);
-    km = ggml_cont(ctx0, ggml_permute(ctx0, km, 0, 2, 1, 3));
-    cb(km, "sparse_k_pool", il);
-
-    // Q: [d*Hq, qsub, NBq] -> [d*Hq, 1, NBq] -> sum over G -> [d, NBq, Hkv]
-    ggml_tensor * qv = ggml_view_3d(ctx0, q_cur, d*Hq, qsub, NBq,
-                                    (size_t)(bq/qsub)*q_cur->nb[2], (size_t)bq*q_cur->nb[2], 0);
-    ggml_tensor * qm = llama_sparse_halve1(ctx0, qv, qsub);
-    qm = ggml_reshape_4d(ctx0, qm, d, G, Hkv, NBq);          // query head h = kv_head*G + j
-    qm = llama_sparse_halve1(ctx0, qm, G);
-    qm = ggml_reshape_3d(ctx0, qm, d, Hkv, NBq);
-    qm = ggml_cont(ctx0, ggml_permute(ctx0, qm, 0, 2, 1, 3));
-    // Every mean's divisor folds here, with 1/sqrt(d). Only the RANKING matters, so the
-    // scale is cosmetic -- but it keeps the scores on the same footing as real logits, which
-    // is what makes the bias leaf's magnitudes meaningful.
-    qm = ggml_scale(ctx0, qm, 1.0f / ((float) qsub * (float) G * (float) ksub * sqrtf((float) d)));
-    cb(qm, "sparse_q_pool", il);
-
-    ggml_tensor * sc = ggml_mul_mat(ctx0, km, qm);           // [NBk, NBq, Hkv]
-    ggml_mul_mat_set_prec(sc, GGML_PREC_F32);
+    // Four representatives score the threshold (fine-row) leaves only.
+    const bool reps4 = llama_sparse_attn_reps4();
+    if (reps4 && !thr) {
+        static bool once = false;
+        if (!once) {
+            once = true;
+            LLAMA_LOG_ERROR("sparse-attn: LLAMA_SPARSE_ATTN_SCORER=reps4 needs LLAMA_SPARSE_ATTN=thr:<c>, using the mean scorer\n");
+        }
+    }
 
     ggml_tensor * b3 = ggml_view_3d(ctx0, bias, NBk, NBq, 1, bias->nb[1], bias->nb[2], 0);
+
+    ggml_tensor * sc = nullptr;
+    if (!(reps4 && thr)) {
+        // K: [n_embd_k_gqa, ksub, NBk] -> [n_embd_k_gqa, 1, NBk] -> [d, NBk, Hkv]
+        ggml_tensor * km = llama_sparse_halve1(ctx0, mctx_cur->get_k_pool_src(ctx0, il, bs, ksub), ksub);
+        km = ggml_reshape_3d(ctx0, km, d, Hkv, NBk);
+        km = ggml_cont(ctx0, ggml_permute(ctx0, km, 0, 2, 1, 3));
+        cb(km, "sparse_k_pool", il);
+
+        // Q: [d*Hq, qsub, NBq] -> [d*Hq, 1, NBq] -> sum over G -> [d, NBq, Hkv]
+        ggml_tensor * qv = ggml_view_3d(ctx0, q_cur, d*Hq, qsub, NBq,
+                                        (size_t)(bq/qsub)*q_cur->nb[2], (size_t)bq*q_cur->nb[2], 0);
+        ggml_tensor * qm = llama_sparse_halve1(ctx0, qv, qsub);
+        qm = ggml_reshape_4d(ctx0, qm, d, G, Hkv, NBq);          // query head h = kv_head*G + j
+        qm = llama_sparse_halve1(ctx0, qm, G);
+        qm = ggml_reshape_3d(ctx0, qm, d, Hkv, NBq);
+        qm = ggml_cont(ctx0, ggml_permute(ctx0, qm, 0, 2, 1, 3));
+        // Every mean's divisor folds here, with 1/sqrt(d). Only the RANKING matters, so the
+        // scale is cosmetic -- but it keeps the scores on the same footing as real logits, which
+        // is what makes the bias leaf's magnitudes meaningful.
+        qm = ggml_scale(ctx0, qm, 1.0f / ((float) qsub * (float) G * (float) ksub * sqrtf((float) d)));
+        cb(qm, "sparse_q_pool", il);
+
+        sc = ggml_mul_mat(ctx0, km, qm);                         // [NBk, NBq, Hkv]
+        ggml_mul_mat_set_prec(sc, GGML_PREC_F32);
+    }
 
     if (thr) {
         // The per-row adaptive rule (see llama_sparse_attn_thr): membership per fine
@@ -2800,7 +2890,18 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
         const float   c    = llama_sparse_attn_thr();
         const int64_t R    = LLAMA_SPARSE_ATTN_BQ / bq;      // fine rows per attention block
 
-        ggml_tensor * pm = ggml_soft_max(ctx0, ggml_add(ctx0, sc, b3));
+        ggml_tensor * pm;
+        if (reps4) {
+            if (sparse_reps4_bias != bias) {
+                sparse_reps4_bias = bias;
+                sparse_reps4_mask = llama_sparse_reps4_mask(ctx0, b3, NBq, NBk);
+            }
+            pm = llama_sparse_reps4_probs(ctx0, q_cur, mctx_cur->get_k_pool_src(ctx0, il, bs, ksub), sparse_reps4_mask,
+                                          Hkv, NBq, NBk, bq);
+            cb(pm, "sparse_reps4_prob", il);
+        } else {
+            pm = ggml_soft_max(ctx0, ggml_add(ctx0, sc, b3));
+        }
         ggml_tensor * av = ggml_view_3d(ctx0, bias, 1, NBq, 1, bias->nb[1], bias->nb[2],
                                         (size_t) NBk * bias->nb[0]);
         pm = ggml_mul(ctx0, pm, av);
@@ -2949,7 +3050,24 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
             *cnt_out = cnt;
         }
 
-        ggml_tensor * ranked = ggml_argsort(ctx0, um, GGML_SORT_ORDER_DESC);
+        ggml_tensor * ranked;
+        if (reps4) {
+            // The HTP sort is much slower at non-power-of-two lengths (1.57 ms vs 60 us for 112 vs 128
+            // blocks), so sort a padded row. Members sort as 2, other blocks as 1 and padding as 0: the
+            // first NBk entries are then exactly the row's blocks, members first.
+            int64_t width = 32;
+            while (width < NBk) {
+                width *= 2;
+            }
+            ggml_tensor * key = ggml_scale_bias(ctx0, um, 1.0f, 1.0f);
+            if (width != NBk) {
+                key = ggml_pad(ctx0, key, (int) (width - NBk), 0, 0, 0);
+            }
+            ranked = ggml_argsort(ctx0, key, GGML_SORT_ORDER_DESC);
+            ranked = ggml_view_3d(ctx0, ranked, NBk, ranked->ne[1], ranked->ne[2], ranked->nb[1], ranked->nb[2], 0);
+        } else {
+            ranked = ggml_argsort(ctx0, um, GGML_SORT_ORDER_DESC);
+        }
         cb(ranked, "sparse_ranked", il);
         return ranked;                                        // full-length rows; cnt truncates
     }

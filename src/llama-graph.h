@@ -1040,6 +1040,11 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
+    // four-representative reach mask, built once per graph from this bias input and shared by every layer
+    mutable ggml_tensor * sparse_reps4_bias = nullptr;
+    mutable ggml_tensor * sparse_reps4_mask = nullptr;
+
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 

@@ -2323,6 +2323,11 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (llama_sparse_attn_thr() != 0.0f || llama_sparse_attn_density() != 0) {
         res += 32u * model.hparams.n_layer();
     }
+    // Four representatives (LLAMA_SPARSE_ATTN_SCORER=reps4) add the representative views, the
+    // repeated mask and the padded sort: ~20 more per layer.
+    if (llama_sparse_attn_reps4()) {
+        res += 32u * model.hparams.n_layer();
+    }
     // The heterogeneous split (LLAMA_SPARSE_ATTN_CSTAR) adds its membership nodes, the head-start
     // index and the GPU cap on top: ~30 more per layer, which llama-bench's reserve hit as
     // GGML_ASSERT(obj_new) in ggml_new_object.
