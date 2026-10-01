@@ -25,6 +25,7 @@
 #include <unordered_set>
 
 #include "llama-sparse-attn.h"
+#include "llama-xattention.h"
 
 // dedup helpers
 
@@ -3109,6 +3110,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     ggml_tensor * cur;
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    const bool use_xattention = llama_xattention_threshold() > 0.0f && q->ne[1] > 256;
+    if (use_xattention) {
+        GGML_ASSERT(use_flash_attn && q->ne[1] % 256 == 0 && n_stream == 1);
+        GGML_ASSERT(!sparse_sel && !sinks && !v_mla && !hparams.attn_soft_cap && hparams.f_max_alibi_bias == 0.0f);
+    }
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -3125,20 +3131,30 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
-                                  hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
-
-        ggml_flash_attn_ext_add_sinks(cur, sinks);
-        ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
-
-        if (sparse_sel) {
-            ggml_flash_attn_ext_set_sparse(cur, sparse_sel, LLAMA_SPARSE_ATTN_BS, sparse_bq);
-            if (sparse_cnt) {
-                ggml_flash_attn_ext_set_sparse_cnt(cur, sparse_cnt);
+        if (use_xattention) {
+            if (xattn_mask != kq_mask) {
+                xattn_mask = kq_mask;
+                const auto inputs = llama_xattention_inputs(ctx0, q->ne[1], q->ne[2], k->ne[1], kq_mask);
+                xattn_indices = inputs.first;
+                xattn_reduced = inputs.second;
             }
-            if (sparse_exc) {
-                ggml_flash_attn_ext_set_sparse_exc(cur, sparse_exc);
+            cur = llama_xattention_build(ctx0, q, k, v, kq_mask, xattn_indices, xattn_reduced, kq_scale, il);
+        } else {
+            cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                                      hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+
+            ggml_flash_attn_ext_add_sinks(cur, sinks);
+            ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+
+            if (sparse_sel) {
+                ggml_flash_attn_ext_set_sparse(cur, sparse_sel, LLAMA_SPARSE_ATTN_BS, sparse_bq);
+                if (sparse_cnt) {
+                    ggml_flash_attn_ext_set_sparse_cnt(cur, sparse_cnt);
+                }
+                if (sparse_exc) {
+                    ggml_flash_attn_ext_set_sparse_exc(cur, sparse_exc);
+                }
             }
         }
 

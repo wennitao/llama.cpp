@@ -1044,6 +1044,10 @@ struct llm_graph_context {
     mutable ggml_tensor * sparse_reps4_bias = nullptr;
     mutable ggml_tensor * sparse_reps4_mask = nullptr;
 
+    // XAttention's reversed-row indices and reduced causal mask, built once per graph for this mask
+    mutable ggml_tensor * xattn_mask    = nullptr;
+    mutable ggml_tensor * xattn_indices = nullptr;
+    mutable ggml_tensor * xattn_reduced = nullptr;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
