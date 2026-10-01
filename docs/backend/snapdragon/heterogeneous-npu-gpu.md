@@ -2080,6 +2080,59 @@ Overlapping shadow has the lowest mean steady decode latency among the heterogen
 
 The reproducible driver, balanced-order runner, exact device commands, all 30 logs, per-token times, output hashes, paired comparisons, CPU affinity checks, binary hashes and governor restoration records are in `/tmp/hetero-e2e-bound-20260916/`. No backend implementation changed for this sweep.
 
+## 4m. Prefill against XAttention with naive 64-block NPU attention, on RULER prompts (2026-09-30, unit 57dd7911)
+
+The paper's baseline is now XAttention B64 scoring followed by naive 64-block NPU attention, and its
+four-representative "union" arm is gone. Accuracy is the existing CUDA cohort; latency is new: full-model
+prefill of five RULER variable-tracking prompts per context (4054-4060 and 7918-8162 tokens), in the accuracy
+evaluation's microbatches (1024-token chunks, a remainder above 256 rounded down to 256s, a dense tail), with
+`prefill_bench` (docs/papers/heterogeneous-inference/data/accuracy-validation/sm8750/ruler-prefill/). Three
+rounds, every run gated at 50 C: one XAttention run at 8k lasts minutes and heats the board past 80 C, and a
+pilot gated once per block let the split, run last at 85 C, tie naive 64-block attention.
+
+**Making the baseline fair cost four fixes**, all exact against the previous graph (see the paper's CHECKS.md):
+
+- HTP `CONCAT` copied one element at a time (11.8 ms per layer at 4k to rejoin XAttention's two GQA lanes).
+  `concat-ops.c` now copies whole slabs when all three tensors are contiguous: 0.6 ms, 48/48 op tests.
+- The reversed-row indices and reduced mask were CPU custom ops built in every layer (a graph split each);
+  they are built once per graph. The CPU cumulative selection was single-threaded; it now uses every thread.
+- The membership argsort is padded to a power of two, as in the four-representative path. This changes only
+  the order of blocks inside a list: two-chunk perplexity 20.0038 -> 19.9868, and an unpadded build of the same
+  tree gives 20.0038 again.
+- **When n_kv is not a multiple of 512 keys** (3840 for a 768-query chunk), the HMX batched product
+  (`hmx_mm_f16_f32_batched` needs src0 rows % 32) and the HTP softmax (`ne0 % 32` or <= 32) are rejected.
+  XAttention's score product fell to a 37.8 ms vector path, and **the four-representative selector's product and
+  softmax ran on the CPU** -- never seen before because every llama-bench prompt is a multiple of 1024. Both
+  selectors now pad the key axis with masked zero keys (`llama_xattention_padded_keys`, `llama_sparse_reps4_padded`):
+  bit-identical on the host CPU, and the 768-query chunk of the split went 447 -> 363 ms.
+
+XAttention's per-query-head masks need one list per query head, but the kernel takes one list per K/V head, so
+they run as two GQA lanes (G = 1, 64-row tiles): about 2.8x the time per selected block of the single GQA call.
+`LLAMA_XATTN_GQA=union` ORs each pair's masks into one list per K/V head instead (a superset of the evaluated
+selection). It is the paper's main XAttention baseline: on CUDA (`--xattention-share-kv`) it scores 86.46 on RULER 4k
+at 62.17% density, +0.08 [-0.22, +0.37] over per-head XAttention and +0.85 [+0.42, +1.26] over four representatives.
+
+| Prefill per prompt (s), median of 3 rounds | 4k | 8k |
+|---|---:|---:|
+| Dense | 2.15 | 5.62 |
+| XAttention + naive 64, per-head masks | 3.73 | 9.66 |
+| XAttention + naive 64, masks per K/V head | 2.76 | 6.66 |
+| Four representatives + naive 64 | 2.11 | 4.82 |
+| Four representatives + split (ours) | 1.92 | 4.44 |
+
+Every arm's rounds agree within 1.8%. XAttention is slower than dense at both lengths: per layer over the prompt
+it spends 8.8/26.3 ms of NPU scoring and 14.4/33.8 ms of CPU selection and graph synchronization (per K/V head,
+4k/8k) before attention. The split is 1.44x/1.50x faster than XAttention with masks per K/V head, 1.94x/2.18x with
+per-head masks, 12%/28% faster than dense, and 10%/9% faster than naive 64-block attention with the same scorer.
+Phone block density 4k/8k: XAttention per head 49.9/42.1%, per K/V head 60.7/53.1%, four-rep naive 43.0/36.0%,
+split executed 52.6/43.2%. Eight-chunk WikiText perplexity (unit e8b7f0c8, same binaries; values are
+unit-independent): dense 17.7145, XAttention per head 17.7994, per K/V head 17.6700, four-rep naive 17.1482,
+split 17.3954. No GPU keep-alive control was run (user decision); the split's gain over the NPU-only arms
+therefore includes any GPU-activity effect, and it vanishes under GPU throttling (llama-bench round 3 at 8k).
+
+Operational: the adb tunnel died mid-run and a polling `adb devices` auto-started a LOCAL adb server that took
+port 5037, so the user's new ssh forward could not bind. Never run adb unless 5037 is the ssh listener.
+
 ## 5. What would change the answer
 
 - **Events in both backends.** OpenCL already uses `cl_event` throughout (its `synchronize` is a
@@ -2101,6 +2154,7 @@ The reproducible driver, balanced-order runner, exact device commands, all 30 lo
 
 ## 6. Operational notes (they cost runs)
 
+- **Required affinity for future benchmarks.** Bind benchmark threads to the fastest performance cores and match both decode and batch CPU worker counts to the selected cores. On unit `9aed338b`, the fastest pair is cores 6 and 7 (mask `0xc0`, two workers). Check CPU topology again when the device changes. For `llama-completion`, use `taskset c0 ./bin/llama-completion ... -t 2 -tb 2 --cpu-mask 0xc0 --cpu-strict 1 --cpu-mask-batch 0xc0 --cpu-strict-batch 1`. Verify effective per-thread affinity and record it with the thread counts, governors and observed clocks. Keep these settings identical across comparison arms. The historical measurements above retain their original settings; specifically, the 30.12/30.15 ms frequency-control comparison was not pinned. A performance governor does not substitute for thread affinity.
 - `llama-bench` separators: `,` separates **test configurations**; `/` separates devices or
   split proportions **within** one. `-dev HTP0,GPUOpenCL -ts 24,4` runs HTP0-only twice and a
   GPU-only config — it never runs a split. The heterogeneous form is
@@ -2130,6 +2184,7 @@ The reproducible driver, balanced-order runner, exact device commands, all 30 lo
 - The QDC pod's adb server is reached through an ssh forward on local 5037; `adb kill-server`
   kills the pod's server and only a new session brings it back. Units and their `/data/local/tmp`
   rotate between sessions (9aed338b <-> f3b4a4c5).
+- Before running ADB, check `ss -ltnp '( sport = :5037 )'` and require an SSH listener. Running `adb devices` without the forward starts a local ADB server that occupies port 5037 and prevents the tunnel from reconnecting. If this happens, stop only the confirmed local ADB listener PID; do not send `adb kill-server` through the tunnel.
 - Host library and HTP skeleton must be pushed as a pair (again): the op descriptor now carries
   12 inputs (`src[8]` is the exception membership).
 - `/sys/devices/system/cpu/bus_dcvs/DDR/cur_freq` is the CPU cluster's DDR vote, not the DDR
