@@ -20,6 +20,7 @@
 #define GGML_COMMON_DECL_CPP
 #include "ggml-common.h"
 #include "htp-ops.h"
+#include "ggml-hexagon/cluster-attn.cl.h"
 
 #include <CL/cl.h>
 #include <CL/cl_ext.h>
@@ -34,11 +35,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <fstream>
+#include <sstream>
 #include <sched.h>
 #include <string>
 #include <time.h>
 #include <unistd.h>
 #include <vector>
+#include <deque>
 
 extern "C" int rpcmem_to_fd(void * po);
 
@@ -117,6 +121,19 @@ struct options {
     int    scatter = 0;        // runs mode: the kernel gathers a run's rows from the positional cache (one descriptor per row)
     int    perm_chunk = 0;     // runs mode: shuffle positions within o.chunk-sized windows (chunk-local clusters)
     int    gpu_gather = 0;     // GPU gather kernel over per-head index lists vs the streaming kernel (no HTP op)
+    int    hetero = 0;         // runs mode: the GPU attends the selected runs from the cache (HTP_FA_CLUSTER_HDR_GPU_RUNS)
+    std::vector<int> keep = { 0 };   // hetero: percent of the selected blocks the HTP keeps (from the shadow), one arm each
+    int    qmode = 1;          // hetero: 1 = the GPU reads Q with atomic loads, 0 = plain loads (stale-cache test)
+    int    gnsplit = 4;        // hetero: GPU partials (work-groups) per KV head
+    int    pos_runs = -1;      // minimum positional run for the HTP; 0 = all selected rows on GPU
+    int    prepared = 0;
+    int    gpu_shadow = 0;    // GPU reads cluster-ordered shadow rows
+    int    overlap = 0;
+    int    reorder = 0;
+    int    gpu_rows = 0;     // shares are GPU row caps instead of HTP block percentages
+    std::string positions;    // replay file: one line of selected non-sink positions per KV head
+    int    gpu_select = 0;     // hetero: the GPU also selects the runs (HTP_FA_CLUSTER_HDR_GPU_SELECT); no DSP select pass, no kept runs
+    int    pollfirst = 0;      // hetero (timing): the DSP polls for done right after ready, before its own work -> exact GPU turnaround
     int    seed      = 1234;
 };
 
@@ -126,7 +143,12 @@ static void usage() {
            "       llama-hetero-decode-attn --cluster [--kv N] [--density PCT] [--sel contig|scatter] [--skew F]\n"
            "         [--nslots N] [--desc 1d|2d] [--window W] [--perm identity|random|chunk] [--pmu] [--select-device] [--page-keys 16|32|64] [--iters N] [--seed N]\n"
            "       llama-hetero-decode-attn --cluster --runs [--scatter] [--csize N] [--chunk N] [--perm identity|random|chunk] ...\n"
-           "       llama-hetero-decode-attn --gpu-gather [--kv N] [--density PCT] [--span N] [--csize N] [--chunk N] [--iters N] [--seed N]\n");
+           "       llama-hetero-decode-attn --gpu-gather [--kv N] [--density PCT] [--span N] [--csize N] [--chunk N] [--iters N] [--seed N]\n"
+           "       llama-hetero-decode-attn --cluster --runs --hetero [--keep P1,P2,..] [--gnsplit N] [--qmode 0|1] [--gpu-shadow] ...\n"
+           "       llama-hetero-decode-attn --cluster --runs --hetero [--overlap|--overlap-barrier] [--reorder] ...\n"
+           "       llama-hetero-decode-attn --cluster --runs --hetero --gpu-rows R1,R2,.. [--gpu-shadow] ...\n"
+           "       llama-hetero-decode-attn --cluster --runs --hetero --pos-runs N [--positions FILE] ...\n"
+           "       llama-hetero-decode-attn --cluster --runs --hetero --prepared-runs N [--positions FILE] ...\n");
 }
 
 static bool parse(int argc, char ** argv, options & o) {
@@ -163,6 +185,19 @@ static bool parse(int argc, char ** argv, options & o) {
         else if (a == "--perm")     { if (i + 1 >= argc) return false; const std::string pm = argv[++i]; o.perm_identity = pm == "identity"; o.perm_chunk = pm == "chunk"; }
         else if (a == "--scatter")  { o.scatter = 1; }
         else if (a == "--gpu-gather") { o.gpu_gather = 1; }
+        else if (a == "--hetero")   { o.hetero = 1; }
+        else if (a == "--qmode")    { if (!next_i(o.qmode)) return false; }
+        else if (a == "--gnsplit")  { if (!next_i(o.gnsplit)) return false; }
+        else if (a == "--pos-runs") { if (!next_i(o.pos_runs) || o.pos_runs < 0 || o.pos_runs > 64) return false; }
+        else if (a == "--prepared-runs") { if (!next_i(o.pos_runs) || o.pos_runs < 0 || o.pos_runs > 64) return false; o.prepared = 1; }
+        else if (a == "--positions") { if (i + 1 >= argc) return false; o.positions = argv[++i]; }
+        else if (a == "--gpu-select") { o.gpu_select = 1; }
+        else if (a == "--gpu-shadow") { o.gpu_shadow = 1; }
+        else if (a == "--overlap") { o.overlap = 1; }
+        else if (a == "--overlap-barrier") { o.overlap = 2; }
+        else if (a == "--reorder") { o.reorder = 1; }
+        else if (a == "--pollfirst") { o.pollfirst = 1; }
+        else if (a == "--keep" || a == "--gpu-rows") { if (i + 1 >= argc) return false; o.gpu_rows = a == "--gpu-rows"; o.keep.clear(); std::string v = argv[++i]; size_t p0 = 0; while (p0 <= v.size()) { size_t p1 = v.find(',', p0); if (p1 == std::string::npos) p1 = v.size(); o.keep.push_back((int) strtol(v.substr(p0, p1 - p0).c_str(), nullptr, 0)); p0 = p1 + 1; } }
         else if (a == "-v")         { o.verbose = 1; }
         else if (a == "--modes") {
             if (i + 1 >= argc) return false;
@@ -177,6 +212,23 @@ static bool parse(int argc, char ** argv, options & o) {
     if (o.d != 128) { fprintf(stderr, "only d=128 is built into the GPU kernel\n"); return false; }
     if (o.nh % o.nkvh) { fprintf(stderr, "nh must be a multiple of nkvh\n"); return false; }
     if (o.gpu_frac < 0 || o.gpu_frac > 1) { fprintf(stderr, "--gpu-frac in [0,1]\n"); return false; }
+    if ((o.pos_runs >= 0 && (!o.cluster || !o.runs || !o.hetero || o.gpu_select)) || (!o.positions.empty() && (!o.cluster || !o.runs || o.gpu_select))) {
+        fprintf(stderr, "--pos-runs requires --cluster --runs --hetero; --positions requires --cluster --runs; neither supports --gpu-select\n"); return false;
+    }
+    if (o.pos_runs >= 0) o.scatter = 1;
+    if (o.prepared && o.inplace) { fprintf(stderr, "--prepared-runs cannot use --inplace pages\n"); return false; }
+    if ((o.gpu_shadow || o.gpu_rows) && (!o.cluster || !o.runs || !o.hetero || o.pos_runs >= 0 || o.gpu_select || o.inplace || o.scatter)) {
+        fprintf(stderr, "--gpu-shadow and --gpu-rows require shadow-backed --cluster --runs --hetero with DSP selection\n"); return false;
+    }
+    if ((o.overlap || o.reorder) && (!o.cluster || !o.runs || !o.hetero || o.pos_runs >= 0 || o.gpu_select || o.inplace || o.scatter)) {
+        fprintf(stderr, "--overlap and --reorder require --cluster --runs --hetero with DSP selection\n"); return false;
+    }
+    if (o.overlap && (!o.positions.empty() || o.density <= 0 || o.pollfirst)) {
+        fprintf(stderr, "--overlap requires live DSP selection and cannot use --pollfirst\n"); return false;
+    }
+    if (o.reorder && o.gpu_shadow) { fprintf(stderr, "--reorder has no shadow for --gpu-shadow\n"); return false; }
+    if (o.hetero && (o.nkvh > HTP_FA_CLUSTER_MAX_HEADS || o.nkvh * HTP_FA_HETERO_SEL_STRIDE > HTP_FA_HETERO_STATUS_OFF - HTP_FA_HETERO_SEL_OFF)) return false;
+    if (o.gpu_rows) for (int n : o.keep) if (n < 0 || n > 6400 || n % 64) { fprintf(stderr, "--gpu-rows values must be multiples of 64 in [0,6400]\n"); return false; }
     return true;
 }
 
@@ -414,13 +466,240 @@ __kernel void fa_dec_gather(__global uchar * base,
         part[32 + t] = o_acc[g];
     }
 }
+
+#define SEL_MAX 64
+// GPU-side selection + gather: every work-group of a KV head scores the head's centroids against its
+// query rows, sorts the candidates (bitonic, in local memory), walks the greedy fill to the row budget
+// exactly as the DSP's select pass does (forced runs free and first, empty runs never, whole runs while
+// they fit), and gathers its share of the resulting rows. Group sp == 0 also publishes the block list
+// as the DSP-format records plus a list-ready word, for the DSP's kept share and for the tool's check.
+__kernel void fa_dec_runs_sel(__global uchar * base,
+                              uint q_off, uint k_off, uint v_off, uint nbq2, uint nbk1, uint nbk2, uint nbv1, uint nbv2,
+                              uint cent_off, uint cent_hstride, uint cent_bytes, uint runs_off, uint runs_hstride, uint n_cand, uint budget,
+                              uint sel_off, uint sel_stride, uint posmap_off, uint posmap_hstride,
+                              uint p_off, uint part_stride, uint nsplit, float scale,
+                              uint ready_off, uint cnt_off, uint done_off, uint list_off, uint want, uint max_spin, uint qmode) {
+    const int  t   = get_local_id(0);
+    const int  kvh = get_group_id(1);
+    const int  sp  = get_group_id(2);
+    const uint n_groups = get_num_groups(1) * get_num_groups(2);
+
+    __local float Q_l[FA_G][FA_D];
+    __local float S_l[FA_G][FA_D];
+    __local float red[FA_G][FA_D];
+    __local uint  I_l[FA_D];
+    __local float  sc[512];
+    __local uint   run_row[512], run_w[512];
+    __local ushort order[512];
+    __local uint   b_row[SEL_MAX], b_row2[SEL_MAX], b_bsz[SEL_MAX], b_bsz2[SEL_MAX], b_pre[SEL_MAX + 1];
+    __local uint   n_blk_l;
+
+    if (t == 0) {
+        uint it = 0;
+        while (atomic_load_explicit((volatile __global atomic_uint *)(base + ready_off), memory_order_acquire, memory_scope_all_svm_devices) != want && it < max_spin) { it++; }
+    }
+    barrier(CLK_GLOBAL_MEM_FENCE);
+
+    for (int g = 0; g < FA_G; ++g) {
+        __global const uint * qw = (__global const uint *)(base + q_off + (kvh * FA_G + g) * nbq2);
+        const uint bits = (qmode & 1) ? atomic_load_explicit((volatile __global atomic_uint *)(qw + t), memory_order_relaxed, memory_scope_all_svm_devices) : qw[t];
+        Q_l[g][t] = as_float(bits) * scale;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // scores: candidate i = run i of this head, folded over the group's query rows by max
+    const uint ncand = min(n_cand, 512u);
+    __global const uint * runs_tab = (__global const uint *)(base + runs_off + kvh * runs_hstride);
+    // debug bits (timing only): 16 = no centroid loads (score = -i), 32 = no rank loop (order = identity),
+    // 64 = no records / list publish
+    for (uint i = t; i < ncand; i += FA_D) {
+        const uint rw = runs_tab[i * 2 + 1];   // n_rows | flags << 16
+        run_row[i] = runs_tab[i * 2];
+        run_w[i]   = rw;
+        float sco = -INFINITY;
+        if (qmode & 16) {
+            sco = -(float) i;
+        } else {
+            __global const half * c = (__global const half *)(base + cent_off + kvh * cent_hstride + i * cent_bytes);
+            float8 acc[FA_G];
+            for (int g = 0; g < FA_G; ++g) acc[g] = (float8)(0.0f);
+            #pragma unroll
+            for (int d8 = 0; d8 < FA_D / 8; ++d8) {
+                const float8 c8 = convert_float8(vload8(d8, c));
+                for (int g = 0; g < FA_G; ++g) acc[g] += c8 * vload8(d8, Q_l[g]);
+            }
+            for (int g = 0; g < FA_G; ++g) {
+                const float8 a8 = acc[g];
+                sco = fmax(sco, a8.s0 + a8.s1 + a8.s2 + a8.s3 + a8.s4 + a8.s5 + a8.s6 + a8.s7);
+            }
+        }
+        if (rw >> 16 & 1u) sco = INFINITY;              // forced (the sinks)
+        else if ((rw & 0xffffu) == 0) sco = -INFINITY;   // empty
+        sc[i] = sco;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // rank by score (descending, ties by lower index) in one barrier-free pass: order[rank] = candidate.
+    // Lanes read the table in rotated order so no two lanes touch the same word in a step (same-address
+    // local reads serialize on this GPU).
+    for (uint i = t; i < ncand; i += FA_D) {
+        uint r = i;
+        if (!(qmode & 32)) {
+            const float si = sc[i];
+            r = 0;
+            uint j = t % ncand;
+            for (uint n = 0; n < ncand; ++n) {
+                const float sj = sc[j];
+                r += (sj > si) || (sj == si && j < i);
+                j = (j + 1 == ncand) ? 0 : j + 1;
+            }
+        }
+        order[r] = (ushort) i;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // greedy fill in rank order (the DSP's rule), expanded into 64-row blocks; group 0 publishes it
+    if (t == 0) {
+        uint nb = 0, cum = 0, taken = 0;
+        for (uint o = 0; o < ncand && nb < SEL_MAX; ++o) {
+            const uint i = order[o];
+            if (sc[i] == -INFINITY) break;
+            const uint rw = run_w[i];
+            const uint n_rows = rw & 0xffffu;
+            const bool forced = (rw >> 16 & 1u) != 0;
+            if (!forced) {
+                if (cum + n_rows > budget && taken > 0) break;
+                cum += n_rows;
+                taken++;
+            }
+            const uint row_first = run_row[i];
+            for (uint r0 = 0; r0 < n_rows && nb < SEL_MAX; r0 += 64) {
+                b_row[nb] = row_first + r0; b_bsz[nb] = min(64u, n_rows - r0); b_row2[nb] = 0; b_bsz2[nb] = 0;
+                nb++;
+            }
+            if (!forced && cum >= budget) break;
+        }
+        n_blk_l = nb;
+        uint pre = 0;
+        for (uint i = 0; i < nb; ++i) { b_pre[i] = pre; pre += b_bsz[i]; }
+        b_pre[nb] = pre;
+        if (sp == 0 && !(qmode & 64)) {
+            __global uint * rec = (__global uint *)(base + sel_off + kvh * sel_stride);
+            rec[0] = nb;
+            for (uint i = 0; i < nb; ++i) { rec[32 + i * 4] = b_row[i]; rec[33 + i * 4] = 0; rec[34 + i * 4] = b_bsz[i]; rec[35 + i * 4] = 0; }
+            atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_seq_cst, memory_scope_all_svm_devices);
+            atomic_store_explicit((volatile __global atomic_uint *)(base + list_off), want, memory_order_seq_cst, memory_scope_all_svm_devices);
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    const uint n_blk = n_blk_l;
+    const uint tot = b_pre[n_blk];
+    const uint per = (tot + nsplit - 1) / nsplit;
+    const uint r0  = min(tot, (uint) sp * per);
+    const uint r1  = min(tot, r0 + per);
+    __global const uint * pmap = (__global const uint *)(base + posmap_off + kvh * posmap_hstride);
+
+    float m_run[FA_G], l_run[FA_G], o_acc[FA_G];
+    for (int g = 0; g < FA_G; ++g) { m_run[g] = -INFINITY; l_run[g] = 0.0f; o_acc[g] = 0.0f; }
+
+    for (uint bs = r0; bs < r1; bs += FA_D) {
+        const int blk_n = (int) min((uint) FA_D, r1 - bs);
+        {
+            const uint ri = bs + min((uint) t, (uint) (blk_n - 1));
+            uint j = 0;
+            while (j + 1 < n_blk && b_pre[j + 1] <= ri) { j++; }
+            const uint off  = ri - b_pre[j];
+            const uint srow = off < b_bsz[j] ? b_row[j] + off : b_row2[j] + (off - b_bsz[j]);
+            I_l[t] = pmap[srow];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        float s[FA_G];
+        for (int g = 0; g < FA_G; ++g) s[g] = -INFINITY;
+        if (t < blk_n) {
+            __global const half * krow = (__global const half *)(base + k_off + I_l[t] * nbk1 + kvh * nbk2);
+            float8 acc[FA_G];
+            for (int g = 0; g < FA_G; ++g) acc[g] = (float8)(0.0f);
+            #pragma unroll
+            for (int d8 = 0; d8 < FA_D / 8; ++d8) {
+                const float8 k8 = convert_float8(vload8(d8, krow));
+                for (int g = 0; g < FA_G; ++g) acc[g] += k8 * vload8(d8, Q_l[g]);
+            }
+            for (int g = 0; g < FA_G; ++g) {
+                const float8 a8 = acc[g];
+                s[g] = (a8.s0 + a8.s1 + a8.s2 + a8.s3 + a8.s4 + a8.s5 + a8.s6 + a8.s7);
+            }
+        }
+        for (int g = 0; g < FA_G; ++g) red[g][t] = s[g];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int o = FA_D / 2; o > 0; o >>= 1) {
+            if (t < o) { for (int g = 0; g < FA_G; ++g) red[g][t] = fmax(red[g][t], red[g][t + o]); }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        float m_new[FA_G], a[FA_G], p[FA_G];
+        for (int g = 0; g < FA_G; ++g) {
+            m_new[g] = fmax(m_run[g], red[g][0]);
+            a[g]     = (m_run[g] == -INFINITY) ? 0.0f : native_exp(m_run[g] - m_new[g]);
+            p[g]     = (t < blk_n && !isinf(s[g]) && m_new[g] != -INFINITY) ? native_exp(s[g] - m_new[g]) : 0.0f;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int g = 0; g < FA_G; ++g) { S_l[g][t] = p[g]; red[g][t] = p[g]; }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int o = FA_D / 2; o > 0; o >>= 1) {
+            if (t < o) { for (int g = 0; g < FA_G; ++g) red[g][t] += red[g][t + o]; }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        for (int g = 0; g < FA_G; ++g) { l_run[g] = a[g] * l_run[g] + red[g][0]; m_run[g] = m_new[g]; }
+
+        {
+            float pv[FA_G];
+            for (int g = 0; g < FA_G; ++g) pv[g] = 0.0f;
+            __global const uchar * vbase = base + v_off + kvh * nbv2 + t * 2;
+            for (int c = 0; c < blk_n; c += 32) {
+                const uint8 oa = vload8((c >> 3) + 0, I_l), ob = vload8((c >> 3) + 1, I_l), oc = vload8((c >> 3) + 2, I_l), od = vload8((c >> 3) + 3, I_l);
+                float8 va, vb, vc, vd;
+#define LDV(dst, o8) \
+                dst.s0 = vload_half(0, (__global const half *)(vbase + o8.s0 * nbv1)); dst.s1 = vload_half(0, (__global const half *)(vbase + o8.s1 * nbv1)); \
+                dst.s2 = vload_half(0, (__global const half *)(vbase + o8.s2 * nbv1)); dst.s3 = vload_half(0, (__global const half *)(vbase + o8.s3 * nbv1)); \
+                dst.s4 = vload_half(0, (__global const half *)(vbase + o8.s4 * nbv1)); dst.s5 = vload_half(0, (__global const half *)(vbase + o8.s5 * nbv1)); \
+                dst.s6 = vload_half(0, (__global const half *)(vbase + o8.s6 * nbv1)); dst.s7 = vload_half(0, (__global const half *)(vbase + o8.s7 * nbv1));
+                LDV(va, oa) LDV(vb, ob) LDV(vc, oc) LDV(vd, od)
+#undef LDV
+                for (int g = 0; g < FA_G; ++g) {
+                    const float8 pa = vload8((c >> 3) + 0, S_l[g]) * va + vload8((c >> 3) + 1, S_l[g]) * vb
+                                    + vload8((c >> 3) + 2, S_l[g]) * vc + vload8((c >> 3) + 3, S_l[g]) * vd;
+                    pv[g] += pa.s0 + pa.s1 + pa.s2 + pa.s3 + pa.s4 + pa.s5 + pa.s6 + pa.s7;
+                }
+            }
+            for (int g = 0; g < FA_G; ++g) o_acc[g] = o_acc[g] * a[g] + pv[g];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    for (int g = 0; g < FA_G; ++g) {
+        const int row = kvh * FA_G + g;
+        __global float * part = (__global float *)(base + p_off + ((ulong) row * nsplit + sp) * part_stride);
+        if (t == 0) { part[0] = (r0 < r1) ? m_run[g] : HTP_M_INIT; part[1] = l_run[g]; }
+        part[32 + t] = o_acc[g];
+    }
+    barrier(CLK_GLOBAL_MEM_FENCE);
+    if (t == 0 && !(qmode & 128)) {   // 128 = measurement re-run: leave the counter and done alone
+        atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_seq_cst, memory_scope_device);
+        const uint old = atomic_fetch_add_explicit((volatile __global atomic_uint *)(base + cnt_off), 1u, memory_order_acq_rel, memory_scope_device);
+        if (old + 1 == want * n_groups) {
+            atomic_work_item_fence(CLK_GLOBAL_MEM_FENCE, memory_order_seq_cst, memory_scope_all_svm_devices);
+            atomic_store_explicit((volatile __global atomic_uint *)(base + done_off), want, memory_order_seq_cst, memory_scope_all_svm_devices);
+        }
+    }
+}
 )CL";
+
 
 // ---------------------------------------------------------------------------------------
 
 struct gpu_side {
     cl_platform_id plat = nullptr; cl_device_id dev = nullptr; cl_context ctx = nullptr; cl_command_queue q = nullptr;
-    cl_program prog = nullptr; cl_kernel k_fa = nullptr; cl_kernel k_ga = nullptr; cl_mem alias = nullptr; uint32_t * svm = nullptr;
+    cl_program prog = nullptr; cl_kernel k_fa = nullptr; cl_kernel k_ga = nullptr; cl_kernel k_runs = nullptr; cl_kernel k_sel = nullptr; cl_mem alias = nullptr; uint32_t * svm = nullptr;
 };
 
 static bool cl_check(cl_int err, const char * what) {
@@ -439,8 +718,10 @@ static bool gpu_init(gpu_side & g, const options & o, uint8_t * base, size_t buf
     cl_queue_properties qp[] = { CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0 };
     g.q = clCreateCommandQueueWithProperties(g.ctx, g.dev, qp, &err); if (!cl_check(err, "queue")) return false;
 
-    char opts[128]; snprintf(opts, sizeof(opts), "-cl-std=CL2.0 -DFA_D=%d -DFA_G=%d", o.d, o.nh / o.nkvh);
-    g.prog = clCreateProgramWithSource(g.ctx, 1, &cl_src_fa, nullptr, &err); if (!cl_check(err, "program")) return false;
+    const int runs_max = HTP_FA_HETERO_SEL_MAX_BLK * (o.pos_runs >= 0 && o.kv > 8192 ? 2 : 1);
+    char opts[128]; snprintf(opts, sizeof(opts), "-cl-std=CL2.0 -DFA_D=%d -DFA_G=%d -DRUNS_MAX=%d -DGPU_SHADOW=%d", o.d, o.nh / o.nkvh, runs_max, o.gpu_shadow || o.reorder);
+    const char * sources[] = { cl_src_fa, ggml_hexagon_cluster_attn_cl };
+    g.prog = clCreateProgramWithSource(g.ctx, 2, sources, nullptr, &err); if (!cl_check(err, "program")) return false;
     err = clBuildProgram(g.prog, 1, &g.dev, opts, nullptr, nullptr);
     if (err != CL_SUCCESS) {
         size_t ln = 0; clGetProgramBuildInfo(g.prog, g.dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &ln);
@@ -449,6 +730,8 @@ static bool gpu_init(gpu_side & g, const options & o, uint8_t * base, size_t buf
     }
     g.k_fa = clCreateKernel(g.prog, "fa_dec_gqa", &err); if (!cl_check(err, "kernel")) return false;
     g.k_ga = clCreateKernel(g.prog, "fa_dec_gather", &err); if (!cl_check(err, "kernel gather")) return false;
+    g.k_runs = clCreateKernel(g.prog, "fa_dec_runs", &err); if (!cl_check(err, "kernel runs")) return false;
+    g.k_sel = clCreateKernel(g.prog, "fa_dec_runs_sel", &err); if (!cl_check(err, "kernel runs_sel")) return false;
 
     cl_uint page = 0; clGetDeviceInfo(g.dev, CL_DEVICE_PAGE_SIZE_QCOM, sizeof(page), &page, nullptr); if (!page) page = 4096;
     cl_mem_ion_host_ptr ion = {};
@@ -567,7 +850,8 @@ static bool prof_last(double * usec, double * axi) {
 
 // CPU reference over an explicit key set of (position, apply_mask) pairs, normalised.
 static void ref_attn_keys(const options & o, const uint8_t * base, const layout & L, int h,
-                          const std::vector<std::pair<int, bool>> & keys, std::vector<double> & out) {
+                          const std::vector<std::pair<int, bool>> & keys, std::vector<double> & out,
+                          const uint32_t * physical_rows = nullptr) {
     const int kvh = h / (o.nh / o.nkvh);
     const float * q = (const float *) (base + L.q + (size_t) h * o.d * 4);
     const ggml_fp16_t * mask = (const ggml_fp16_t *) (base + L.mask);
@@ -576,7 +860,8 @@ static void ref_attn_keys(const options & o, const uint8_t * base, const layout 
     double M = -INFINITY;
     for (size_t i = 0; i < keys.size(); ++i) {
         const int p = keys[i].first;
-        const ggml_fp16_t * kr = (const ggml_fp16_t *) (base + L.k + (size_t) p * L.nbk1 + (size_t) kvh * L.nbk2);
+        const uint32_t row = physical_rows ? physical_rows[p] : p;
+        const ggml_fp16_t * kr = (const ggml_fp16_t *) (base + L.k + (size_t) row * L.nbk1 + (size_t) kvh * L.nbk2);
         double dot = 0;
         for (int d = 0; d < o.d; ++d) dot += (double) q[d] * ggml_fp16_to_fp32(kr[d]);
         s[i] = dot * scale + (keys[i].second ? (double) ggml_fp16_to_fp32(mask[p]) : 0.0);
@@ -589,7 +874,8 @@ static void ref_attn_keys(const options & o, const uint8_t * base, const layout 
         const double w = exp(s[i] - M);
         S += w;
         const int p = keys[i].first;
-        const ggml_fp16_t * vr = (const ggml_fp16_t *) (base + L.v + (size_t) p * L.nbk1 + (size_t) kvh * L.nbk2);
+        const uint32_t row = physical_rows ? physical_rows[p] : p;
+        const ggml_fp16_t * vr = (const ggml_fp16_t *) (base + L.v + (size_t) row * L.nbk1 + (size_t) kvh * L.nbk2);
         for (int d = 0; d < o.d; ++d) out[d] += w * ggml_fp16_to_fp32(vr[d]);
     }
     for (int d = 0; d < o.d; ++d) out[d] = S > 0 ? out[d] / S : 0.0;
@@ -608,6 +894,80 @@ static int run_cluster_runs(const options & o, ggml_backend_t be, ggml_backend_b
     const uint32_t rows_max = hdr.n_pages_max * hdr.page_keys;
     const size_t head_stride = (size_t) hdr.n_pages_max * hdr.page_bytes;
     const size_t row_bytes = (size_t) o.d * 2;
+    std::vector<std::vector<int>> replay(o.nkvh);
+    std::vector<std::vector<htp_fa_cluster_blk>> replay_blocks(o.nkvh);
+    std::vector<std::vector<uint32_t>> replay_clusters(o.nkvh);
+    std::vector<std::vector<uint32_t>> replay_rows(o.nkvh);
+    if (!o.positions.empty()) {
+        std::ifstream file(o.positions);
+        std::string line;
+        for (int h = 0; h < o.nkvh; ++h) {
+            if (!std::getline(file, line)) { fprintf(stderr, "positions: expected one line per KV head\n"); return 1; }
+            std::istringstream values(line);
+            int p;
+            while (values >> p) replay[h].push_back(p);
+            auto sorted = replay[h];
+            std::sort(sorted.begin(), sorted.end());
+            if (sorted.empty() || sorted.front() < n_sink || sorted.back() >= covered_end || std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
+                fprintf(stderr, "positions: head %d has empty, duplicate, sink or dense-tail positions\n", h); return 1;
+            }
+            const uint32_t count = n_sink + (uint32_t) replay[h].size();
+            values.clear();
+            std::string marker;
+            if (values >> marker) {
+                if (marker != "|") { fprintf(stderr, "positions: expected | before block sizes\n"); return 1; }
+                uint32_t n1, n2, row = 0;
+                while (values >> n1 >> n2) {
+                    if (!n1 || n1 > 64 || n2 > 64 - n1 || row + n1 + n2 > count) { fprintf(stderr, "positions: invalid block sizes\n"); return 1; }
+                    replay_blocks[h].push_back({ row, n2 ? row + n1 : 0, (uint16_t) n1, (uint16_t) n2, 0 });
+                    row += n1 + n2;
+                }
+                if (row != count) { fprintf(stderr, "positions: block sizes do not cover selected rows\n"); return 1; }
+                values.clear();
+                if (values >> marker) {
+                    if (marker != "|") { fprintf(stderr, "positions: expected | before cluster sizes\n"); return 1; }
+                    uint32_t size, total = 0;
+                    while (values >> size) {
+                        if (!size || size > count - total) { fprintf(stderr, "positions: invalid cluster size\n"); return 1; }
+                        replay_clusters[h].push_back(size);
+                        total += size;
+                    }
+                    if (total != count) { fprintf(stderr, "positions: cluster sizes do not cover selected rows\n"); return 1; }
+                    values.clear();
+                    if (values >> marker) {
+                        if (marker != "|") { fprintf(stderr, "positions: expected | before shadow row addresses\n"); return 1; }
+                        for (auto & b : replay_blocks[h]) {
+                            if (!(values >> b.row >> b.row2) || b.row >= (uint32_t) covered_end || b.bsz > covered_end - b.row || b.row2 >= (uint32_t) covered_end || b.bsz2 > covered_end - b.row2) {
+                                fprintf(stderr, "positions: invalid shadow row addresses\n"); return 1;
+                            }
+                            for (uint32_t r = 0; r < b.bsz; ++r) replay_rows[h].push_back(b.row + r);
+                            for (uint32_t r = 0; r < b.bsz2; ++r) replay_rows[h].push_back(b.row2 + r);
+                        }
+                        auto rows = replay_rows[h];
+                        std::sort(rows.begin(), rows.end());
+                        if (std::adjacent_find(rows.begin(), rows.end()) != rows.end() || (values >> marker)) {
+                            fprintf(stderr, "positions: duplicate shadow rows or extra fields\n"); return 1;
+                        }
+                        uint32_t first = 0;
+                        for (uint32_t size : replay_clusters[h]) {
+                            for (uint32_t i = 1; i < size; ++i) {
+                                if (replay_rows[h][first + i] != replay_rows[h][first] + i) {
+                                    fprintf(stderr, "positions: cluster rows are not contiguous\n"); return 1;
+                                }
+                            }
+                            first += size;
+                        }
+                    }
+                }
+            } else {
+                for (uint32_t row = 0; row < count; row += 64) replay_blocks[h].push_back({ row, 0, (uint16_t) std::min(64u, count - row), 0, 0 });
+            }
+            size_t nblocks = replay_blocks[h].size();
+            if (o.scatter) for (const auto & b : replay_blocks[h]) nblocks += b.bsz2 ? 1 : 0;
+            if (nblocks > hdr.n_pages_max + hdr.n_runs_max) { fprintf(stderr, "positions: too many blocks\n"); return 1; }
+            if (o.prepared && replay_clusters[h].empty()) { fprintf(stderr, "prepared replay requires captured cluster sizes after a second |\n"); return 1; }
+        }
+    }
 
     memcpy(base, &hdr, sizeof(hdr));
     auto * dir = (htp_fa_cluster_dir *) (base + HTP_FA_CLUSTER_DIR_OFF);
@@ -615,6 +975,13 @@ static int run_cluster_runs(const options & o, ggml_backend_t be, ggml_backend_b
     auto * hdir = (htp_fa_cluster_hdir *) (base + HTP_FA_CLUSTER_HDIR_OFF);
     memset(hdir, 0, sizeof(*hdir));
     hdir->rows_valid = (uint32_t) covered_end;
+    gpu_side gs;
+    if (o.hetero) {
+        if (!hdr.hetero_off) { fprintf(stderr, "hetero: no control region in the header\n"); return 1; }
+        if ((size_t) o.nh * o.gnsplit * L.part_stride > HTP_FA_HETERO_PART_SLOT || o.gnsplit < 1) { fprintf(stderr, "--gnsplit too large for the partial slot\n"); return 1; }
+        memset(base + hdr.hetero_off, 0, HTP_FA_HETERO_PARTS_OFF + HTP_FA_HETERO_PART_SLOT);
+        if (!gpu_init(gs, o, base, L.total, rpcmem_to_fd(base))) return 1;
+    }
 
     // middle positions in a (random or identity) order, cut into runs of csize/2 .. 3*csize/2 keys
     std::mt19937 rng(o.seed);
@@ -648,21 +1015,61 @@ static int run_cluster_runs(const options & o, ggml_backend_t be, ggml_backend_b
     const int n_runs = (int) runs.size();
     if ((uint32_t) n_runs > hdr.n_runs_max) { fprintf(stderr, "too many runs (%d > %u)\n", n_runs, hdr.n_runs_max); return 1; }
     auto * pos_map = (uint32_t *) (lb + hdr.off_pos_map);
+    uint64_t prepare_ticks = 0;
     for (int h = 0; h < o.nkvh; ++h) {
-        uint8_t * kp = lb + hdr.off_k_pages + (size_t) h * head_stride;
-        uint8_t * vp = lb + hdr.off_v_pages + (size_t) h * head_stride;
+        std::vector<int> head_perm = perm;
+        if (!o.positions.empty()) {
+            head_perm = replay[h];
+            auto sorted = replay[h];
+            std::sort(sorted.begin(), sorted.end());
+            for (int p = n_sink; p < covered_end; ++p) {
+                if (!std::binary_search(sorted.begin(), sorted.end(), p)) head_perm.push_back(p);
+            }
+        }
+        uint8_t * kp = o.pos_runs >= 0 || o.reorder ? nullptr : lb + hdr.off_k_pages + (size_t) h * head_stride;
+        uint8_t * vp = o.pos_runs >= 0 || o.reorder ? nullptr : lb + hdr.off_v_pages + (size_t) h * head_stride;
+        std::vector<int> row_pos(covered_end);
+        std::iota(row_pos.begin(), row_pos.end(), 0);
+        std::copy(head_perm.begin(), head_perm.end(), row_pos.begin() + n_sink);
+        if (!replay_rows[h].empty()) {
+            const auto ordered = row_pos;
+            std::fill(row_pos.begin(), row_pos.end(), -1);
+            for (size_t i = 0; i < replay_rows[h].size(); ++i) row_pos[replay_rows[h][i]] = ordered[i];
+            size_t next = replay_rows[h].size();
+            for (int & p : row_pos) if (p < 0) p = ordered[next++];
+        }
         for (int r = 0; r < covered_end; ++r) {
-            const int pos = r < n_sink ? r : perm[r - n_sink];
-            memcpy(kp + (size_t) r * row_bytes, base + L.k + (size_t) pos * L.nbk1 + (size_t) h * L.nbk2, row_bytes);
-            memcpy(vp + (size_t) r * row_bytes, base + L.v + (size_t) pos * L.nbk1 + (size_t) h * L.nbk2, row_bytes);
+            const int pos = row_pos[r];
+            if (kp) {
+                memcpy(kp + (size_t) r * row_bytes, base + L.k + (size_t) pos * L.nbk1 + (size_t) h * L.nbk2, row_bytes);
+                memcpy(vp + (size_t) r * row_bytes, base + L.v + (size_t) pos * L.nbk1 + (size_t) h * L.nbk2, row_bytes);
+            }
             pos_map[(size_t) h * rows_max + r] = (uint32_t) pos;
+        }
+        if (o.prepared) {
+            const uint64_t t0 = cnt_now();
+            auto * meta = (uint32_t *) (lb + htp_fa_cluster_meta_offset(&hdr));
+            meta[0] = o.pos_runs;
+            uint32_t * pm = meta + 32 + (size_t) h * rows_max * 2;
+            memcpy(pm, pos_map + (size_t) h * rows_max, (size_t) covered_end * 4);
+            auto prepare = [&](uint32_t first, uint32_t size) {
+                std::sort(pm + first, pm + first + size);
+                htp_fa_cluster_prepare_spans(pm, pm + rows_max, first, size, o.pos_runs);
+            };
+            if (o.positions.empty()) {
+                for (const auto & r : runs) prepare(r.first, r.second);
+            } else {
+                uint32_t first = 0;
+                for (uint32_t size : replay_clusters[h]) { prepare(replay_rows[h].empty() ? first : replay_rows[h][first], size); first += size; }
+            }
+            prepare_ticks += cnt_now() - t0;
         }
         auto * rt = (htp_fa_cluster_run *) (lb + hdr.off_runs) + (size_t) h * hdr.n_runs_max;
         for (int i = 0; i < n_runs; ++i) {
             rt[i] = { (uint32_t) runs[i].first, (uint16_t) runs[i].second, (uint16_t) (i == 0 ? HTP_FA_CLUSTER_RUN_FORCED : 0) };
             std::vector<float> acc(o.d, 0.0f);
             for (int r = runs[i].first; r < runs[i].first + runs[i].second; ++r) {
-                const ggml_fp16_t * kr = (const ggml_fp16_t *) (kp + (size_t) r * row_bytes);
+                const ggml_fp16_t * kr = (const ggml_fp16_t *) (base + L.k + (size_t) pos_map[(size_t) h * rows_max + r] * L.nbk1 + (size_t) h * L.nbk2);
                 for (int d = 0; d < o.d; ++d) acc[d] += ggml_fp16_to_fp32(kr[d]);
             }
             ggml_fp16_t * c = (ggml_fp16_t *) (lb + hdr.off_centroids + ((size_t) h * hdr.n_runs_max + i) * hdr.centroid_bytes);
@@ -696,18 +1103,48 @@ static int run_cluster_runs(const options & o, ggml_backend_t be, ggml_backend_b
     if (!ggml_backend_supports_op(be, fa)) { fprintf(stderr, "HTP0 rejects the FA op\n"); return 1; }
     uint32_t flags = HTP_FA_CLUSTER_FLAG_ECHO;
     { int lg = 0; while ((1 << lg) < o.nslots) lg++; flags |= (uint32_t) lg << 1; }
-    auto set_mode = [&](bool on) {
+    // gpu: the header flag the DSP re-reads every op decides who attends the runs; keep = the HTP's share
+    auto set_mode = [&](bool on, bool gpu = false, int keep = 0, bool gsel = false) {
         fa->op_params[HTP_FA_CLUSTER_OPP_MAGIC]   = on ? (int32_t) HTP_FA_CLUSTER_MAGIC : 0;
         fa->op_params[HTP_FA_CLUSTER_OPP_LAYER]   = 0;
-        fa->op_params[HTP_FA_CLUSTER_OPP_DENSITY] = o.density * 10;
+        fa->op_params[HTP_FA_CLUSTER_OPP_DENSITY] = o.positions.empty() ? o.density * 10 : 0;
         fa->op_params[HTP_FA_CLUSTER_OPP_WINDOW]  = W;
-        fa->op_params[HTP_FA_CLUSTER_OPP_FLAGS]   = (int32_t) flags;
+        fa->op_params[HTP_FA_CLUSTER_OPP_FLAGS]   = (int32_t) (flags | ((uint32_t) std::min(std::max(keep, 0), 100) << 24) | (o.pollfirst && gpu ? HTP_FA_CLUSTER_FLAG_POLLFIRST : 0u));
+        fa->op_params[HTP_FA_HETERO_OPP_GPU_BLOCKS] = 0;
+        fa->op_params[HTP_FA_HETERO_OPP_SLOT]       = 0;
+        fa->op_params[HTP_FA_HETERO_OPP_GPU_NSPLIT] = o.hetero ? o.gnsplit : 0;
         fa->src[7] = on ? shadow : nullptr;
+        auto * h = (htp_fa_cluster_header *) base;
+        h->flags = (hdr.flags & ~(HTP_FA_CLUSTER_HDR_GPU_RUNS | HTP_FA_CLUSTER_HDR_GPU_SELECT)) | (gpu ? HTP_FA_CLUSTER_HDR_GPU_RUNS : 0u) | (gsel ? HTP_FA_CLUSTER_HDR_GPU_SELECT : 0u);
+        dc_cvac(base, 128);
+        if (!o.positions.empty()) {
+            for (int kvh = 0; kvh < o.nkvh; ++kvh) {
+                auto * rec = (uint32_t *) (lb + hdr.off_host_sel + (size_t) kvh * hdr.host_sel_stride);
+                auto * blocks = (htp_fa_cluster_blk *) (rec + 32);
+                rec[0] = 0;
+                for (const auto & b : replay_blocks[kvh]) {
+                    if (o.scatter && !(gpu && o.pos_runs >= 0) && b.bsz2) {
+                        blocks[rec[0]++] = { b.row, 0, b.bsz, 0, 0 };
+                        blocks[rec[0]++] = { b.row2, 0, b.bsz2, 0, 0 };
+                    } else {
+                        blocks[rec[0]++] = b;
+                    }
+                }
+                dc_cvac(rec, hdr.host_sel_stride);
+            }
+        }
     };
     const uint32_t budget_rows = (uint32_t) (((uint64_t) (covered_end - n_sink) * o.density * 10 + 999) / 1000);
     printf("runs mode%s: kv %d, window %d, %d runs (avg %d keys, sink run of %d), row budget %u/head (%d%%), perm %s, nslots %d\n",
            o.scatter ? " (scatter: rows gathered from the positional cache, one descriptor per row)" : "",
            o.kv, W, n_runs, o.csize, n_sink, budget_rows, o.density, perm_name, o.nslots);
+    if (o.pos_runs >= 0) printf("positional split: minimum run %d, metadata/control %.2f MB, K/V shadow 0 bytes\n", o.pos_runs, shadow_bytes / 1048576.0);
+    if (o.prepared) printf("prepared cluster spans: %.1f us CPU setup, %zu bytes of extra metadata (outside decode timing)\n", ticks_us((double) prepare_ticks), 128 + (size_t) o.nkvh * rows_max * 8);
+    if (o.gpu_shadow) printf("GPU source: cluster-ordered K/V shadow\n");
+    if (o.overlap) printf("Overlap: %s; ready->done includes selection\n", o.overlap == 1 ? "each GPU head starts after its DSP selection" : "parallel handoff, GPU held until all heads are ready");
+    if (o.reorder) printf("Physical reorder: K/V shadow 0 bytes, metadata/control %.2f MiB, shared buffer %.2f MiB\n", shadow_bytes / 1048576.0, L.total / 1048576.0);
+    if (o.gpu_rows) printf("GPU work cap: selected rows per KV head, rounded down to whole blocks\n");
+    if (!o.positions.empty()) printf("selected positions replay: %s (selection is supplied, partition time is included)\n", o.positions.c_str());
 
     // host greedy selection per KV head: forced first, then runs by descending max-over-group q.centroid until the budget
     auto host_select = [&](int kvh) {
@@ -732,7 +1169,14 @@ static int run_cluster_runs(const options & o, ggml_backend_t be, ggml_backend_b
         }
         return sel;
     };
+    bool blocks_from_gpu = false;   // GPU_SELECT arms: the records the GPU wrote hold the attended blocks
     auto read_echo_blocks = [&](int kvh) {
+        if (blocks_from_gpu) {
+            const uint8_t * e = base + hdr.hetero_off + HTP_FA_HETERO_SEL_OFF + (size_t) kvh * HTP_FA_HETERO_SEL_STRIDE;
+            dc_civac(e, HTP_FA_HETERO_SEL_STRIDE);
+            const uint32_t n = std::min<uint32_t>(*(const uint32_t *) e, HTP_FA_HETERO_SEL_MAX_BLK);
+            return std::vector<htp_fa_cluster_blk>((const htp_fa_cluster_blk *) (e + 128), (const htp_fa_cluster_blk *) (e + 128) + n);
+        }
         dc_civac(lb + hdr.off_echo_sel, (size_t) o.nkvh * hdr.host_sel_stride);
         const uint8_t * e = lb + hdr.off_echo_sel + (size_t) kvh * hdr.host_sel_stride;
         const uint32_t n = *(const uint32_t *) e;
@@ -740,20 +1184,133 @@ static int run_cluster_runs(const options & o, ggml_backend_t be, ggml_backend_b
         return b;
     };
 
-    struct arm_res { stat_acc wall, usec, axi; double worst = 0; };
-    auto run_arm = [&](const char * name, bool on, arm_res & r) {
-        set_mode(on);
+    std::vector<std::vector<std::pair<int, bool>>> baseline_keys(o.nkvh);
+    std::vector<uint32_t> physical_rows;
+    struct arm_res { stat_acc wall, usec, axi, gpu_us, wait_us, turn_us, pure_us; double worst = 0; bool keys_match = true; };
+    auto run_arm = [&](const char * name, bool on, arm_res & r, bool gpu = false, int keep = 0, bool gsel = false) {
+        std::mt19937 rng_q(o.seed + 77);
+        set_mode(on, gpu, keep, gsel);
+        volatile uint32_t * ready = (volatile uint32_t *) (base + hdr.hetero_off);
+        // the chain: one kernel always enqueued ahead, so the GPU is spinning when the DSP publishes
+        // and each kernel is submitted BEFORE its op's Q is written (the stale-line case)
+        std::deque<cl_event> evs;
+        cl_uint want_next = 0;
+        auto enqueue_k = [&](cl_uint want, cl_uint qextra = 0) {
+                cl_uint a_q = L.q, a_k = L.k, a_v = L.v, a_nbq2 = o.d * 4, a_nbk1 = L.nbk1, a_nbk2 = L.nbk2;
+                cl_uint a_sel = hdr.hetero_off + HTP_FA_HETERO_SEL_OFF, a_selst = HTP_FA_HETERO_SEL_STRIDE;
+                cl_uint a_pm = hdr.layer0_off + hdr.off_pos_map, a_pmst = rows_max * 4;
+                cl_uint a_p = hdr.hetero_off + HTP_FA_HETERO_PARTS_OFF, a_ps = L.part_stride, a_ns = o.gnsplit;
+                cl_float a_scale = 1.0f / sqrtf((float) o.d);
+                cl_uint a_ready = hdr.hetero_off, a_cnt = hdr.hetero_off + HTP_FA_HETERO_SLOT_COUNTER, a_done = hdr.hetero_off + 128;
+                cl_uint a_spin = 20000000u, a_qmode = (cl_uint) o.qmode | qextra | (o.overlap == 1 ? 32u : 0u);
+                if (o.gpu_shadow) {
+                    a_k = hdr.layer0_off + hdr.off_k_pages;
+                    a_v = hdr.layer0_off + hdr.off_v_pages;
+                    a_nbk1 = row_bytes;
+                    a_nbk2 = head_stride;
+                }
+                if (o.pos_runs >= 0) {
+                    a_sel = hdr.layer0_off + hdr.off_n_valid;
+                    a_selst = 128 + rows_max * 4;
+                    a_qmode |= 16;
+                    if (o.prepared) {
+                        a_pm = hdr.layer0_off + htp_fa_cluster_meta_offset(&hdr) + 128;
+                        a_pmst = rows_max * 8;
+                    }
+                }
+                if (gsel) {
+                    cl_uint a_cent = hdr.layer0_off + hdr.off_centroids, a_chs = hdr.n_runs_max * hdr.centroid_bytes, a_cb = hdr.centroid_bytes;
+                    cl_uint a_runs = hdr.layer0_off + hdr.off_runs, a_rhs = hdr.n_runs_max * (cl_uint) sizeof(htp_fa_cluster_run), a_ncand = (cl_uint) n_runs, a_budget = budget_rows;
+                    cl_uint a_list = hdr.hetero_off + HTP_FA_HETERO_SLOT_LIST;
+                    int j = 0;
+                    clSetKernelArg(gs.k_sel, j++, sizeof(cl_mem), &gs.alias);
+                    clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_q); clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_k); clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_v);
+                    clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_nbq2);
+                    clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_nbk1); clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_nbk2);
+                    clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_nbk1); clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_nbk2);
+                    clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_cent); clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_chs); clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_cb);
+                    clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_runs); clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_rhs);
+                    clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_ncand); clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_budget);
+                    clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_sel); clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_selst);
+                    clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_pm); clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_pmst);
+                    clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_p); clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_ps);
+                    clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_ns); clSetKernelArg(gs.k_sel, j++, sizeof(cl_float), &a_scale);
+                    clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_ready); clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_cnt);
+                    clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_done); clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_list);
+                    clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &want); clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_spin); clSetKernelArg(gs.k_sel, j++, sizeof(cl_uint), &a_qmode);
+                    size_t gsz[3] = { (size_t) o.d, (size_t) o.nkvh, (size_t) o.gnsplit }, lsz[3] = { (size_t) o.d, 1, 1 };
+                    cl_event ev = nullptr;
+                    if (!cl_check(clEnqueueNDRangeKernel(gs.q, gs.k_sel, 3, nullptr, gsz, lsz, 0, nullptr, &ev), "enqueue runs_sel")) return false;
+                    clFlush(gs.q);
+                    evs.push_back(ev);
+                    return true;
+                }
+                int i = 0;
+                clSetKernelArg(gs.k_runs, i++, sizeof(cl_mem), &gs.alias);
+                clSetKernelArg(gs.k_runs, i++, sizeof(cl_uint), &a_q); clSetKernelArg(gs.k_runs, i++, sizeof(cl_uint), &a_k); clSetKernelArg(gs.k_runs, i++, sizeof(cl_uint), &a_v);
+                clSetKernelArg(gs.k_runs, i++, sizeof(cl_uint), &a_nbq2);
+                clSetKernelArg(gs.k_runs, i++, sizeof(cl_uint), &a_nbk1); clSetKernelArg(gs.k_runs, i++, sizeof(cl_uint), &a_nbk2);
+                clSetKernelArg(gs.k_runs, i++, sizeof(cl_uint), &a_nbk1); clSetKernelArg(gs.k_runs, i++, sizeof(cl_uint), &a_nbk2);
+                clSetKernelArg(gs.k_runs, i++, sizeof(cl_uint), &a_sel); clSetKernelArg(gs.k_runs, i++, sizeof(cl_uint), &a_selst);
+                clSetKernelArg(gs.k_runs, i++, sizeof(cl_uint), &a_pm); clSetKernelArg(gs.k_runs, i++, sizeof(cl_uint), &a_pmst);
+                clSetKernelArg(gs.k_runs, i++, sizeof(cl_uint), &a_p); clSetKernelArg(gs.k_runs, i++, sizeof(cl_uint), &a_ps);
+                clSetKernelArg(gs.k_runs, i++, sizeof(cl_uint), &a_ns); clSetKernelArg(gs.k_runs, i++, sizeof(cl_float), &a_scale);
+                clSetKernelArg(gs.k_runs, i++, sizeof(cl_uint), &a_ready); clSetKernelArg(gs.k_runs, i++, sizeof(cl_uint), &a_cnt);
+                clSetKernelArg(gs.k_runs, i++, sizeof(cl_uint), &a_done); clSetKernelArg(gs.k_runs, i++, sizeof(cl_uint), &want);
+                clSetKernelArg(gs.k_runs, i++, sizeof(cl_uint), &a_spin); clSetKernelArg(gs.k_runs, i++, sizeof(cl_uint), &a_qmode);
+                size_t gsz[3] = { (size_t) o.d, (size_t) o.nkvh, (size_t) o.gnsplit }, lsz[3] = { (size_t) o.d, 1, 1 };
+                cl_event ev = nullptr;
+                if (!cl_check(clEnqueueNDRangeKernel(gs.q, gs.k_runs, 3, nullptr, gsz, lsz, 0, nullptr, &ev), "enqueue runs")) return false;
+                clFlush(gs.q);
+                evs.push_back(ev);
+                return true;
+        };
+        if (gpu) {
+            dc_civac((const void *) ready, 4);
+            want_next = *ready + 1;
+            if (!enqueue_k(want_next++)) return;
+        }
         for (int it = -1; it < o.iters; ++it) {
             memset(base + L.dst, 0, (size_t) o.nh * o.d * 4);
             g_prof_lines.clear();
+            if (gpu) {
+                if (!enqueue_k(want_next++)) return;   // the NEXT op's kernel, ahead of this op's Q
+            }
+            std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+            float * qf = (float *) (base + L.q);
+            for (int i = 0; i < o.nh * o.d; ++i) qf[i] = u(rng_q);
+            dc_cvac(base + L.q, (size_t) o.nh * o.d * 4);
             const uint64_t t0 = cnt_now();
             ggml_backend_graph_compute(be, g);
             const uint64_t t1 = cnt_now();
             dc_civac(base + L.dst, (size_t) o.nh * o.d * 4);
+            double gpu_total = 0, waited = 0, turn = 0, pure = 0;
+            if (gpu) {
+                cl_event ev = evs.front(); evs.pop_front();
+                clWaitForEvents(1, &ev);
+                cl_ulong ts = 0, te = 0;
+                clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(ts), &ts, nullptr);
+                clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof(te), &te, nullptr);
+                clReleaseEvent(ev);
+                gpu_total = (double) (te - ts) / 1000.0;
+                dc_civac(base + hdr.hetero_off + 8, 16);
+                waited = ((const uint32_t *) (base + hdr.hetero_off + 8))[0];
+                turn   = o.pollfirst ? ((const uint32_t *) (base + hdr.hetero_off + 8))[2] : ((const uint32_t *) (base + hdr.hetero_off + 8))[1];
+            }
             if (it < 0) continue;
             r.wall.add(ticks_us((double) (t1 - t0)));
+            if (gpu) { r.gpu_us.add(gpu_total); r.wait_us.add(waited); r.turn_us.add(turn); (void) pure; }
             double us = 0, ax = 0;
             if (prof_last(&us, &ax)) { r.usec.add(us); r.axi.add(ax); }
+        }
+        std::vector<float> checked_output((size_t) o.nh * o.d);
+        memcpy(checked_output.data(), base + L.dst, checked_output.size() * sizeof(float));
+        if (gpu) {
+            // Release the queued kernel. Check the saved output from before this repeated Q.
+            ggml_backend_graph_compute(be, g);
+            dc_civac(base + L.dst, (size_t) o.nh * o.d * 4);
+            for (auto & ev : evs) { clWaitForEvents(1, &ev); clReleaseEvent(ev); }
+            evs.clear();
         }
         double worst = 0; size_t rows_att = 0; int sym = 0, n_blocks = 0, n_packed = 0;
         for (int h = 0; h < o.nh; ++h) {
@@ -774,23 +1331,40 @@ static int run_cluster_runs(const options & o, ggml_backend_t be, ggml_backend_b
                 }
                 for (int p = covered_end; p < o.kv; ++p) keys.push_back({ p, true });
                 if (h % G == 0) {
+                    auto sorted_keys = keys;
+                    std::sort(sorted_keys.begin(), sorted_keys.end());
+                    if (!gpu) baseline_keys[kvh] = sorted_keys;
+                    else r.keys_match &= sorted_keys == baseline_keys[kvh];
+                    if (!o.positions.empty()) {
+                        std::vector<std::pair<int, bool>> expected;
+                        for (int p = 0; p < n_sink; ++p) expected.push_back({ p, false });
+                        for (int p : replay[kvh]) expected.push_back({ p, false });
+                        for (int p = covered_end; p < o.kv; ++p) expected.push_back({ p, true });
+                        std::sort(expected.begin(), expected.end());
+                        r.keys_match &= expected == sorted_keys;
+                    }
                     rows_att += keys.size();
-                    std::vector<int> hs = host_select(kvh); std::set<int> host_runs(hs.begin(), hs.end());
-                    std::vector<int> diff; std::set_symmetric_difference(host_runs.begin(), host_runs.end(), dev_runs.begin(), dev_runs.end(), std::back_inserter(diff));
-                    sym += (int) diff.size();
-                    if (!diff.empty() && o.verbose) {
-                        printf("    head %d run set differs:", kvh);
-                        for (int r : diff) printf(" %d%s(%d rows)", r, host_runs.count(r) ? "H" : "D", runs[r].second);
-                        printf("\n");
+                    if (o.positions.empty()) {
+                        std::vector<int> hs = host_select(kvh); std::set<int> host_runs(hs.begin(), hs.end());
+                        std::vector<int> diff; std::set_symmetric_difference(host_runs.begin(), host_runs.end(), dev_runs.begin(), dev_runs.end(), std::back_inserter(diff));
+                        sym += (int) diff.size();
+                        if (!diff.empty() && o.verbose) {
+                            printf("    head %d run set differs:", kvh);
+                            for (int r : diff) printf(" %d%s(%d rows)", r, host_runs.count(r) ? "H" : "D", runs[r].second);
+                            printf("\n");
+                        }
                     }
                 }
             } else {
                 for (int p = 0; p < o.kv; ++p) keys.push_back({ p, true });
             }
             std::vector<double> ref;
-            ref_attn_keys(o, base, L, h, keys, ref);
-            const float * out = (const float *) (base + L.dst + (size_t) h * o.d * 4);
-            for (int dd = 0; dd < o.d; ++dd) worst = std::max(worst, fabs((double) out[dd] - ref[dd]));
+            ref_attn_keys(o, base, L, h, keys, ref, physical_rows.empty() ? nullptr : physical_rows.data() + (size_t) kvh * o.kv);
+            const float * out = checked_output.data() + (size_t) h * o.d;
+            for (int dd = 0; dd < o.d; ++dd) {
+                const double error = fabs((double) out[dd] - ref[dd]);
+                worst = std::isfinite(error) ? std::max(worst, error) : INFINITY;
+            }
         }
         r.worst = worst;
         const size_t bytes = on ? rows_att * 2 * row_bytes : (size_t) o.kv * o.nkvh * 2 * row_bytes;
@@ -804,13 +1378,135 @@ static int run_cluster_runs(const options & o, ggml_backend_t be, ggml_backend_b
             const uint32_t * tw = (const uint32_t *) (lb + hdr.off_echo_sel);
             printf("  %-10s phases of the last op (us): setup %u | select %u | dec %u | merge %u | select slowest thread: dma issue %u wait %u score %u greedy %u\n",
                    name, tw[1], tw[2], tw[3], tw[4], tw[5], tw[6], tw[7], tw[8]);
+            if (o.pos_runs >= 0 && gpu) printf("  %-10s partition %u us (included in select): map %u mark %u scan %u flush %u\n", name, tw[9], tw[10], tw[11], tw[12], tw[13]);
+        }
+        if (gpu) {
+            printf("  %-10s selected keys vs NPU-only: %s\n", name, r.keys_match ? "identical" : "MISMATCH");
+            dc_civac(base + hdr.hetero_off + HTP_FA_HETERO_STATUS_OFF, 16);
+            const uint32_t * st = (const uint32_t *) (base + hdr.hetero_off + HTP_FA_HETERO_STATUS_OFF);
+            uint32_t n_gpu = 0, min_gpu_rows = UINT32_MAX, max_gpu_rows = 0;
+            for (int h = 0; h < o.nkvh; ++h) {
+                const uint8_t * rec = o.pos_runs >= 0 ? lb + hdr.off_n_valid + (size_t) h * (128 + rows_max * 4) : base + hdr.hetero_off + HTP_FA_HETERO_SEL_OFF + (size_t) h * HTP_FA_HETERO_SEL_STRIDE;
+                dc_civac(rec, o.pos_runs >= 0 ? 128 + rows_max * 4 : HTP_FA_HETERO_SEL_STRIDE);
+                const uint32_t n = *(const uint32_t *) rec;
+                if (o.pos_runs >= 0 && ((const uint32_t *) rec)[3] == 0) {
+                    const auto * blocks = (const htp_fa_cluster_blk *) (rec + 128);
+                    for (uint32_t b = 0; b < n; ++b) n_gpu += blocks[b].bsz + blocks[b].bsz2;
+                } else {
+                    n_gpu += n;
+                }
+                if (o.pos_runs < 0) {
+                    const auto * blocks = (const htp_fa_cluster_blk *) (rec + 128);
+                    uint32_t rows = 0;
+                    for (uint32_t b = 0; b < n; ++b) rows += blocks[b].bsz + blocks[b].bsz2;
+                    min_gpu_rows = std::min(min_gpu_rows, rows); max_gpu_rows = std::max(max_gpu_rows, rows);
+                }
+            }
+            printf("  %-10s GPU ready->done med %5.1f us (max %5.1f)%s | DSP waited for done med %5.1f us (max %5.1f) | kernel incl. spin med %7.1f us | %s to GPU %u/head | DSP done timeouts %u\n",
+                   name, r.turn_us.med(), r.turn_us.mx(), o.pollfirst ? " (polled from ready)" : "", r.wait_us.med(), r.wait_us.mx(), r.gpu_us.med(), o.pos_runs >= 0 ? "rows" : "blocks", n_gpu / o.nkvh, st[0]);
+            if (o.pos_runs < 0) printf("  %-10s GPU rows/head: min %u max %u\n", name, min_gpu_rows, max_gpu_rows);
+            if (o.overlap) {
+                printf("  %-10s head ready after selection start (us):", name);
+                for (int h = 0; h < o.nkvh; ++h) {
+                    const uint32_t * rec = (const uint32_t *) (base + hdr.hetero_off + HTP_FA_HETERO_SEL_OFF + (size_t) h * HTP_FA_HETERO_SEL_STRIDE);
+                    printf(" %u", rec[5]);
+                }
+                printf("\n");
+            }
+            if (o.pos_runs >= 0) {
+                uint32_t kept = 0, blocks = 0, indexed = 0;
+                for (int h = 0; h < o.nkvh; ++h) {
+                    const uint32_t * rec = (const uint32_t *) (lb + hdr.off_n_valid + (size_t) h * (128 + rows_max * 4));
+                    kept += rec[1]; blocks += rec[2]; indexed += rec[3] != 0;
+                }
+                printf("  %-10s positional rows: GPU %.1f/head | HTP %.1f/head in %.1f blocks/head, plus dense tail | indexed GPU heads %u\n", name, (double) n_gpu / o.nkvh, (double) kept / o.nkvh, (double) blocks / o.nkvh, indexed);
+            }
         }
     };
     arm_res dense, sel;
     run_arm("dense", false, dense);
+    if (o.reorder) {
+        physical_rows.resize((size_t) o.nkvh * o.kv);
+        std::vector<uint8_t> visited(covered_end);
+        std::vector<uint8_t> saved(2 * row_bytes);
+        std::vector<uint64_t> hashes(o.kv);
+        auto row_ptr = [&](size_t off, int h, uint32_t row) { return base + off + (size_t) h * L.nbk2 + (size_t) row * L.nbk1; };
+        auto hash_row = [&](int h, uint32_t row) {
+            uint64_t hash = 14695981039346656037ull;
+            for (size_t off : { L.k, L.v }) {
+                const uint8_t * ptr = row_ptr(off, h, row);
+                for (size_t i = 0; i < row_bytes; ++i) hash = (hash ^ ptr[i]) * 1099511628211ull;
+            }
+            return hash;
+        };
+        uint64_t move_ticks = 0, flush_ticks = 0;
+        size_t moved = 0;
+        for (int h = 0; h < o.nkvh; ++h) {
+            const uint32_t * pm = pos_map + (size_t) h * rows_max;
+            for (int r = 0; r < o.kv; ++r) hashes[r] = hash_row(h, r);
+            for (int r = 0; r < o.kv; ++r) physical_rows[(size_t) h * o.kv + (r < covered_end ? pm[r] : r)] = r;
+            const uint64_t t0 = cnt_now();
+            std::fill(visited.begin(), visited.end(), 0);
+            for (uint32_t first = 0; first < (uint32_t) covered_end; ++first) {
+                if (visited[first] || pm[first] == first) continue;
+                memcpy(saved.data(), row_ptr(L.k, h, first), row_bytes);
+                memcpy(saved.data() + row_bytes, row_ptr(L.v, h, first), row_bytes);
+                uint32_t dst = first;
+                for (;;) {
+                    visited[dst] = 1;
+                    moved++;
+                    const uint32_t src = pm[dst];
+                    memcpy(row_ptr(L.k, h, dst), src == first ? saved.data() : row_ptr(L.k, h, src), row_bytes);
+                    memcpy(row_ptr(L.v, h, dst), src == first ? saved.data() + row_bytes : row_ptr(L.v, h, src), row_bytes);
+                    if (src == first) break;
+                    dst = src;
+                }
+            }
+            move_ticks += cnt_now() - t0;
+            for (int r = 0; r < o.kv; ++r) {
+                if (hash_row(h, r) != hashes[r < covered_end ? pm[r] : r]) {
+                    fprintf(stderr, "physical reorder: K/V row mismatch at head %d row %d\n", h, r); return 2;
+                }
+            }
+        }
+        const uint64_t tf = cnt_now();
+        dc_cvac(base + L.k, (size_t) covered_end * L.nbk1);
+        dc_cvac(base + L.v, (size_t) covered_end * L.nbk1);
+        flush_ticks = cnt_now() - tf;
+        printf("Physical reorder: moved %zu K/V row pairs, CPU move %.1f us + flush %.1f us, scratch %zu bytes; all rows and dense tail verified\n",
+               moved, ticks_us((double) move_ticks), ticks_us((double) flush_ticks), visited.size() + saved.size());
+        printf("Physical reorder: removed %zu bytes of K/V shadow; reference-only inverse map and hashes %zu bytes (outside decode timing)\n",
+               2 * (size_t) o.nkvh * head_stride, physical_rows.size() * sizeof(uint32_t) + hashes.size() * sizeof(uint64_t));
+    }
     run_arm(o.scatter ? "scatter" : "runs", true, sel);
+    bool ok = dense.worst < 2e-2 && sel.worst < 2e-2 && sel.keys_match;
+    if (o.hetero) {
+        const std::vector<int> shares = o.pos_runs >= 0 ? std::vector<int>{ o.pos_runs } : o.keep;
+        for (int keep : shares) {
+            arm_res het;
+            char nm[32]; snprintf(nm, sizeof(nm), o.pos_runs >= 0 ? "pos-n%d" : o.gpu_rows ? "gpu-r%d" : "gpu-k%d", keep);
+            run_arm(nm, true, het, true, o.gpu_rows ? keep / 64 : keep);
+            ok = ok && het.worst < 2e-2 && het.keys_match;
+        }
+        if (o.gpu_select) {
+            arm_res het;
+            blocks_from_gpu = true;
+            run_arm("gpu-sel", true, het, true, 0, true);
+            blocks_from_gpu = false;
+            ok = ok && het.worst < 2e-2 && het.keys_match;
+        }
+        if (gs.svm) clSVMFree(gs.ctx, gs.svm);
+        if (gs.alias) clReleaseMemObject(gs.alias);
+        if (gs.k_fa) clReleaseKernel(gs.k_fa);
+        if (gs.k_ga) clReleaseKernel(gs.k_ga);
+        if (gs.k_runs) clReleaseKernel(gs.k_runs);
+        if (gs.k_sel) clReleaseKernel(gs.k_sel);
+        if (gs.prog) clReleaseProgram(gs.prog);
+        if (gs.q) clReleaseCommandQueue(gs.q);
+        if (gs.ctx) clReleaseContext(gs.ctx);
+    }
     ggml_free(ctx);
-    return (dense.worst < 2e-2 && sel.worst < 2e-2) ? 0 : 2;
+    return ok ? 0 : 2;
 }
 
 static int run_cluster(const options & o, ggml_backend_t be, ggml_backend_buffer_t buf, uint8_t * base, const layout & L,
@@ -1188,6 +1884,8 @@ static int run_gpu_gather(const options & o, uint8_t * base, const layout & L, i
     if (g.alias) clReleaseMemObject(g.alias);
     if (g.k_fa) clReleaseKernel(g.k_fa);
     if (g.k_ga) clReleaseKernel(g.k_ga);
+    if (g.k_runs) clReleaseKernel(g.k_runs);
+    if (g.k_sel) clReleaseKernel(g.k_sel);
     if (g.prog) clReleaseProgram(g.prog);
     if (g.q) clReleaseCommandQueue(g.q);
     if (g.ctx) clReleaseContext(g.ctx);
@@ -1233,7 +1931,20 @@ int main(int argc, char ** argv) {
         // one layer's shadow at the front of the buffer; the positional data moves up behind it
         shadow_bytes = (size_t) htp_fa_cluster_layout_v2(&shadow_hdr, 1, (uint32_t) o.kv, (uint32_t) o.nkvh, (uint32_t) o.d, (uint32_t) o.page_keys, (uint32_t) o.csize,
                                                          HTP_FA_CLUSTER_HDR_HOST_ROWS | (o.inplace ? HTP_FA_CLUSTER_HDR_INPLACE : 0u) | (o.runs ? HTP_FA_CLUSTER_HDR_RUNS : 0u) |
-                                                         (o.runs && o.scatter ? HTP_FA_CLUSTER_HDR_SCATTER : 0u));
+                                                         (o.runs && o.scatter ? HTP_FA_CLUSTER_HDR_SCATTER : 0u) |
+                                                         (o.runs && o.hetero ? HTP_FA_CLUSTER_HDR_GPU_RUNS : 0u) |
+                                                         (o.pos_runs >= 0 ? HTP_FA_CLUSTER_HDR_POS_RUNS : 0u) |
+                                                         (o.prepared ? HTP_FA_CLUSTER_HDR_PREPARED : 0u) |
+                                                         (o.gpu_rows ? HTP_FA_CLUSTER_HDR_GPU_ROWS : 0u) |
+                                                         (o.overlap ? HTP_FA_CLUSTER_HDR_OVERLAP : 0u) |
+                                                         (o.reorder ? HTP_FA_CLUSTER_HDR_REORDER : 0u) |
+                                                         (!o.positions.empty() ? HTP_FA_CLUSTER_HDR_HOST_RUNS : 0u) |
+                                                         (o.runs && o.hetero && o.gpu_select ? HTP_FA_CLUSTER_HDR_GPU_SELECT : 0u));
+        if (o.runs && o.hetero) {
+            // hetero control region after the shadow: one slot, its partials, and the per-head hand-off records
+            shadow_hdr.hetero_off = shadow_bytes;
+            shadow_bytes += HTP_FA_HETERO_PARTS_OFF + HTP_FA_HETERO_PART_SLOT;
+        }
         shadow_bytes = ((shadow_bytes + (1 << 20) - 1) >> 20) << 20;
         L.q += shadow_bytes; L.mask += shadow_bytes; L.dst += shadow_bytes; L.parts += shadow_bytes; L.k += shadow_bytes;
     }
@@ -1591,6 +2302,8 @@ int main(int argc, char ** argv) {
     if (g.alias) clReleaseMemObject(g.alias);
     if (g.k_fa) clReleaseKernel(g.k_fa);
     if (g.k_ga) clReleaseKernel(g.k_ga);
+    if (g.k_runs) clReleaseKernel(g.k_runs);
+    if (g.k_sel) clReleaseKernel(g.k_sel);
     if (g.prog) clReleaseProgram(g.prog);
     if (g.q) clReleaseCommandQueue(g.q);
     if (g.ctx) clReleaseContext(g.ctx);
