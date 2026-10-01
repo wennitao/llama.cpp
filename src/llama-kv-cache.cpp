@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-sparse-attn.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1848,8 +1849,10 @@ void llama_kv_cache::set_input_sparse_bias(ggml_tensor * dst, const llama_ubatch
             for (uint32_t b = 0; b < n_bk; ++b) {
                 frc[b] = b < n_avail ? 0.0f : -BIG;
             }
-            frc[0]           = BIG;
-            frc[n_avail - 1] = BIG;
+            // Exceed the threshold offset even when the probability rounds to zero.
+            const float force = (llama_sparse_attn_thr() + 1.0f) * BIG;
+            frc[0]           = force;
+            frc[n_avail - 1] = force;
             frc[n_bk]        = 0.0f;
             continue;
         }
