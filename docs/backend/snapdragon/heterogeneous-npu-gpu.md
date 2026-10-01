@@ -22,6 +22,8 @@ also needs a sustained-load guard, because the Adreno throttles before the HTP d
 One decode asymmetry does hold up (§4l): the HTP gathers scattered KV rows at 9 GB/s, one DMA
 descriptor per row, while the GPU gathers the same rows through index lists at 33-45 GB/s, so
 whole-cluster sparse decode can drop its shadow copy by giving the scattered clusters to the GPU.
+The later full-model experiment below also removes that shadow by physically rearranging K/V;
+it preserves the split, but follow-up profiling finds that CPU output-projection variation obscured the initial full-model speed comparison. Setup costs still need to be amortized.
 
 Everything below is SM8750 (Hexagon v79 + Adreno 830), Qwen3-1.7B Q4_0, `llama-bench`
 `-fa 1 -ngl 99`, one binary carrying both backends (`GGML_HEXAGON=ON GGML_OPENCL=ON`).
@@ -1609,6 +1611,474 @@ its value is quality and memory at depth, not speed. Not built: the sidecar emit
 instead of the shadow, the DSP select pass publishing chosen runs to the GPU, the per-layer chain
 (4k's) driving the gather kernel, the Q staleness rule of 4k (a post-write submission before the
 GPU reads Q).
+
+### Built: the shadow-free split at the op level (2026-09-15, unit f3b4a4c5)
+
+`llama-hetero-decode-attn --cluster --runs --hetero`: the DSP's select pass runs as in runs mode,
+writes the selected blocks minus the HTP's KEEP share (`HTP_FA_CLUSTER_FLAG_KEEP`, percent of the
+score-ordered list, taken from the front) into per-head records of a hetero control region inside
+the shadow buffer (`hdr.hetero_off`, header flag `HTP_FA_CLUSTER_HDR_GPU_RUNS`), publishes the ready
+sequence, attends the dense tail and its kept runs from the shadow, waits for done and merges the
+GPU's split-KV partials, which the merge threads now DMA into VTCM row by row instead of invalidating
+the region line by line. The GPU kernel `fa_dec_runs` (one work-group per KV head and split) spins
+on the ready word with atomic loads, reads the block records and optionally Q with atomic loads,
+maps each row through pos_map to its position in llama's cache, and publishes done from the last
+work-group through a never-reset counter (`counter == want * n_groups`). The tool keeps one kernel
+enqueued ahead, as a per-layer chain would, and rewrites Q after each kernel is enqueued.
+
+Exact in every arm (max err 5e-6 .. 3e-5 against the CPU reference, run sets identical to the host
+greedy). FA op median us, window 64, average cluster 32, 4 GPU splits per head:
+
+| kv, budget | NPU only | GPU all runs | HTP keeps 25% | HTP keeps 50% | HTP keeps 75% |
+|---|--:|--:|--:|--:|--:|
+| 4k, 12.5% | 122 | 122 (GPU 68, HTP idle 44) | 120 | **110** (GPU 57, idle 1) | 121 |
+| 4k, 25% | 189 | 189 (GPU 119, idle 94) | 184 | **170** (GPU 104, idle 16) | 175 |
+| 8k, 12.5% | 202 | 203 (GPU 120, idle 97) | 198 | **172** (GPU 91, idle 7) | 189 |
+| 8k, 25% | 338 | 339 (GPU 224, idle 201) | 319 | **290** (GPU 183, idle 42) | 297 |
+
+"GPU" is the DSP-observed ready-to-done turnaround, "idle" the DSP's wait after its own work.
+
+What the sweep says:
+- With the GPU taking every run the op equals the NPU-only op at every point: the HTP's tail is
+  24 us, the GPU needs 60-120 us after a ready that comes 40 us into the op, and the HTP idles.
+  Balanced at a 50% share, the op is 10% faster at 4k and 14-15% faster at 8k.
+- Without the chain (a fresh enqueue per op, the first sweep) the GPU started 100-150 us late in
+  the arms where it had little work: the Adreno clocks down between kernels, and the DSP waited
+  110-150 us for 50 us of gather. One kernel enqueued ahead removes it entirely; a production
+  chain has 28 layers of kernels queued and never idles inside a token.
+- Work-groups: 4 splits per head (32 groups) is the sweet spot; 2 gives 86 us and 8 gives 100 us
+  for the same rows at 4k, so the per-group fixed cost (spin exit, Q and record loads, the serial
+  softmax over 128 lanes on two lanes) is ~1 us per extra group and dominates small gathers.
+- Plain Q loads were exact even with the kernel enqueued before Q was written: each enqueue here
+  is its own command buffer and the GPU's caches do not survive the boundary. Inside a batched
+  chain they do (the prefill trap), so the atomic Q read stays; it costs 2 us at 32 groups.
+
+Where the rest is, at 4k and 12.5% with the 50% share (110 us): setup 5, select 35 (the GPU cannot
+start before it), HTP tail plus kept runs ~62 in parallel with GPU 57, merge 7 with the partial DMA.
+Two moves would take it further: the GPU doing the selection itself (the centroid scores are a few
+kilobytes of work) so both engines start at Q, worth ~30 us, and a GPU kernel with parallel
+softmax reductions instead of two lanes walking 128 columns, worth 20-30 us of the gather.
+
+### Where the GPU's time goes, measured exactly (2026-09-16)
+
+A poll-first probe (`--pollfirst`, `HTP_FA_CLUSTER_FLAG_POLLFIRST`: the op polls for done right after
+publishing ready, before its own work) makes the DSP-observed ready-to-done turnaround exact instead
+of floored by the DSP's own tail. With the kernel reduced to gate and signal (no Q, no records, no
+rows) the round trip is **6 us** at 32 groups, 2 us at 8 and 11 us at 64: the protocol costs nothing
+worth chasing. The full gather at 4k and 12.5% (117 rows per group) is 56 us, so ~50 us is kernel
+compute for one 128-row chunk, and the split sweep explains it: 8 groups with 5 chunks each take
+71 us, 16 groups with 2 chunks 57, 32 groups with 1 chunk 56, 64 groups with half a chunk 74. A chunk
+costs ~13 us of latency chain (scattered K rows, two 7-step reductions, four steps of 32 scattered V
+loads) and only ~8 groups run concurrently; shrinking the per-group local memory from 9 to 5 KB did
+not change it, so the ceiling is registers or the scheduler. Rotating the local-memory read order per
+lane, to avoid same-address reads, made every phase slower: those reads are broadcast here, and the
+rotation only bought bank conflicts.
+
+**GPU-side selection** (`--gpu-select`, `HTP_FA_CLUSTER_HDR_GPU_SELECT`): every group scores the head's
+centroids against its query rows, ranks them (a barrier-free rank count; a bitonic sort cost the
+same and dropped candidates past 256), walks the DSP's greedy rule and gathers, while the DSP runs no
+select pass and publishes ready right after setup. Exact, run set identical to the host greedy, but
+44 us on top of the gather: scoring 16 (130 centroid rows of 16 uncached loads each, latency-bound
+per lane), rank 21 (260 local reads per lane), publish 9 (the all-devices fence). The DSP's select
+pass is 35 us with the tool's echo write and ~25 without, so moving the selection to the GPU does not
+pay on this SoC; the DSP selects, the GPU gathers.
+
+**Consequence for the design.** The balanced split needs the DSP to hold work that overlaps the GPU's
+50-100 us, and the only work the DSP can hold at a cluster granularity is runs read from a shadow. So
+the shadow-free form (keep 0) is neutral at 4k and 8% better at 8k, and the 13-22% gains of the 50%
+share come with a shadow for the DSP's half: half the memory of today's runs mode, and at 8k the
+uncovered positions above the shadow cap can go to the GPU instead of the dense tail. Per-layer
+production costs not in these numbers: the atomic Q read inside a batched chain (2 us) and the
+DSP's echo write, which the tool alone pays.
+
+### The consecutive-run statistic: how much of a cluster is contiguous in the cache (2026-09-16)
+
+The balanced split above needs the HTP to hold cluster work, and without a shadow the only cluster
+rows the HTP can fetch as one descriptor are runs of consecutive positions inside a cluster (the cost
+model puts the break-even near 8 rows). Whether such runs exist was unmeasured. The sidecar now logs,
+per published chunk (`GGML_HEXAGON_CLUSTER_RUNSTAT=1`), how many cluster rows sit in maximal runs of
+consecutive positions of each length, over the real chunk-local k-means (average cluster 32, chunk
+1024, Qwen3-1.7B, 28 layers x 8 heads).
+
+| rows by run length | 1 | 2-3 | 4-7 | 8-15 | 16-31 | 32+ | rows in runs >= 8 | >= 16 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| wikitext-2, 4k x 2 contexts (224 chunks) | 32.2% | 26.2% | 15.7% | 12.4% | 10.6% | 2.9% | **25.9%** | 13.5% |
+| synthetic filler with 43 key-value needles, 4k (112 chunks) | 33.2% | 20.0% | 10.9% | 9.8% | 16.2% | 9.9% | **35.9%** | 26.1% |
+
+Mean run length 2.05 and 2.16; the longest runs 100 and 110 positions. The layer spread is the
+finding: on wikitext layers 0-2 have 0% of rows in runs of 8 or more, layers 3-5 and 15 and 24-26
+under 12%, layers 6-14 and 20-23 19-46%, layers 16-19 51-59%, layer 27 70%. The needle prompt lifts
+the same layers (layer 27 95%, 17 and 19 76%, 9 68%) and leaves the early ones at 0-7%.
+
+**What it means for the split.** A shadow-free HTP share exists but is thin and layer-dependent:
+about a quarter of the cluster rows on natural text, a third with needles, concentrated in the later
+layers. Fed to the HTP as 2D descriptors straight from the cache (8-31 rows each, ~2.5 us per
+segment per thread), the wikitext share is roughly 40 us of HTP work per op at 4k and 12.5% on top
+of the 24 us tail, which is about the GPU's 50 us for the remaining three quarters: the balance the
+50% shadow share reached, without a shadow, in the layers that have runs. In layers 0-5 the HTP has
+only the tail and the op falls back to the GPU-bound time. Averaged over layers the estimate is 6-8%
+below the NPU-only op at 4k and ~12% at 8k, against 13-22% with the half shadow. The statistic is
+over all clusters; the selected 12.5% may differ, which a decode-time version of the same count
+would settle.
+
+### Selected rows and the best measured share (2026-09-16, unit 9aed338b)
+
+The device was reprovisioned, so this is a new session with a rebuilt host library and the matching v79 skeleton. Two questions were measured: whether long positional runs survive selection on real queries, and which HTP share and GPU split count minimize the existing heterogeneous op.
+
+**Selected positional runs.** `GGML_HEXAGON_CLUSTER_RUNSTAT=2` enables the existing DSP list echo and reads it after each decode graph. The host maps both segments of every selected block through `pos_map`, excludes the four sink positions, sorts the selected positions per head, and counts maximal consecutive runs. Adjacent members of different selected clusters can share a fetch, so this statistic describes the union of selected members; it is not directly comparable to the earlier within-cluster statistic. Echo counts are cleared before each graph so a layer that runs dense contributes no stale sample. This diagnostic is excluded from timing runs.
+
+Qwen3-1.7B Q4_0, clusters averaging 32 keys, chunks of 1024, density 125 permille, window 64, greedy continuation. Each row below contains 32 decode steps x 28 layers x 8 heads; every histogram accounts for all selected non-sink rows, with zero duplicate positions.
+
+| prompt | decode positions | selected rows/head | rows in runs >= 8 | >= 16 | runs >= 8 per head |
+|---|---|--:|--:|--:|--:|
+| wikitext prefix | 4103-4134 | 476.9 | 38.8% | 26.6% | 9.3 |
+| next wikitext slice | 4104-4135 | 474.4 | 34.6% | 22.0% | 9.0 |
+| filler with needles | 4104-4135 | 475.8 | 54.3% | 39.6% | 11.5 |
+| wikitext, longer prefix | 8199-8230 | 593.1 | 37.2% | 25.1% | 11.3 |
+
+At 8k the current shadow covers only the first 5056 positions of an 8704-cell cache; the last row measures selection in that prefix, not a shadow-free selection over the whole context. The layer spread persists: on the two 4k wikitext slices, layers 0 and 2 have only 4-8% in runs >= 8, layers 16-19 have 52-66%, and layer 27 has 78-80%. There is useful contiguous work for the HTP, but a uniform positional-run share would leave some layers GPU-bound. Forming these runs on the execution path and measuring their fetch time remain unbuilt; the histogram alone does not establish a speedup.
+
+**Controlled share sweep.** The harness previously reused one Q for the NPU-only arm and advanced a random generator across GPU arms. It now resets the generator for each arm and changes Q on every iteration, including NPU-only, so all arms execute the same query sequence. The final selected key sets are also compared directly with the NPU-only arm. The host f32 greedy can differ from the DSP's f16 scores at a near-tie (two run IDs at 8k/12% here); the execution comparison uses the actual DSP-selected keys and the CPU attention reference over those keys.
+
+Swept 1/2/4/8 GPU splits per head and HTP KEEP 0/25/50/75/100, then refined KEEP in steps of five. The refined sweep was repeated in reverse order. Each value is a median of 21 ops after one warm-up. Q uses atomic reads, the GPU has one kernel queued ahead, and the sink plus dense window are included. The harness's `--density 12` is **12%, not 12.5%**; the real-query diagnostic above uses 12.5%.
+
+| kv, budget | NPU only + GPU keep-alive (us) | HTP KEEP | GPU splits/head | heterogeneous, forward / reverse (us) | speedup | DSP wait (us) |
+|---|--:|--:|--:|--:|--:|--:|
+| 4k, 12% | 122 | 45% | 2 | 103 / 103 | 1.18x | 0 / 0 |
+| 4k, 25% | 191 | 50% | 2 | 151 / 152 | 1.26x | 1 / 3 |
+| 8k, 12% | 202 | 50% | 2 | 163 / 164 | 1.24x | 1 / 0 |
+| 8k, 25% | 339 | 55% | 4 | 260 / 261 | 1.30x | 2 / 3 |
+| 16k, 12% | 358 | 55% | 2 | 285 / 284 | 1.26x | 6 / 4 |
+| 16k, 25% | 639 | 60% | 4 | 488 / 487 | 1.31x | 0 / 0 |
+
+The keep-alive control is `llama-gpu-keepalive 4 1` running alongside the NPU-only harness. Its NPU times match the ordinary baselines within 0-2 us, so the reduction survives the GPU clock control. All 96 refined GPU arms matched the NPU-only final key sets; maximum absolute attention error was 3.54e-5, with zero DSP done timeouts.
+
+The larger cases need a larger HTP share: at 16k/25%, KEEP 50 leaves the DSP waiting about 55 us, while KEEP 60 reduces the wait to zero and lowers the op from 501-513 us to 487-488 us. More GPU groups are not automatically better: at 4k/12%, KEEP 50 takes 105-106 us with 2-4 splits and 121 us with 8. At 16k/25%, KEEP 0 hits the 64-block GPU record limit and leaves about 23 blocks/head on the HTP, so that arm must not be described as GPU-all or shadow-free.
+
+These are **attention-op gains with the HTP reading its retained blocks from the shadow**. KEEP is a percentage of selected blocks, not allocated storage: neither KEEP 50 nor KEEP 0 removes the harness's shadow allocation. The 16k one-layer harness fits, but it does not demonstrate a 28-layer shadow fitting at 16k. The harness still pays a host enqueue per op, and a production per-layer chain and end-to-end token speedup remain unmeasured. At 4k/12%, repeating the measured 19 us saving across 28 layers would save only 0.53 ms/token before integration overhead.
+
+The next heterogeneous target is now better constrained: DSP selection; HTP for the dense tail and sufficiently long positional runs from the selected union; GPU for the remaining selected positions. Balance by the measured time of each engine, with GPU split count chosen for its remaining row count. The open measurement is whether constructing the positional run lists and executing them preserves the 19-152 us/op saving found with shadow reads.
+
+Reproduce the op sweep point with:
+
+```sh
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-hetero-decode-attn --cluster --runs --hetero --kv 8192 --density 25 --perm chunk --window 64 --iters 21 --gnsplit 4 --keep 35,40,45,50,55,60,65,100
+```
+
+### Positional-run split without a K/V shadow (2026-09-16, unit 9aed338b)
+
+The positional-run experiment is now built in `llama-hetero-decode-attn --cluster --runs --hetero --pos-runs N`. The best measured split on the 4k replay is the simple one: GPU for all selected cluster members and sinks, HTP for the dense tail. Sending long positional runs to the HTP preserves the selected keys but costs more than it saves.
+
+`HTP_FA_CLUSTER_HDR_POS_RUNS` omits both K/V page regions from the allocation. With `N > 0`, the DSP maps the selected blocks to a bitmap, scans the union for consecutive positions, packs runs of at least N rows into native positional DMA blocks, and sends the remaining positions to the GPU. These blocks use the cache row stride for both packed segments. With `N = 0`, the DSP passes the original block descriptors directly to the GPU; if a head exceeds the record capacity, it expands them into an index list. Capacity is 64 blocks through 8k and 128 above 8k. All selected rows still go to the GPU in the index-list case. This avoids the older KEEP 0 path's fallback to HTP shadow reads. Both formats use the existing ready/done protocol and split-KV merge.
+
+**Replay from real selections.** `GGML_HEXAGON_CLUSTER_RUNSTAT=3` dumps selected positions in member order, followed by `|` and each block's two segment lengths. `--positions FILE` reads one such line per KV head; the four sinks are implicit. Captures use Qwen3-1.7B Q4_0, density 125 permille, average cluster 32, chunk 1024, and decode position 4118 for wikitext or 4119 for the second wikitext slice and needles. All 28 layers had published their fourth chunk before these snapshots. The first decode snapshot was unsuitable: the asynchronous sidecar still covered only 3k in most layers.
+
+The replay preserves selected members, member order, and segment sizes, using identical synthetic Q/K/V values across arms. Shadow row addresses are repacked, so the shadow baseline gets favorable locality. Centroid scoring and greedy selection are bypassed in every replay arm; list loading, routing, attention, and merging are timed. The 4352-cell cache has a 4096-cell selected prefix and a 256-cell dense tail. Mask values are synthetic too; this is an operator replay, not a replay of model logits.
+
+Mean of the 28 per-layer medians, 15 ops after warm-up, two GPU splits per head, times in us:
+
+| wikitext replay arm | FA op | K/V shadow allocated |
+|---|--:|--:|
+| HTP reads selected shadow blocks | 134.3 | 17 MiB |
+| HTP gathers selected positional rows | 288.2 | 0 |
+| Existing GPU-all path | 107.4 | 17 MiB |
+| Shadow-free GPU-all, N = 0 | **107.4** | **0** |
+| HTP positional runs >= 8, GPU remainder | 141.1 | 0 |
+| HTP positional runs >= 16, GPU remainder | 136.4 | 0 |
+
+The shadow-free GPU-all arm is 1.25x faster than HTP shadow reads and 2.68x faster than HTP positional gathers. Metadata and control occupy 3 MiB; the complete one-layer alias drops from 39 to 22 MiB. These allocation numbers include the harness's control and diagnostic storage. They do not demonstrate a complete model fitting at a longer context.
+
+Layers 0/7/16/19/27 from the second wikitext slice give 134.6 us for HTP shadow reads, 108.8 for shadow-free GPU-all, and 143.2/137.8 for positional thresholds 8/16. The same layers from the needle prompt give 135.4, 105.4, and 146.2/138.0 us. A GPU keep-alive control on wikitext layers 0/16/27 changes the HTP shadow baseline by at most 1 us. The advantage survives that clock control.
+
+**Why keeping long runs loses here.** At N = 8, routing takes 28.7 us on average, and the HTP receives 177.7 selected rows/head in 5.2 blocks in addition to its tail. At N = 16 it receives 127.1 rows in 2.9 blocks, but routing still takes 28.9 us. The GPU-all handoff takes 5.1 us. The HTP decode phase grows from 55.7 us with just the tail to 77.2 or 69.9 us with the kept runs. A scalar bitmap in VTCM was even slower; moving the bitmap and member-map reads to cached DSP memory reduced a representative routing pass from 87 to 25 us, but did not make the split competitive. The existence of contiguous rows alone does not establish a useful HTP share. This also explains why a 50% shadow share, beneficial in the earlier 64-cell-tail sweep, loses to GPU-all with this 256-cell tail.
+
+**Live DSP selection and larger caches.** Synthetic chunk-local clusters, a 256-cell tail, 21 iterations, with scoring, greedy selection, echo, and handoff included. Density is the harness's integer percent. The shadow-free GPU-all arm uses two splits/head in this table; KEEP 50 uses two except at 16k/25%, where it uses four. KEEP 50 is a comparison point, not a retuned optimum.
+
+| kv, budget | HTP shadow (us) | HTP KEEP 50 + GPU (us), shadow allocated | GPU-all, no shadow (us) |
+|---|--:|--:|--:|
+| 4k, 12% | 141 | 127 | 119 |
+| 4k, 25% | 208 | 171 | 175 |
+| 8k, 12% | 221 | 181 | 194 |
+| 8k, 25% | 356 | 268 | 313 |
+| 16k, 12% | 376 | 296 | 372 |
+| 16k, 25% | 656 | 525 | 656 / 658 repeat |
+
+The 16k/25% case selects about 87 packed blocks/head, beyond the older 64-block GPU record. Expanding those blocks into indices took 82 us and produced a 731 us op. Raising the shadow-free record capacity to 128 reduced handoff to 14-15 us; binary search over block prefix lengths for lists longer than 32 removed another 31 us from the four-split op. Two splits then beat four: 656-658 us versus 667-671; one and eight took 725 and 703. The HTP shadow baseline with GPU keep-alive was 654 us, confirming that this case is effectively neutral. The larger record is enabled only above 8k, preserving small-cache local storage. At 32k/25%, about 174 blocks/head exercise the index-list fallback and all selected rows still reach the GPU, with zero HTP retained rows. The GPU is the limiting engine at depth: the shadow-free form saves memory, but it does not preserve the balanced shadow-backed speedup.
+
+The result supports DSP selection, GPU cluster gathers, and HTP tail attention as the next integration target. At the 4k replay shape the sum of attention medians falls from 3.76 to 3.01 ms across 28 layers, a 0.75 ms saving before integration costs. Selection, the live sidecar without shadow writes, cache visibility in a batched per-layer chain, and end-to-end token timing still need to be measured together. For a larger shadow-free HTP share, the next useful experiment is to prepare positional-run metadata during clustering, so decode does not pay a bitmap construction and scan. The positional-run mode remains an experimental option in the harness; the model backend does not enable it automatically.
+
+**Validation.** Replay arms, live-selection sweeps, and boundary cases matched the CPU attention reference, with maximum absolute error 4.15e-5, identical selected key sets across execution arms, and zero DSP done timeouts. Cases include a zero-row GPU share, packed positional segments, an index-list fallback above 128 blocks, and the bitmap scratch fallback above 16k. The harness now checks the saved output of the final changing-Q iteration before draining the queued kernel with a repeated Q, and rejects non-finite errors. The standard `test-backend-ops -b HTP0 -o FLASH_ATTN_EXT` run passed 2174/2196 cases; all 22 failures were `sinks=1`, in the previously documented threshold-sensitive family, with no non-sinks failures. This is not a clean pass of the full suite.
+
+Reproduce a shadow-free op with live DSP selection over synthetic clusters, or supply captured selections:
+
+```sh
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-hetero-decode-attn --cluster --runs --hetero --pos-runs 0 --kv 8192 --density 25 --perm chunk --window 256 --iters 21 --gnsplit 2
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-hetero-decode-attn --cluster --runs --hetero --pos-runs 8 --kv 4352 --window 256 --positions wiki-4k-l19.txt --iters 15 --gnsplit 2
+```
+
+### Prepare positional spans during clustering (2026-09-16, unit 9aed338b)
+
+Preparing metadata removes much of the per-decode routing cost, but does not yet make the shadow-free NPU/GPU split faster than GPU-all. This experiment uses the same SM8750 / Adreno 830 / v79 unit as the positional-run measurements above. It does not physically rearrange K/V.
+
+`GGML_HEXAGON_CLUSTER_PREPARED=N` makes the whole-cluster sidecar prepare a second member map, sorted by position within each cluster, plus a span-end array. Consecutive native runs of at least N rows are marked for HTP; adjacent shorter runs form one logical GPU span. The original distance-sorted member map and centroid accumulation order are preserved. Both arrays are flushed before the chunk is published. The extra storage is eight bytes per allocated row per KV head, plus a 128-byte threshold header per layer. There is no K/V copy in this metadata.
+
+`llama-hetero-decode-attn --cluster --runs --hetero --prepared-runs N` consumes these spans after selection. It walks span boundaries instead of building and scanning the selected-position bitmap. HTP receives native positional DMA blocks; the GPU gathers the remaining rows through the sorted member map. Both engines use the original positional K/V cache. The threshold is fixed when metadata is prepared. N = 0 is a GPU-all control with the sorted map. More than 256 input blocks falls back to the bitmap path; more than 128 retained HTP blocks routes the excess to the GPU. GPU record overflow expands to absolute indices, preserving every selected row.
+
+**Capture without a shadow.** `GGML_HEXAGON_CLUSTER_NO_SHADOW=1`, with whole-cluster runs enabled, omits K/V pages and their writes. Centroids are accumulated directly from the original K rows in the same member order. A Qwen3-1.7B Q4_0 capture at 8704 cache cells allocated 80 MiB of cluster metadata/control across 28 layers and published all eight 1024-row chunks before the snapshot at decode position 8214. This avoids the shadow allocation cap in the earlier 8k capture. The model capture still uses HTP positional gathers; the prepared heterogeneous consumer is exercised in the operator harness. This is not an end-to-end heterogeneous token-speed measurement.
+
+The selected-position dump now adds a second `|` footer containing full cluster lengths in member order. Prepared replay requires this footer so it does not mistake a 64-row DMA fragment for a complete cluster. The no-shadow capture emits unpacked segments; the 8k replay reconstructs the existing two-segment packing from those cluster lengths for all arms. It preserves selected members and their order.
+
+**Matched 8k replay.** Wikitext selections from layers 0/7/16/19/27, 8448 cache cells, 8192-row prefix, 256-row dense tail, density 125 permille, average cluster 32, eight KV heads, two GPU splits/head, 21 iterations. As above, Q/K/V and masks are synthetic, and centroid selection is bypassed. The table is the mean of five per-layer FA medians; routing is the mean of the final-op profile samples, included in FA time.
+
+| Arm | FA op (us) | Routing (us) | K/V shadow |
+|---|--:|--:|---|
+| HTP selected shadow blocks | 191.2 | - | Yes |
+| Shadow-backed HTP KEEP 50 + GPU | **155.0** | - | Yes |
+| GPU-all, original member map | **158.2** | 5.4 | No |
+| GPU-all, prepared sorted member map | 157.8 | 5.6 | No |
+| Bitmap positional runs >= 8 | 217.6 | 47.0 | No |
+| Prepared positional runs >= 8 | 185.6 | 23.2 | No |
+| Prepared positional runs >= 16 | 178.2 | 20.0 | No |
+| Prepared positional runs >= 32 | 172.8 | 16.8 | No |
+
+At threshold 8, preparation cuts routing by 51% and the full op by 15% versus bitmap routing. It still trails GPU-all by 17%. Threshold 32 reduces that gap to 9%, mostly by returning work to the GPU. One and four GPU splits/head were also tested on layers 7/16/27; neither made the prepared split beat the best GPU-all arm. At 4k, layers 0/16/27 measured 108/132/160 us for prepared threshold 8, versus 104/109/110 us for GPU-all. Cold preparation in the 8k replay took 97-124 us per layer across eight heads, outside decode timing, and used 540800 extra bytes. This replay setup cost is not a measurement of sidecar scheduling or publication latency.
+
+**Locality and balance.** The prepared metadata can identify consecutive positions inside one cluster. The bitmap can also join adjacent positions from different selected clusters, whose joint selection is unknown during clustering. Across all 28 captured layers, only 20.3% of the 8k selected rows belong to within-cluster native runs of length >= 8; at thresholds 16 and 32, this falls to 10.6% and 2.5%. At 4k, the corresponding threshold-8 shares are 18.4% for wikitext, 18.3% for the second slice, and 32.8% for needles. These are selected-prefix shares, excluding the dense tail.
+
+The share also varies sharply by head. At 8k layer 16, threshold 8 sends 648/727/515/698/284/92/318/0 selected rows to HTP across the eight heads, in addition to its dense tail. Layer 0 has no qualifying rows. Thus average work moved to HTP does not imply an evenly shortened GPU path. The profile still shows GPU wait time, while HTP attention and routing grow. Sorting metadata alone has not produced a profitable balance.
+
+The remaining physical-layout hypothesis is to compact cluster K/V rows in place, so any chosen cluster is contiguous regardless of its original positions. That would need a position-to-storage mapping for cache writes, masks, rewinds and eviction, and publication only after both K and V have moved. It remains unimplemented here. The current evidence supports GPU selected-row gathers plus HTP dense-tail attention as the faster shadow-free option, while prepared spans remain an opt-in experiment.
+
+**Validation.** The host, v79 skeleton and harness built without warnings. The 101 harness runs matched the CPU reference with maximum absolute error 3.47e-5, identical selected key sets across arms, and zero done timeouts. Boundary cases covered an empty GPU share, 4k through 32k caches, random and chunk-local members, and the >256-input-block bitmap fallback. A constructed fragmented selection also filled all 128 retained HTP blocks and forced the prepared GPU records to expand to absolute indices on all eight heads; it preserved all 3004 selected rows/head. The final binary smoke repeated the 8k comparison. `test-backend-ops -b HTP0 -o FLASH_ATTN_EXT` passed 2177/2196; all 19 failures were `sinks=1`, in the previously documented family, with no non-sinks failures. The full suite is not a clean pass. Captures, replay inputs, command logs and build hashes are saved in `/tmp/hetero-prepared-20260916/`.
+
+Reproduce the prepared replay, or capture cluster metadata without shadow writes:
+
+```sh
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-hetero-decode-attn --cluster --runs --hetero --prepared-runs 8 --kv 8448 --window 256 --positions wiki-8k-l16.txt --iters 21 --gnsplit 2
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib GGML_HEXAGON_CLUSTER_RUNS=1 GGML_HEXAGON_CLUSTER_AVG=32 GGML_HEXAGON_CLUSTER_CHUNK=1024 GGML_HEXAGON_CLUSTER_ATTN=125,64 GGML_HEXAGON_CLUSTER_PREPARED=8 GGML_HEXAGON_CLUSTER_NO_SHADOW=1 GGML_HEXAGON_CLUSTER_THREADS=4 GGML_HEXAGON_CLUSTER_RUNSTAT=3 ./bin/llama-completion -m /data/local/tmp/gguf/Qwen3-1.7B-Q4_0.gguf -f /data/local/tmp/llama/wiki-8k.txt -dev HTP0 -ngl 99 -fa on -c 8704 -b 1024 -ub 1024 -n 16 -t 6 --temp 0 --no-display-prompt -v
+```
+
+### Beyond a 50/50 shadow-backed split (2026-09-16, unit 9aed338b)
+
+Two improvements survive further measurement. The 8k real-selection replay prefers about 40% of selected blocks on HTP, because HTP also owns the dense tail. At the larger 16k/25% synthetic workload, having the GPU read the existing K/V shadow as well as HTP reduces attention time by about 8% versus the original 50/50 split, or 5% versus its tuned share. A row-count cap per GPU head was also built and tested, but its routing overhead made it slower than the tuned percentage split.
+
+**Preserve the cluster layout in replay.** The earlier replay packed selected rows together. `GGML_HEXAGON_CLUSTER_RUNSTAT=3` now adds a third `|` footer with each block's two original cluster-row offsets. The harness reconstructs the shadow at those offsets, including gaps between selected clusters; it validates bounds, duplicate rows and cluster continuity. Old replay files still work. Prepared positional spans also use the restored cluster offsets. This prevents a GPU shadow-read experiment from benefiting from artificial compaction of the selected set.
+
+The device was reconnected with an empty filesystem during this experiment. The host/HTP pair, model and prompts were restored before the new measurements. The complete 8k wikitext capture is at decode position 8214, with all eight chunks published for all 28 layers. It uses the same model and clustering settings as above, but a new selection snapshot. As before, the replay uses synthetic Q/K/V and masks; selection is supplied and its computation is excluded. The 8448-cell cache leaves a 256-row dense tail. Each timing is a median of 31 ops after warm-up, with changing Q, two GPU splits/head and one kernel queued ahead.
+
+**Tune the share before changing the method.** Means of all 28 layer medians, measured once in forward layer/arm order and once in reverse:
+
+| Arm | Forward (us) | Reverse (us) |
+|---|--:|--:|
+| HTP selected shadow blocks | 193.1 | 193.0 |
+| Original HTP KEEP 50 + positional GPU gathers | 153.7 | 153.5 |
+| Original HTP KEEP 40 + positional GPU gathers | **145.1** | **143.5** |
+
+KEEP 40 beat KEEP 50 in all 28 layers in both orders. The total saving over 28 attention ops is 0.24-0.28 ms, about 6% of their 50/50 attention time. This is not an end-to-end token-speed measurement. KEEP remains a percentage of selected blocks, not total rows or execution time; the dense tail remains entirely on HTP. The shorter 64-row tail and larger selected prefixes in earlier sections favor a larger HTP share.
+
+**Both engines read the shadow.** `--gpu-shadow` changes the harness GPU's K/V base and strides to the cluster-ordered shadow and uses block row offsets directly. The default GPU path still maps block rows through `pos_map` and reads the positional cache. Selection, Q, selected keys, GPU math, handoff and merge are unchanged. This option uses the existing shadow allocation and makes no additional K/V copy. The improvement includes both the changed memory layout and removal of the position-map lookup; these contributions were not isolated.
+
+On the five real-selection layers 0/7/16/19/27, the mean at KEEP 40 is 143.4 us for positional GPU gathers and 143.0 us for GPU shadow reads. That is too small a difference to choose a winner. The larger live-selection experiment gives a repeatable benefit. The following uses synthetic chunk-local clusters, kv = 16384, density = 25%, window = 256, two GPU splits/head, and 31 changing-Q ops. DSP scoring, greedy selection, echo and handoff are all timed. The repeated sweep runs shares in descending order and the GPU-shadow arm before the positional-gather arm. Seeds change K/V, cluster sizes/member permutations and the query sequence.
+
+| Seed | Original KEEP 50 (us) | Original tuned KEEP 55 (us) | Both read shadow, KEEP 50 (us) | Both read shadow, KEEP 52 (us) |
+|---|--:|--:|--:|--:|
+| 1234 | 515 | 498 | 481 | **476** |
+| 4321 | 515 | 496 | 478 | **473** |
+| 2026 | 519 | 503 | 482 | **476** |
+| Mean | 516.3 | 499.0 | 480.3 | **475.0** |
+
+At the same KEEP 50, changing the GPU source cuts time by 7%. Retuning to KEEP 52 brings the total reduction to 8% versus original KEEP 50 and 4.8% versus original KEEP 55. HTP's wait for GPU completion falls from 49-51 us at original KEEP 50 to 14-15 us with GPU shadow reads, then 1-3 us at KEEP 52. Four GPU splits/head were also measured and did not improve the repeated result. The HTP-only baseline is about 655 us, so the best split is about 1.38x faster for this op. At 8k/25% with a 256-row tail, the initial live sweep measured 271 us for original KEEP 50 and 263 us for both engines reading the shadow. The memory-layout benefit grows with the selected workload; it is not a universal gain at small shapes.
+
+**Cap GPU rows instead of block percentage.** `--gpu-rows R1,R2,...` chooses the longest suffix of the selected block list that fits a row cap independently for each KV head. The cap is specified in multiples of 64; HTP keeps the remaining blocks and dense tail. The existing 64-block GPU record capacity is respected, and excess work stays on HTP. This can limit slow GPU heads when cluster sizes differ. The implementation copies at most 64 descriptors into cached DSP memory and sums their row counts before publishing the record.
+
+At 8k, caps 512/576/640/704/768 were tested on the five real-selection layers. The best, 640, gives 148.0 us with positional gathers and 148.8 us with GPU shadow reads, against 143.4/143.0 for KEEP 40. A representative layer's select/routing phase rises from 24 to 30 us. At 16k/25%, caps 1792 through 2304 in steps of 128 give a best 485 us with GPU shadow reads, versus 473-476 us for the tuned percentage split. More even GPU row counts did not offset the extra routing work and the remaining variation in HTP block costs.
+
+These modes remain opt-in operator experiments. A 16k one-layer shadow fits in the harness; this does not establish that all 28 model layers can retain a full shadow at 16k. The result supports testing GPU reads from an already available shadow when the selected workload is large, with the HTP share tuned to the actual dense-tail size. Starting GPU attention per head while DSP selection finishes other heads is a separate, unmeasured opportunity to hide selection latency; it would require changing the ready protocol.
+
+**Validation.** All 186 harness invocations passed their CPU-reference and selected-key checks, with maximum absolute error 3.07e-5 and zero done timeouts. Boundary checks include empty/all-GPU shares, the 64-block record limit at 32k, four query heads sharing one KV head, original-address and legacy prepared replays, and rejection of invalid row caps, shadow-free combinations and out-of-range row addresses. The host, v79 skeleton and tools built without warnings. The standard `test-backend-ops -b HTP0 -o FLASH_ATTN_EXT` suite passed 2182/2196 cases; all 14 failures were in the documented `sinks=1` family, with no non-sinks failures. This is not a clean full-suite pass. Captures, scripts, logs, source snapshots and final build hashes are in `/tmp/hetero-shadow-split-20260916/`.
+
+Reproduce the larger comparison and the alternative row cap:
+
+```sh
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-hetero-decode-attn --cluster --runs --hetero --kv 16384 --density 25 --perm chunk --window 256 --iters 31 --gnsplit 2 --keep 50,52,55,60
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-hetero-decode-attn --cluster --runs --hetero --gpu-shadow --kv 16384 --density 25 --perm chunk --window 256 --iters 31 --gnsplit 2 --keep 50,52,55,60
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-hetero-decode-attn --cluster --runs --hetero --gpu-shadow --gpu-rows 1792,1920,2048,2176,2304 --kv 16384 --density 25 --perm chunk --window 256 --iters 31 --gnsplit 2
+```
+
+### Per-head overlap and physical K/V rearrangement (2026-09-16, unit 9aed338b)
+
+Both experiments now work in `llama-hetero-decode-attn`. Per-head publication reduces decode latency at the same split, and physical rearrangement removes the K/V shadow while retaining nearly the same decode time. These are operator experiments; the model cache lifecycle does not yet support this representation.
+
+**Overlap selection with GPU attention.** `--overlap` lets each DSP selection worker publish its head's GPU records as soon as that head is selected. Q is flushed before selection. The worker copies and flushes the selected-block record, then publishes the op sequence in record word 4. Each GPU workgroup polls its own head's sequence with an acquire load. The existing final GPU counter, completion flag and NPU merge remain unchanged. Echo lists are copied before partitioning so correctness checks still see the complete selected set. This also parallelizes the formerly serial echo and handoff copies.
+
+`--overlap-barrier` is the attribution control: it does the same parallel publication, but GPU workgroups wait on the global ready word until all selection workers finish. Both modes require live DSP selection; captured-list replay and `--pollfirst` are rejected. GPU ready-to-done telemetry in these modes starts before selection, so it cannot be compared directly with the old post-selection turnaround.
+
+**Same ratio, new method.** The following numbers are means of three seeds' 31-op medians with changing Q: kv = 16384, density = 25%, window = 256, eight KV heads, GQA = 2, D = 128, two GPU splits/head, chunk-local synthetic clusters. The arm order is reversed for the middle seed. Every row below uses KEEP 50.
+
+| Method | Attention op (us) | K/V shadow per layer (MiB) |
+|---|--:|--:|
+| Both engines read shadow, original handoff | 477.3 | 64 |
+| Shadow, parallel handoff, GPU held at barrier | 438.7 | 64 |
+| Shadow, per-head overlap | **424.3** | 64 |
+| Physically rearranged K/V, original handoff | 482.3 | **0** |
+| Physically rearranged K/V, per-head overlap | **424.7** | **0** |
+
+The complete change saves 11% at the same 50/50 share. About 38.7 us comes from parallel handoff; allowing early GPU attention saves another 14.3 us. It is therefore incorrect to attribute the whole improvement to hiding GPU work under selection. The previous tuned shadow arm, KEEP 52, is 472.7 us in this run; the combined KEEP 50 experiment has about 10% lower latency. NPU-only attention is about 655 us, giving the combined path about 1.54x operator speedup.
+
+A representative final op changes selection/handoff from 168 us to 127 us while NPU attention remains about 281-282 us. The first six heads publish around 70-73 us after selection starts; the remaining two publish around 123-125 us. Median NPU wait for the GPU falls from 8-17 us to zero at KEEP 50. The phase values are single-op profiles, not the medians used in the table. GPU completion observed by the NPU remains bounded by the NPU's own completion when the GPU finishes first.
+
+**Physical rearrangement, not a gathered copy.** `--reorder` cycle-permutes the completed prefix of the existing K and V allocations independently for each KV head. `pos_map[head][row]` retains the original position, and the dense tail stays in position order. The original cache remains interleaved by head: cluster members occupy consecutive row indices, with the original row stride. HTP uses its existing two-dimensional DMA fetch for those rows; GPU uses block row indices directly. The header layout allocates metadata but zero K/V shadow bytes. This is distinct from the old `--inplace` option, which selects fixed positional pages without clustering or moving rows.
+
+At 16k the shared allocation falls from 134 MiB to 70 MiB: one 64 MiB K/V cache replaces a cache plus its 64 MiB shadow. Metadata/control rounds to 4 MiB; the remaining space is existing harness scratch. The cycle algorithm needs 16,640 bytes of scratch (one visited byte per prefix row and a 512-byte K/V row pair), reused across heads. Validation separately uses 655,360 bytes of inverse-position mappings and hashes; these are reference-only allocations, not another K/V copy. Every original row is hashed before moving, and every resulting row, including the untouched dense tail, is checked afterward. CPU attention references continue to use original token positions through the inverse map.
+
+The CPU prototype spends about 10.1-10.3 ms moving data and another 2.6 ms flushing the entire 16k prefix per layer, outside decode timing. This is a one-time bulk rearrangement measurement with verification-warmed input, not an incremental clustering cost or an end-to-end token-speed result. Clustering itself is also excluded from these setup costs. A production version must reorder each completed chunk once, coordinate publication with readers, and preserve or remap position-dependent masks, cache rewinds, slot reuse, KV copies and dense fallback. The asynchronous sidecar must not mutate a prefix while attention reads it. No model-level memory saving or token-throughput claim is established here.
+
+**Smaller workloads and real selections.** At 8k/12% live selection, KEEP 50 changes from 182 us (shadow) to 175 us (overlap) and 174 us (overlap plus rearrangement); at 8k/25%, it changes from 262 us to 244 us and 245 us respectively. These smaller live checks use one seed. On captured original-offset 8k selections, five layers average 149.0 us for shadow versus 150.8 us for rearranged K/V at KEEP 40. Repeating in reverse layer order with adjacent rearranged/shadow pairs gives 146.4 versus 150.8 us. KEEP 50 shows a larger penalty: 153.0-153.4 us versus 159.6-160.2 us. This replay excludes selection, so it tests memory layout rather than overlap; rearrangement is a memory tradeoff, not a universal latency improvement.
+
+**Validation.** All 68 harness invocations, including the preliminary sweeps, passed CPU-reference and selected-key checks with maximum absolute error 2.75e-5 and zero GPU done timeouts. Boundary coverage includes KEEP 0/50/100, identity/chunk/random permutations, one KV head with four query heads, four GPU splits/head, 32k with the 64-record GPU limit, row caps, prepared-list compatibility, and invalid mode combinations. All physically rearranged rows and dense tails passed their hash checks. The build completed without warnings. `test-backend-ops -b HTP0 -o FLASH_ATTN_EXT` passed 2171/2196; all 25 failures are in the previously problematic `sinks=1` family, with no non-sinks failures. The previous run had 14 failures in that family; this is not a clean suite pass or a matched-input regression comparison.
+
+Artifacts, source snapshots and scripts are in `/tmp/hetero-overlap-reorder-20260916/`. `confirm.py` reproduces the table; the earlier `live-*` sweeps preceded the barrier control and the batched cache-flush change and are preliminary. Reproduce one seed from the device directory:
+
+```sh
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-hetero-decode-attn --cluster --runs --hetero --gpu-shadow --kv 16384 --density 25 --window 256 --perm chunk --gnsplit 2 --keep 50 --iters 31
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-hetero-decode-attn --cluster --runs --hetero --gpu-shadow --overlap-barrier --kv 16384 --density 25 --window 256 --perm chunk --gnsplit 2 --keep 50 --iters 31
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib ./bin/llama-hetero-decode-attn --cluster --runs --hetero --reorder --overlap --kv 16384 --density 25 --window 256 --perm chunk --gnsplit 2 --keep 50 --iters 31
+```
+
+### Full-model overlap and physical K/V rearrangement (2026-09-16, unit 9aed338b)
+
+The Hexagon backend now runs the combined method inside normal model decode graphs. This is an opt-in research path. HTP still runs the projections, centroid scoring, its selected blocks, the dense tail, and the final partial merge. GPU attention is queued before graph submission and starts for each KV head when HTP publishes that head's selection. Both engines read either the existing shadow or the physically rearranged cache. The backend and operator harness share `ggml/src/ggml-hexagon/cluster-attn.cl.h`.
+
+The controls are:
+
+| Variable | Meaning |
+|---|---|
+| `GGML_HEXAGON_CLUSTER_ATTN=125,64` | Select about 12.5% of clustered prefix rows, with a 64-cell minimum dense tail. |
+| `GGML_HEXAGON_CLUSTER_HETERO=50` | HTP keeps 50% of selected blocks; GPU receives the rest, subject to its existing 64-record limit per head. Unset or `-1` disables GPU attention. |
+| `GGML_HEXAGON_CLUSTER_OVERLAP=1` | Default: per-head handoff and early GPU attention. `0` uses the original serial handoff; `2` retains parallel handoff but holds GPU attention at the global barrier. |
+| `GGML_HEXAGON_CLUSTER_REORDER=1` | Cycle-permute completed chunks in the original K/V allocations and allocate metadata without a K/V shadow. |
+| `GGML_HEXAGON_CLUSTER_SYNC=1` | Wait for clustering at graph boundaries. Heterogeneous and rearranged modes currently enable this automatically; set it explicitly for a matched HTP-only control. |
+
+The new modes select the existing whole-cluster implementation and disable incompatible prepared/gather layouts. The initial integration accepts single-token decode over a contiguous, fully visible prefix, interleaved F16 K/V, F32 Q, and a common GQA group size across layers. GPU attention requires D = 128 and G = 1..4. Shape, mask, control-buffer capacity, and VTCM checks gate dispatch. Unsupported decode graphs use the dense path.
+
+**Cache ownership.** The sidecar prepares each chunk's centroids and permutation without moving K/V or publishing the chunk. After the sidecar becomes idle, the graph thread moves that chunk once, flushes it, and publishes its directory entry. It leaves the dense tail in position order. Normal scratch is `5 * chunk_rows + 4 * D` bytes, or 5,632 bytes for a 1,024-row chunk at D = 128; verification adds row hashes. There is no second K/V allocation.
+
+Before cache export, overwrite, clear, a rewind into prepared chunks, or incompatible cache operations, the backend restores positional order. Read-only export retains the metadata, and tail rewinds retain the valid arranged prefix. CPU in-place cache operations also trigger restoration when their writable view is initialized: F16 context-shift RoPE executes on the CPU and bypasses Hexagon's graph-compute callback. Cache import invalidates metadata; a validated prefix can be clustered again after the first dense decode. Thus import or a prefix rewind can change the sparse/dense execution path while metadata is rebuilt. The tested lifecycle behavior is described below; arbitrary concurrent access to one context is outside this prototype.
+
+**Full-model memory.** Qwen3-1.7B Q4_0, 28 layers, eight KV heads, D = 128, F16 K/V. These are backend allocation sizes, rounded to MiB, rather than process RSS:
+
+| Prompt / cache capacity | Original K/V | Cluster allocation with shadow | Cluster allocation with rearrangement | K/V shadow removed |
+|---|--:|--:|--:|--:|
+| 4,096 / 4,608 cells | 504 MiB | 551 MiB | 47 MiB | **504 MiB** |
+| 8,192 / 8,704 cells | 952 MiB | 1,011 MiB | 59 MiB | **952 MiB** |
+
+**Initial unpinned full-model decode timing (superseded below).** Each arm processes the same wikitext prompt and 64 fixed continuation tokens. All 28 transformer blocks run on HTP; the GPU work is dispatched inside attention. The Q6_K output projection falls back to CPU, as identified in the follow-up profile below. Batch and ubatch are 1,024, CPU threads are six, density is 125 permille, and the window is 64. The table gives the mean of three runs' mean latencies for decode calls 2..64, with the range across those three runs in parentheses. Model loading, prefill, the first decode call, and logit-file writes are excluded. Arm order is forward, reverse, then interleaved. `CLUSTER_MEM_MB=1152` permits a complete shadow at 8k, so both layouts cover the same prefix.
+
+| Method | 4k prompt, ms/token | 8k prompt, ms/token |
+|---|--:|--:|
+| HTP-only selected shadow blocks | 39.81 (37.27-41.24) | 46.73 (45.85-47.43) |
+| Shadow KEEP 50, original handoff | 38.07 (37.32-38.83) | 44.27 (42.78-45.87) |
+| Shadow KEEP 50, per-head overlap | 39.00 (36.77-41.20) | 42.88 (39.93-47.27) |
+| Rearranged K/V KEEP 50, per-head overlap | 40.07 (37.57-41.40) | **41.54 (39.59-43.67)** |
+
+In this initial sweep, at 8k the combined path has 6.2% lower steady decode latency than the original shadow split, or 24.08 versus 22.59 tokens/s. It wins in each of the three rounds by 4.8-7.5%. At 4k it is 5.3% slower, also consistently across the three rounds. The 8k result is encouraging but does not establish a general winner: the runs vary substantially and cover one model and one prompt per length. The comparison with HTP-only also includes effects such as GPU launch overhead and shared-bus activity, which were not isolated here. The follow-up 4k profile below identifies CPU output-projection variation as a major confounder and does not reproduce the 4k regression under a matched CPU frequency control; these initial full-model percentages should not be read as isolated attention speedups.
+
+**Setup is still expensive.** Moving all prepared chunks costs 59-63 ms at 4k and 134-169 ms at 8k, including cache maintenance and without verification hashes. Clustering and GPU setup add further work: mean first-decode latency is 456 versus 508 ms at 4k, and 737 versus 961 ms at 8k, for original shadow versus rearrangement. The synchronized publication policy also contributes to prefill time. In this sweep, prefill plus all 64 decode calls totals 6.06 versus 6.22 seconds at 4k and 13.27 versus 14.02 seconds at 8k. These totals include substantial prefill drift; the 8k prefill observations range from 8.1 to 10.6 seconds. The measured steady decode improvement therefore does not establish a faster complete request. The 64-call timing window does not cross a new 1,024-row chunk boundary.
+
+**Validation.** At 4k, all 72 captured logit vectors, each with 151,936 entries, match bit for bit between shadow and rearranged storage: 36 vectors each at 12.5% and full selection. The cases include ordinary decode, tail rewind, state save/load, cache clear/reuse, sequence copy, a masked prefix, and context shift. Tail rewind also reproduces the pre-rewind logits exactly. At 8k, all 65 vectors match bit for bit between original shadow handoff and rearrangement with overlap. A separate 1,024-token prompt with 128-row chunks and 136 decode calls crosses a new chunk boundary; all 137 vectors match bit for bit. Every moved/restored row passes its permutation/hash check. These 274 vector comparisons establish parity between the clustered paths. A separate full-selection comparison against dense HTP differs by up to 0.96 in logits over 16 decode calls, with RMS difference 0.151 and 15/17 matching top choices including the prefill output; perplexity and dense-attention equivalence are not established.
+
+The final 16k operator checks pass their CPU references with maximum absolute error 1.46e-5, identical selected keys, and zero DSP done timeouts. Normal `llama-completion` also completes a 64-token greedy continuation with rearrangement and GPU dispatch active. The Android build passes, and the backend also passes a syntax check without `GGML_HEXAGON_HETERO` (with the existing unused `hetero_slot` warning). The existing `FLASH_ATTN_EXT` checks filtered to `sinks=0` pass 1108/1108. The earlier unfiltered suite's sink failures remain as documented above.
+
+Artifacts and reproducible drivers are in `/tmp/hetero-full-model-20260916/`: `bench.py`, `bench.json`, `model-check.cpp`, `validate-v5.py`, `validation.json`, source snapshots, and binary hashes. From the device's `/data/local/tmp/llama.cpp` directory, normal completion can use the integration directly:
+
+```sh
+LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=lib \
+GGML_HEXAGON_CLUSTER_ATTN=125,64 \
+GGML_HEXAGON_CLUSTER_HETERO=50 \
+GGML_HEXAGON_CLUSTER_REORDER=1 \
+./bin/llama-completion -m /data/local/tmp/gguf/Qwen3-1.7B-Q4_0.gguf \
+  -f /data/local/tmp/llama/wiki-4k.txt -dev HTP0 -ngl 99 -fa on \
+  -c 4608 -b 1024 -ub 1024 -n 64 -t 6 --temp 0 \
+  --no-conversation --no-display-prompt --log-verbosity 4
+```
+
+Set `CLUSTER_REORDER=0` for shadow storage, and additionally `CLUSTER_OVERLAP=0` for the original handoff control. For the 8k comparison, use `wiki-8k.txt`, `-c 8704`, and `GGML_HEXAGON_CLUSTER_MEM_MB=1152` in every arm.
+
+### Why the first full-model 4k comparison looked slower (2026-09-16, unit 9aed338b)
+
+The original 38.07 versus 40.07 ms/token result does not establish a 2 ms penalty from the rearranged K/V layout. A follow-up profile finds much larger variation outside attention, particularly in the CPU output projection. The 28 transformer blocks run on HTP, but `result_output` uses a Q6_K weight tensor on the CPU, despite the model filename containing Q4_0 and the loader reporting 29/29 layers offloaded. Hexagon does not support that weight type; the existing LM-head size guard is a separate restriction.
+
+**Matched attention profile.** The same prompt, 64 fixed continuation tokens, capacity 4608, six CPU threads, 12.5% selection and KEEP 50 are used. Each of four arms runs three times in forward, reverse and interleaved orders. The table averages decode calls 2..64. `GGML_HEXAGON_PROFILE=1` measures HTP operations, and the existing ECHO flag records attention phases. A temporary driver buffers logs until timing finishes and uses the existing evaluation callback to time only `result_output`. That callback preserves the full HTP subgraph but disables its graph cache; its measured node preparation costs 0.06-0.12 ms/token. Profiled wall times should not be compared directly with the earlier unprofiled wall times.
+
+| Method | Full token, ms | CPU output projection, ms | All 28 attention ops, ms | Selection/handoff phase, ms | HTP attention compute phase, ms |
+|---|--:|--:|--:|--:|--:|
+| Shadow, original handoff | 42.80 | 16.49 | 3.863 | 0.879 | 2.202 |
+| Shadow, per-head overlap | 39.48 | 13.11 | 3.697 | 0.708 | 2.214 |
+| Rearranged K/V, original handoff | 40.96 | 13.72 | 3.866 | 0.873 | 2.205 |
+| Rearranged K/V, per-head overlap | 42.82 | 14.80 | 3.708 | 0.707 | 2.216 |
+
+The CPU output projection's run means span 11.75-21.01 ms/token. Non-attention HTP work stays near 16.1 ms/token. Host GPU submission takes 0.23-0.26 ms/token across these arm means, and `clFinish` takes about 0.009 ms/token. Neither has a 2 ms layout penalty. Other host work also varies with CPU execution conditions; CPU output projection alone does not explain every wall-time difference.
+
+The attention measurements separate the two design changes. Parallel per-head handoff saves about 0.16 ms/token, mainly in selection/handoff. Physical rearrangement adds about 0.01 ms/token when overlap is held constant. Its same-head row stride is indeed 2048 bytes versus 256 in the packed shadow, but these measurements do not support that stride difference as the cause of the earlier 2 ms slowdown.
+
+Across 21,168 steady attention calls in this sweep, the DSP's GPU-wait counter is zero except for one 1 us sample. These integer counters round down; zero is not a claim of zero nanoseconds. The GPU already finishes before the HTP reaches the merge, so starting it earlier has little critical-path benefit at this context. The reported ready-to-done interval is the DSP's observation after its own compute, not isolated GPU execution time; overlap mode also starts that interval before selection. Those intervals cannot be subtracted to estimate GPU compute savings. The profile confirms a 4096-row clustered prefix and four 64-row dense blocks, including masked cache padding.
+
+**CPU execution control.** Pinning the process to the two prime cores with two CPU threads still leaves large per-token variation under the `walt` governor. A separate control keeps the original six CPU threads and temporarily changes both CPU policies from `walt` to `performance`. Reported frequencies are 3.5328 GHz for policy0 and 4.32 GHz for policy6. The same four arms are run twice in forward/reverse order, first with profiling and then with profiling and the evaluation callback both disabled. Both original governors are restored afterward. This is a diagnostic intervention, not a new deployment default or a split-ratio change.
+
+In the profiled frequency control, original shadow versus rearranged overlap measures 31.84 versus 31.41 ms/token overall, 8.04 versus 7.88 ms/token in the CPU output projection, and 3.855 versus 3.705 ms/token in attention. Changing CPU execution conditions moves full-model latency by roughly 10 ms while the attention result stays similar. Frequency control reduces, but does not eliminate, CPU variation.
+
+Unprofiled frequency-control results (two runs per arm, same 63 steady calls per run):
+
+| Method | ms/token, mean (run range) |
+|---|--:|
+| Shadow, original handoff | 30.12 (29.21-31.03) |
+| Shadow, per-head overlap | 30.12 (29.69-30.55) |
+| Rearranged K/V, original handoff | 29.79 (29.32-30.26) |
+| Rearranged K/V, per-head overlap | 30.15 (29.96-30.34) |
+
+Original shadow and rearranged overlap are effectively tied: 30.12 versus 30.15 ms/token. The rearranged path is 0.75 ms slower in the forward order and 0.69 ms faster in reverse order. This control does not establish a full-model speed winner at 4k.
+
+The original unprofiled sweep did not record CPU output timing, so its exact 2 ms difference cannot be reconstructed afterward. The supported conclusion is that CPU-side variation dominated that comparison, while the rearranged attention kernel itself has no comparable regression. The 504 MiB shadow saving remains established. The verified-affinity comparison below supplies the matched CPU control for both lengths and does not reproduce the earlier 8k full-model percentage.
+
+**Diagnostics and artifacts.** The backend now emits `cluster-profile` host and graph timings when `GGML_HEXAGON_PROFILE` is enabled. Use `GGML_HEXAGON_CLUSTER_ATTN=125,64,16` to add the existing ECHO-based per-layer phases. `merge_us` includes waiting for the GPU; `wait_us` is a subset of that phase. `graph execute_us` includes RPC completion and profiler formatting; `host finish_us` is a subset of it. These fields must not all be added together. Normal runs leave both profiling and ECHO disabled.
+
+The Android backend and v79 skeleton build successfully. All 16 frequency-control output files (65 logit vectors each, including prefill) have the same SHA-256, covering all four methods with profiling on and off. Artifacts, the temporary driver, balanced-order scripts, raw profiles, analysis, source diffs and governor restoration records are in `/tmp/hetero-4k-profile-20260916/`. The final phase dataset is `detail-*`; `fixed-*` and `clean-*` are the frequency controls. `basic-*` logs were truncated by the device console and are preliminary only; `phases-*` predates the additional DSP wait counters and is not used for GPU-wait claims.
+
+### End-to-end comparison with verified affinity (2026-09-16, unit 9aed338b)
+
+This is the current comparison for these methods on the original Qwen3-1.7B Q4_0 file. Every process starts with `taskset c0`; CPU decode and batch worker counts are both two. The driver checks every observable thread's effective affinity at startup, after prefill and after decode, and checks the main thread's CPU for every decode call. All observed masks stay within cores 6-7. Both CPU policies use `performance` for the sweep, with recorded clocks of 3.5328 and 4.32 GHz. The original `walt` governors are restored afterward. This combines affinity and frequency control; the preceding 30.12/30.15 ms experiment controlled frequency alone.
+
+The same 4096/8192-token wikitext prompts, capacities 4608/8704, batch/ubatch 1024, 64 fixed continuation inputs, 12.5% cluster selection, four sink tokens, 64-cell minimum dense window and 1152 MiB shadow budget are used in every arm. Clustering is synchronized in every arm, including the NPU-only reference. The four heterogeneous arms all keep 50% of selected blocks on HTP. The Q6_K output projection stays on CPU. Profiling, ECHO and the evaluation callback are disabled. One warm-up process is excluded; each arm then runs three times in forward, reverse and interleaved orders. No additional 1024-row cluster boundary is crossed during the timing window.
+
+**Steady full-model decode.** Mean latency for calls 2..64, with the range of the three process means in parentheses. This includes the transformer blocks, heterogeneous attention, CPU output projection and synchronization, not only the attention operator.
+
+| Attention method | 4k prompt, ms/token | 8k prompt, ms/token |
+|---|--:|--:|
+| NPU-only sparse attention (reference) | 30.08 (29.71-30.40) | 32.47 (32.22-32.64) |
+| Shadow, original handoff | 28.44 (27.27-29.15) | 30.43 (28.98-32.43) |
+| Shadow, per-head overlap | 28.17 (27.26-28.98) | 30.07 (28.73-31.92) |
+| Rearranged K/V, original handoff | 28.44 (27.78-29.39) | 30.66 (29.39-32.51) |
+| Rearranged K/V, per-head overlap | 28.31 (27.72-29.06) | 30.44 (29.53-32.04) |
+
+**Prompt plus decode inference time.** Prefill plus all 64 decode calls, including first-decode clustering/publication, GPU setup and physical rearrangement. The model is already loaded; tokenization, logit validation/file I/O and teardown are excluded. These are controlled teacher-forced model timings, not complete CLI-process or sampled-generation wall times.
+
+| Attention method | 4k prompt + 64 calls, seconds (range) | 8k prompt + 64 calls, seconds (range) | First decode at 4k, ms | First decode at 8k, ms |
+|---|--:|--:|--:|--:|
+| NPU-only sparse attention (reference) | 5.823 (5.664-5.904) | 11.708 (10.932-13.170) | 472.6 | 533.4 |
+| Shadow, original handoff | 5.778 (5.566-5.907) | 11.650 (10.754-13.294) | 536.8 | 610.2 |
+| Shadow, per-head overlap | 5.720 (5.579-5.891) | 11.166 (10.775-11.839) | 531.3 | 599.7 |
+| Rearranged K/V, original handoff | 5.812 (5.648-6.008) | 11.787 (10.816-13.527) | 575.8 | 725.8 |
+| Rearranged K/V, per-head overlap | 5.807 (5.639-5.983) | 11.685 (10.897-13.185) | 591.8 | 719.5 |
+
+At 4k, overlapping shadow averages 0.277 ms/token less than original shadow (0.97% lower latency). Rearrangement with overlap differs from original shadow by -0.135 ms/token; the three paired differences are +0.449, -0.761, -0.091 ms/token.
+
+At 8k, overlapping shadow averages 0.365 ms/token less than original shadow (1.20% lower latency). Rearrangement with overlap differs from original shadow by +0.011 ms/token; the three paired differences are +0.779, -0.353, -0.393 ms/token.
+
+Overlapping shadow has the lowest mean steady decode latency among the heterogeneous arms and beats original shadow in all three paired runs at each length, by about 1% on average. Rearrangement with overlap is effectively tied with original shadow in the aggregate. The measured differences among the heterogeneous variants are small relative to process-to-process variation. These results do not reproduce the earlier 6.2% 8k advantage for rearrangement. The established benefit of rearrangement is removing 504 MiB of shadow allocation at 4k and 952 MiB at 8k. Its additional first-decode work must be included when comparing short requests. Full-request averages also include prefill variation, so they must not be presented as isolated attention speedups. In the third 8k pass, prefill rises to 9.06-10.53 seconds from 8.36-8.52 seconds in the first two passes. The 0.48-second mean request advantage for overlapping shadow over original shadow is mostly a 0.45-second prefill difference; it is not evidence of a corresponding attention gain. Affinity and reported CPU clocks remained fixed, but these controls do not fix all device execution conditions.
+
+**Output checks.** All 12 heterogeneous output files at each prompt length (four variants, three runs, 65 logit vectors per file) have identical SHA-256 hashes within that length. The NPU-only reference differs from the heterogeneous output and is therefore not an output-equivalent speed comparison. In the captured first runs, the top logit agrees for 63/65 vectors at 4k and 62/65 at 8k; maximum absolute logit differences are 7.50 and 2.93. Prefill logits match exactly. These observations do not establish equal generation quality between NPU-only and heterogeneous attention, or between sparse and dense attention.
+
+The reproducible driver, balanced-order runner, exact device commands, all 30 logs, per-token times, output hashes, paired comparisons, CPU affinity checks, binary hashes and governor restoration records are in `/tmp/hetero-e2e-bound-20260916/`. No backend implementation changed for this sweep.
 
 ## 5. What would change the answer
 
