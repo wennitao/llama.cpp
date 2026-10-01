@@ -100,6 +100,8 @@ struct htp_fa_context {
     uint32_t  dec_nslots;      // staging slots per thread (2 today; cluster mode may deepen the ring)
     uint32_t  het_gpu_nsplit;  // hetero: GPU partials per row appended to the merge (0 = none)
     const uint8_t * het_parts; // hetero: GPU partials in DDR, [row][gpu_split] x dec_stride_part
+    uint8_t * het_vtcm;        // hetero: VTCM scratch the merge threads DMA their rows' GPU partials into
+    uint32_t  het_rows_per_thread;
 
     // Cluster-selected pages (htp-ops.h, HTP_FA_CLUSTER_*). When cl_on, a unit (KV head, split)
     // walks a per-head list: cl_sel_n[kvh] shadow pages (contiguous 16 KB per tensor, no mask)
@@ -108,6 +110,21 @@ struct htp_fa_context {
     bool            cl_inplace;        // pages are page_keys consecutive rows of the positional K/V (HTP_FA_CLUSTER_HDR_INPLACE)
     bool            cl_runs;           // whole-cluster runs (HTP_FA_CLUSTER_HDR_RUNS): lists are DMA blocks of selected runs
     bool            cl_scatter;        // runs mode, rows fetched from the positional cache at cl_pos_map[row] (HTP_FA_CLUSTER_HDR_SCATTER)
+    bool            cl_gpu_runs;       // runs mode, the GPU attends the selected runs (HTP_FA_CLUSTER_HDR_GPU_RUNS)
+    bool            cl_gpu_select;     // GPU_RUNS and the GPU selects too: no select pass here, no kept runs (HTP_FA_CLUSTER_HDR_GPU_SELECT)
+    bool            cl_pos_runs;
+    bool            cl_reorder;
+    bool            cl_overlap;
+    bool            cl_gpu_rows;
+    uint32_t        cl_seq;
+    uint64_t        cl_t_ready;
+    uint8_t *       cl_echo;
+    uint32_t        cl_echo_stride;
+    uint8_t *       cl_pos_out;
+    const uint32_t * cl_prepared;
+    uint32_t        cl_partition_us;
+    uint64_t        cl_partition_prof[HTP_MAX_NTHREADS][4];
+    uint8_t *       cl_het_base;       // GPU_RUNS: the hetero control region (header base + hdr.hetero_off)
     uint64_t        cl_sel_prof[HTP_MAX_NTHREADS][4];   // select pass per thread, qtimer ticks: DMA issue, DMA wait, scoring, greedy fill
    // select pass per thread: [0..3] qtimer ticks DMA issue, DMA wait, scoring, greedy; [4..6] pcycles mark loop, greedy scalar, greedy vector
     const uint32_t * cl_pos_map;       // [kvh][cl_rows_max] positional row of each shadow row
@@ -4315,6 +4332,20 @@ static inline void hvx_fa_dec_blk_src(const struct htp_fa_context * factx, const
                 if (bsz == 0 || bsz > FLASH_ATTN_BLOCK_SIZE || row + bsz > factx->cl_rows_max) {
                     row = 0; bsz = 1;   // never a wild address
                 }
+                if (factx->cl_pos_runs || factx->cl_reorder) {
+                    b->k = (const uint8_t *) k->data + (size_t) ik2 * k->nb[2] + (size_t) ik3 * k->nb[3] + (size_t) row * k->nb[1];
+                    b->v = (const uint8_t *) v->data + (size_t) iv2 * v->nb[2] + (size_t) iv3 * v->nb[3] + (size_t) row * v->nb[1];
+                    b->bsz = bsz;
+                    b->pos = UINT32_MAX;
+                    b->contig = false;
+                    if (e->bsz2 && bsz + e->bsz2 <= FLASH_ATTN_BLOCK_SIZE && e->row2 + e->bsz2 <= factx->cl_rows_max) {
+                        b->k2 = (const uint8_t *) k->data + (size_t) ik2 * k->nb[2] + (size_t) ik3 * k->nb[3] + (size_t) e->row2 * k->nb[1];
+                        b->v2 = (const uint8_t *) v->data + (size_t) iv2 * v->nb[2] + (size_t) iv3 * v->nb[3] + (size_t) e->row2 * v->nb[1];
+                        b->bsz2 = e->bsz2;
+                        b->bsz += e->bsz2;
+                    }
+                    return;
+                }
                 if (factx->cl_scatter) {
                     // the same rows, gathered from the positional cache: one descriptor per row
                     b->rows   = factx->cl_pos_map + (size_t) kvh * factx->cl_rows_max + row;
@@ -4406,9 +4437,9 @@ static inline bool hvx_fa_dec_stage(dma_queue * dma, dma_cache * mc, const struc
     } else {
         // K segments then V segments: the consumer pops the K descriptors first
         dma_queue_push(dma, dma_make_ptr(k_dst, b->k), factx->size_k_row_padded, b->contig ? size_k_row : nbk1, size_k_row, bsz1);
-        if (b->bsz2) dma_queue_push(dma, dma_make_ptr(k_dst + (size_t) bsz1 * factx->size_k_row_padded, b->k2), factx->size_k_row_padded, size_k_row, size_k_row, b->bsz2);
+        if (b->bsz2) dma_queue_push(dma, dma_make_ptr(k_dst + (size_t) bsz1 * factx->size_k_row_padded, b->k2), factx->size_k_row_padded, b->contig ? size_k_row : nbk1, size_k_row, b->bsz2);
         dma_queue_push(dma, dma_make_ptr(v_dst, b->v), factx->size_v_row_padded, b->contig ? size_v_row : nbv1, size_v_row, bsz1);
-        if (b->bsz2) dma_queue_push(dma, dma_make_ptr(v_dst + (size_t) bsz1 * factx->size_v_row_padded, b->v2), factx->size_v_row_padded, size_v_row, size_v_row, b->bsz2);
+        if (b->bsz2) dma_queue_push(dma, dma_make_ptr(v_dst + (size_t) bsz1 * factx->size_v_row_padded, b->v2), factx->size_v_row_padded, b->contig ? size_v_row : nbv1, size_v_row, b->bsz2);
     }
     const bool has_mask = mask && b->pos != UINT32_MAX;
     if (has_mask) {
@@ -4719,7 +4750,20 @@ static void flash_attn_ext_f16_merge_thread(unsigned int nth, unsigned int ith, 
 
     float * acc = (float *) (factx->spad_a + factx->size_vkq_acc * factx->dec_R * ith);
 
+    // GPU partials: one DMA per row of this thread into its VTCM scratch, all pushed up front
+    const uint32_t het_n         = factx->het_gpu_nsplit;
+    const size_t   het_row_bytes = (size_t) het_n * factx->dec_stride_part;
+    uint8_t *      het_scr       = het_n ? factx->het_vtcm + (size_t) ith * factx->het_rows_per_thread * het_row_bytes : NULL;
+    dma_queue *    dma           = octx->ctx->dma[ith];
+    if (het_n) {
+        uint32_t i = 0;
+        for (uint32_t row = ith; row < rows_total; row += nth, ++i) {
+            dma_queue_push_single_1d(dma, dma_make_ptr(het_scr + (size_t) i * het_row_bytes, factx->het_parts + (size_t) row * het_row_bytes), het_row_bytes);
+        }
+    }
+
     for (uint32_t row = ith; row < rows_total; row += nth) {
+        const uint8_t * het_row = het_n ? (const uint8_t *) dma_queue_pop(dma).dst : NULL;
         const uint32_t iq3 = row / (neq2 * neq1);
         const uint32_t rem = row - iq3 * neq2 * neq1;
         const uint32_t iq2 = rem / neq1;
@@ -4730,7 +4774,7 @@ static void flash_attn_ext_f16_merge_thread(unsigned int nth, unsigned int ith, 
         // Partials sp < n_split are the HVX units' (VTCM); the rest are the GPU's (DDR, hetero).
         const uint32_t n_all = n_split + factx->het_gpu_nsplit;
         #define HVX_FA_PART(sp) ((sp) < n_split ? (const uint8_t *) hvx_fa_dec_partial(factx, row, (sp)) \
-                                                : factx->het_parts + ((size_t) row * factx->het_gpu_nsplit + ((sp) - n_split)) * factx->dec_stride_part)
+                                                : het_row + (size_t) ((sp) - n_split) * factx->dec_stride_part)
         float M = HTP_FA_M_INITIAL_VAL;
         for (uint32_t sp = 0; sp < n_all; ++sp) {
             const float m = ((const float *) HVX_FA_PART(sp))[0];
@@ -4993,10 +5037,24 @@ static bool hvx_fa_cl_setup(struct htp_fa_context * factx, const struct htp_ops_
         return false;
     }
 
+    factx->cl_reorder        = (hdr->flags & HTP_FA_CLUSTER_HDR_REORDER) != 0;
+    factx->cl_gpu_rows       = (hdr->flags & HTP_FA_CLUSTER_HDR_GPU_ROWS) != 0;
+    factx->cl_echo           = (uint8_t *) (uintptr_t) (layer_base + hdr->off_echo_sel);
+    factx->cl_echo_stride    = hdr->host_sel_stride;
     factx->cl_flags          = (uint32_t) octx->op_params[HTP_FA_CLUSTER_OPP_FLAGS];
     factx->cl_inplace        = inplace;
     factx->cl_runs           = runs;
     factx->cl_scatter        = runs && (hdr->flags & HTP_FA_CLUSTER_HDR_SCATTER) != 0;
+    factx->cl_gpu_runs       = runs && (hdr->flags & HTP_FA_CLUSTER_HDR_GPU_RUNS) != 0 && hdr->hetero_off != 0;
+    factx->cl_het_base       = factx->cl_gpu_runs ? (uint8_t *) (uintptr_t) (base + hdr->hetero_off) : NULL;
+    factx->cl_gpu_select     = factx->cl_gpu_runs && (hdr->flags & HTP_FA_CLUSTER_HDR_GPU_SELECT) != 0;
+    factx->cl_pos_runs       = factx->cl_gpu_runs && (hdr->flags & HTP_FA_CLUSTER_HDR_POS_RUNS) != 0;
+    factx->cl_pos_out        = factx->cl_pos_runs ? (uint8_t *) (uintptr_t) (layer_base + hdr->off_n_valid) : NULL;
+    if (factx->cl_pos_runs && (hdr->flags & HTP_FA_CLUSTER_HDR_PREPARED)) {
+        const uint32_t * meta = (const uint32_t *) (layer_base + htp_fa_cluster_meta_offset(hdr));
+        hvx_fa_cl_inval(meta, 128);
+        if (meta[0] == HTP_FA_CLUSTER_FLAG_KEEP(factx->cl_flags)) factx->cl_prepared = meta + 32;
+    }
 
     factx->cl_pos_map        = (const uint32_t *) (layer_base + hdr->off_pos_map);
     factx->cl_k_pages        = inplace ? NULL : layer_base + hdr->off_k_pages;
@@ -5058,17 +5116,16 @@ static bool hvx_fa_cl_setup(struct htp_fa_context * factx, const struct htp_ops_
         s->max_total = b + factx->cl_n_dense_blocks;
         return true;
     }
-    if (runs) {
-        return false;   // host-written lists are not defined for runs; density 0 falls back to dense
-    }
+    if (runs && !(hdr->flags & HTP_FA_CLUSTER_HDR_HOST_RUNS)) return false;
     // Host-written lists: lengths now (the split pick needs them), pages after the VTCM alloc.
     s->host_sel = layer_base + hdr->off_host_sel;
     hvx_fa_cl_inval(s->host_sel, (size_t) nek2 * hdr->host_sel_stride);
     s->max_total = 0;
     for (uint32_t h = 0; h < nek2; ++h) {
         uint32_t n = *(const uint32_t *) (s->host_sel + (size_t) h * hdr->host_sel_stride);
-        if (n > n_cand) {
-            n = n_cand;
+        const uint32_t max_list = runs ? factx->cl_max_blk : n_cand;
+        if (n > max_list) {
+            n = max_list;
         }
         factx->cl_sel_n[h] = n;
         const uint32_t total = n + factx->cl_n_dense_blocks;
@@ -5092,10 +5149,184 @@ static bool hvx_fa_cl_setup(struct htp_fa_context * factx, const struct htp_ops_
     return true;
 }
 
+static bool hvx_fa_cl_append_block(struct htp_fa_cluster_blk * out, uint32_t * n, uint32_t cap, uint32_t row, uint32_t size) {
+    if (*n) {
+        struct htp_fa_cluster_blk * b = out + *n - 1;
+        if (b->bsz + b->bsz2 + size <= FLASH_ATTN_BLOCK_SIZE) {
+            if (!b->bsz2 && b->row + b->bsz == row) { b->bsz += size; return true; }
+            if (b->bsz2 && b->row2 + b->bsz2 == row) { b->bsz2 += size; return true; }
+            if (!b->bsz2) { b->row2 = row; b->bsz2 = size; return true; }
+        }
+    }
+    if (*n == cap) return false;
+    out[(*n)++] = (struct htp_fa_cluster_blk) { row, 0, (uint16_t) size, 0, 0 };
+    return true;
+}
+
+static bool hvx_fa_cl_partition_prepared(struct htp_fa_context * factx, uint32_t h, uint32_t max_gpu_blocks, uint64_t * prof) {
+    struct htp_fa_cluster_blk input[256], gpu[2 * HTP_FA_HETERO_SEL_MAX_BLK], kept[128];
+    const uint32_t nblocks = factx->cl_sel_n[h], nrows = factx->cl_rows_max;
+    if (nblocks > 256 || !factx->cl_prepared) return false;
+    uint64_t t = HAP_perf_get_qtimer_count();
+    struct htp_fa_cluster_blk * htp = factx->cl_sel_blk + (size_t) h * factx->cl_max_blk;
+    memcpy(input, htp, (size_t) nblocks * sizeof(*input));
+    const uint32_t * pm = factx->cl_prepared + (size_t) h * nrows * 2;
+    const uint32_t * spans = pm + nrows;
+    hvx_fa_cl_inval(pm, (size_t) nrows * 8);
+    uint32_t * rec = (uint32_t *) (factx->cl_pos_out + (size_t) h * (128 + nrows * 4));
+    uint32_t nh = 0, ng = 0, nhtp = 0, ngpu = 0;
+    bool indexed = false;
+    max_gpu_blocks = MIN(max_gpu_blocks, nrows / 4);
+    uint64_t now = HAP_perf_get_qtimer_count(); prof[0] += now - t; t = now;
+    for (uint32_t b = 0; b < nblocks; ++b) {
+        const uint32_t row[2] = { input[b].row, input[b].row2 };
+        const uint32_t len[2] = { input[b].bsz, input[b].bsz2 };
+        for (uint32_t s = 0; s < 2; ++s) {
+            const uint32_t limit = row[s] + len[s];
+            for (uint32_t r = row[s]; r < limit;) {
+                const uint32_t span = spans[r];
+                const uint32_t end = MIN(limit, span & ~HTP_FA_CLUSTER_SPAN_HTP);
+                if (end <= r) return false;
+                const uint32_t size = end - r;
+                if ((span & HTP_FA_CLUSTER_SPAN_HTP) && hvx_fa_cl_append_block(kept, &nh, MIN(128u, factx->cl_max_blk), pm[r], size)) {
+                    nhtp += size;
+                } else {
+                    if (!indexed && !hvx_fa_cl_append_block(gpu, &ng, max_gpu_blocks, r, size)) {
+                        uint32_t at = 0;
+                        for (uint32_t g = 0; g < ng; ++g) {
+                            memcpy(rec + 32 + at, pm + gpu[g].row, (size_t) gpu[g].bsz * 4); at += gpu[g].bsz;
+                            memcpy(rec + 32 + at, pm + gpu[g].row2, (size_t) gpu[g].bsz2 * 4); at += gpu[g].bsz2;
+                        }
+                        indexed = true;
+                    }
+                    if (indexed) memcpy(rec + 32 + ngpu, pm + r, (size_t) size * 4);
+                    ngpu += size;
+                }
+                r = end;
+            }
+        }
+    }
+    factx->cl_sel_n[h] = nh;
+    memcpy(htp, kept, (size_t) nh * sizeof(*kept));
+    now = HAP_perf_get_qtimer_count(); prof[1] += now - t; t = now;
+    if (!indexed) memcpy(rec + 32, gpu, (size_t) ng * sizeof(*gpu));
+    rec[0] = indexed ? ngpu : ng; rec[1] = nhtp; rec[2] = nh; rec[3] = indexed;
+    qurt_mem_cache_clean((qurt_addr_t) rec, 128 + (indexed ? (size_t) ngpu * 4 : (size_t) ng * sizeof(*gpu)), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+    prof[3] += HAP_perf_get_qtimer_count() - t;
+    return true;
+}
+
+static void flash_attn_ext_f16_partition_thread(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_fa_context * factx = (struct htp_fa_context *) data;
+    const uint32_t nrows = factx->cl_rows_max;
+    const uint32_t nwords = (nrows + 31) / 32;
+    const uint32_t min_run = HTP_FA_CLUSTER_FLAG_KEEP(factx->cl_flags);
+    const uint32_t max_gpu_blocks = HTP_FA_HETERO_SEL_MAX_BLK * (nrows > 8192 ? 2 : 1);
+    uint32_t local_bits[512];
+    uint32_t * bits = nwords <= 512 ? local_bits : (uint32_t *) (factx->cl_sel_c + (size_t) ith * factx->cl_sel_c_stride);
+    uint64_t * prof = factx->cl_partition_prof[ith];
+    memset(prof, 0, 4 * sizeof(*prof));
+    for (uint32_t h = ith; h < factx->octx->src[1]->ne[2]; h += nth) {
+        if (min_run && hvx_fa_cl_partition_prepared(factx, h, max_gpu_blocks, prof)) continue;
+        uint64_t t = HAP_perf_get_qtimer_count();
+        struct htp_fa_cluster_blk * blocks = factx->cl_sel_blk + (size_t) h * factx->cl_max_blk;
+        uint32_t * rec = (uint32_t *) (factx->cl_pos_out + (size_t) h * (128 + nrows * 4));
+        const uint32_t nblocks = factx->cl_sel_n[h];
+        if (!min_run && nblocks <= MIN(max_gpu_blocks, nrows / 4)) {
+            memcpy(rec + 32, blocks, (size_t) nblocks * sizeof(*blocks));
+            rec[0] = nblocks; rec[1] = 0; rec[2] = 0; rec[3] = 0;
+            factx->cl_sel_n[h] = 0;
+            qurt_mem_cache_clean((qurt_addr_t) rec, 128 + (size_t) nblocks * sizeof(*blocks), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+            prof[3] += HAP_perf_get_qtimer_count() - t;
+            continue;
+        }
+        const uint32_t * pm = factx->cl_pos_map + (size_t) h * nrows;
+        hvx_fa_cl_inval(pm, (size_t) nrows * 4);
+        uint64_t now = HAP_perf_get_qtimer_count(); prof[0] += now - t; t = now;
+        if (!min_run) {
+            uint32_t ngpu = 0;
+            for (uint32_t b = 0; b < factx->cl_sel_n[h]; ++b) {
+                const uint32_t row[2] = { blocks[b].row, blocks[b].row2 };
+                const uint32_t len[2] = { blocks[b].bsz, blocks[b].bsz2 };
+                for (uint32_t s = 0; s < 2; ++s) {
+                    if (row[s] > nrows || len[s] > nrows - row[s] || len[s] > nrows - ngpu) continue;
+                    memcpy(rec + 32 + ngpu, pm + row[s], (size_t) len[s] * 4);
+                    ngpu += len[s];
+                }
+            }
+            rec[0] = ngpu; rec[1] = 0; rec[2] = 0; rec[3] = 1;
+            factx->cl_sel_n[h] = 0;
+            now = HAP_perf_get_qtimer_count(); prof[1] += now - t; t = now;
+            qurt_mem_cache_clean((qurt_addr_t) rec, 128 + (size_t) ngpu * 4, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+            prof[3] += HAP_perf_get_qtimer_count() - t;
+            continue;
+        }
+        memset(bits, 0, (size_t) nwords * 4);
+        for (uint32_t b = 0; b < factx->cl_sel_n[h]; ++b) {
+            const uint32_t row[2] = { blocks[b].row, blocks[b].row2 };
+            const uint32_t len[2] = { blocks[b].bsz, blocks[b].bsz2 };
+            for (uint32_t s = 0; s < 2; ++s) {
+                if (row[s] > nrows || len[s] > nrows - row[s]) continue;
+                for (uint32_t i = 0; i < len[s]; ++i) {
+                    const uint32_t pos = pm[row[s] + i];
+                    if (pos < factx->cl_dense_b0 * FLASH_ATTN_BLOCK_SIZE) bits[pos / 32] |= 1u << (pos % 32);
+                }
+            }
+        }
+        now = HAP_perf_get_qtimer_count(); prof[1] += now - t; t = now;
+        uint32_t ngpu = 0, nhtp = 0, nb = 0, pending_row = 0, pending_size = 0;
+        for (uint32_t pos = 0; pos < nrows;) {
+            const uint32_t word = bits[pos / 32] & (UINT32_MAX << (pos % 32));
+            if (!word) { pos = (pos / 32 + 1) * 32; continue; }
+            const uint32_t begin = (pos / 32) * 32 + __builtin_ctz(word);
+            uint32_t end = begin;
+            while (end < nrows) {
+                const uint32_t offset = end % 32;
+                const uint32_t inv = ~bits[end / 32] >> offset;
+                const uint32_t step = inv ? (uint32_t) __builtin_ctz(inv) : 32 - offset;
+                end += step;
+                if (step < 32 - offset) break;
+            }
+            const uint32_t len = end - begin;
+            if (min_run && len >= min_run && nb + (len + FLASH_ATTN_BLOCK_SIZE - 1) / FLASH_ATTN_BLOCK_SIZE + 1 < factx->cl_max_blk) {
+                nhtp += len;
+                for (uint32_t row = begin; row < end; row += FLASH_ATTN_BLOCK_SIZE) {
+                    const uint32_t size = MIN(FLASH_ATTN_BLOCK_SIZE, end - row);
+                    if (!pending_size) {
+                        pending_row = row; pending_size = size;
+                    } else if (pending_size + size <= FLASH_ATTN_BLOCK_SIZE) {
+                        blocks[nb++] = (struct htp_fa_cluster_blk) { pending_row, row, (uint16_t) pending_size, (uint16_t) size, 0 };
+                        pending_size = 0;
+                    } else {
+                        blocks[nb++] = (struct htp_fa_cluster_blk) { pending_row, 0, (uint16_t) pending_size, 0, 0 };
+                        pending_row = row; pending_size = size;
+                    }
+                }
+            } else {
+                for (uint32_t row = begin; row < end; ++row) rec[32 + ngpu++] = row;
+            }
+            pos = end;
+        }
+        if (pending_size) blocks[nb++] = (struct htp_fa_cluster_blk) { pending_row, 0, (uint16_t) pending_size, 0, 0 };
+        factx->cl_sel_n[h] = nb;
+        rec[0] = ngpu;
+        rec[1] = nhtp;
+        rec[2] = nb;
+        rec[3] = 1;
+        now = HAP_perf_get_qtimer_count(); prof[2] += now - t; t = now;
+        qurt_mem_cache_clean((qurt_addr_t) rec, 128 + (size_t) ngpu * 4, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+        prof[3] += HAP_perf_get_qtimer_count() - t;
+    }
+}
+
 static void hvx_fa_cl_copy_lists(struct htp_fa_context * factx, const struct hvx_fa_cl_setup * s, uint32_t nek2) {
     const uint32_t stride = s->hdr->host_sel_stride;
     if (s->host_sel) {
         for (uint32_t h = 0; h < nek2; ++h) {
+            if (factx->cl_runs) {
+                memcpy(factx->cl_sel_blk + (size_t) h * factx->cl_max_blk, s->host_sel + (size_t) h * stride + 128, (size_t) factx->cl_sel_n[h] * sizeof(struct htp_fa_cluster_blk));
+                continue;
+            }
             const uint16_t * pages = (const uint16_t *) (s->host_sel + (size_t) h * stride + 128);
             uint16_t * dst = factx->cl_sel_pages + (size_t) h * factx->cl_n_pages_max;
             const uint32_t n = factx->cl_sel_n[h];
@@ -5121,6 +5352,62 @@ static void hvx_fa_cl_copy_lists(struct htp_fa_context * factx, const struct hvx
         }
         qurt_mem_cache_clean((qurt_addr_t) echo, (size_t) nek2 * stride, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
     }
+}
+
+static void hvx_fa_cl_publish_head(struct htp_fa_context * factx, uint32_t h) {
+    const uint32_t keep_pct = HTP_FA_CLUSTER_FLAG_KEEP(factx->cl_flags);
+    if (factx->cl_overlap && (factx->cl_flags & HTP_FA_CLUSTER_FLAG_ECHO)) {
+        uint8_t * e = factx->cl_echo + (size_t) h * factx->cl_echo_stride;
+        const size_t bytes = (size_t) factx->cl_sel_n[h] * sizeof(struct htp_fa_cluster_blk);
+        *(uint32_t *) e = factx->cl_sel_n[h];
+        memcpy(e + 128, factx->cl_sel_blk + (size_t) h * factx->cl_max_blk, bytes);
+        qurt_mem_cache_clean((qurt_addr_t) e, 128 + bytes, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+    }
+    const uint32_t nb = factx->cl_sel_n[h];
+    uint32_t keep = (nb * keep_pct + 50) / 100;
+    if (nb - keep > HTP_FA_HETERO_SEL_MAX_BLK) {
+        keep = nb - HTP_FA_HETERO_SEL_MAX_BLK;   // the record is full: the rest stays on the HTP
+    }
+    uint32_t * rec = (uint32_t *) (factx->cl_het_base + HTP_FA_HETERO_SEL_OFF + (size_t) h * HTP_FA_HETERO_SEL_STRIDE);
+    if (factx->cl_gpu_rows) {
+        struct htp_fa_cluster_blk blocks[HTP_FA_HETERO_SEL_MAX_BLK];
+        const uint32_t count = MIN(nb, HTP_FA_HETERO_SEL_MAX_BLK);
+        memcpy(blocks, factx->cl_sel_blk + (size_t) h * factx->cl_max_blk + nb - count, (size_t) count * sizeof(*blocks));
+        const uint32_t budget = keep_pct * 64;
+        uint32_t rows = 0, ng = 0;
+        while (ng < count && rows + blocks[count - ng - 1].bsz + blocks[count - ng - 1].bsz2 <= budget) {
+            rows += blocks[count - ng - 1].bsz + blocks[count - ng - 1].bsz2;
+            ng++;
+        }
+        keep = nb - ng;
+        rec[0] = ng;
+        memcpy(rec + 32, blocks + count - ng, (size_t) ng * sizeof(*blocks));
+    } else {
+        rec[0] = nb - keep;
+        memcpy(rec + 32, factx->cl_sel_blk + (size_t) h * factx->cl_max_blk + keep, (size_t) (nb - keep) * sizeof(struct htp_fa_cluster_blk));
+    }
+    factx->cl_sel_n[h] = keep;
+    if (factx->cl_overlap) {
+        qurt_mem_cache_clean((qurt_addr_t) rec, 128 + (size_t) rec[0] * sizeof(struct htp_fa_cluster_blk), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+        rec[5] = (uint32_t) ((HAP_perf_get_qtimer_count() - factx->cl_t_ready) * 10ull / 192ull);
+        rec[4] = factx->cl_seq;
+        qurt_mem_cache_clean((qurt_addr_t) rec, 128, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+    }
+}
+
+static uint32_t hvx_fa_publish_ready(const struct htp_tensor * q, uint8_t * base, uint32_t slot, bool publish) {
+    const size_t bytes = q->ne[0] * ((q->type == HTP_TYPE_F32) ? 4 : 2);
+    for (uint32_t h = 0; h < q->ne[2]; ++h) {
+        hex_l2flush((uint8_t *) (uintptr_t) q->data + h * q->nb[2], bytes);
+    }
+    volatile uint32_t * ready = (volatile uint32_t *) (base + slot * HTP_FA_HETERO_SLOT_STRIDE);
+    Q6_dcinva_A((void *) ready);
+    const uint32_t seq = *ready + 1;
+    if (publish) {
+        *ready = seq;
+        qurt_mem_cache_clean((qurt_addr_t) ready, sizeof(uint32_t), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+    }
+    return seq;
 }
 
 // On-device page selection: one unit per KV head. Stage the head's page descriptors and its G
@@ -5238,7 +5525,7 @@ static void flash_attn_ext_f16_select_thread(unsigned int nth, unsigned int ith,
             // Two short runs share one 64-row DMA block (a second segment in the same staging slot): the
             // per-block fixed cost (descriptors, full-width softmax) is paid once for both. Not for the
             // scatter fetch, whose rows list is per segment.
-            const bool pack = !factx->cl_scatter;
+            const bool pack = !factx->cl_scatter || factx->cl_pos_runs;
             uint32_t p_row = 0, p_bsz = 0;   // pending segment waiting for a partner
             for (;;) {
                 HVX_Vector m = scores[0];
@@ -5299,6 +5586,7 @@ static void flash_attn_ext_f16_select_thread(unsigned int nth, unsigned int ith,
             }
             factx->cl_sel_n[kvh] = nb;
             prof[3] += HAP_perf_get_qtimer_count() - tp3;
+            if (factx->cl_overlap) hvx_fa_cl_publish_head(factx, kvh);
             continue;
         }
 
@@ -5361,6 +5649,14 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
 
     struct htp_fa_context factx;
     factx.octx = octx;
+    factx.cl_pos_runs = false;
+    factx.cl_reorder = false;
+    factx.cl_overlap = false;
+    factx.cl_seq = 0;
+    factx.cl_t_ready = 0;
+    factx.cl_pos_out = NULL;
+    factx.cl_prepared = NULL;
+    factx.cl_partition_us = 0;
 
     factx.t_start = HAP_perf_get_qtimer_count();
 
@@ -5430,6 +5726,9 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     // The GPU computes KV blocks [0, het_gpu_blocks) and writes its partials into the buffer.
     uint32_t het_gpu_blocks = 0, het_slot = 0, het_nsplit = 0;
     uint8_t * het_base = NULL;
+    // GPU partials per row, any hetero path: sizes the merge threads' VTCM scratch
+    const uint32_t het_nsplit_req = (dec && octx->src[7] && octx->src[7]->data && octx->op_params[HTP_FA_HETERO_OPP_GPU_NSPLIT] > 0 &&
+                                     (uint32_t) octx->op_params[HTP_FA_HETERO_OPP_GPU_NSPLIT] <= 64) ? (uint32_t) octx->op_params[HTP_FA_HETERO_OPP_GPU_NSPLIT] : 0;
     if (dec && octx->src[7] && octx->src[7]->data && octx->op_params[HTP_FA_HETERO_OPP_GPU_BLOCKS] > 0 && neq1 == 1 && neq3 == 1) {
         het_gpu_blocks = (uint32_t) octx->op_params[HTP_FA_HETERO_OPP_GPU_BLOCKS];
         het_slot       = (uint32_t) octx->op_params[HTP_FA_HETERO_OPP_SLOT];
@@ -5443,6 +5742,8 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     factx.dec_b_base     = het_gpu_blocks;
     factx.het_gpu_nsplit = 0;
     factx.het_parts      = NULL;
+    factx.het_vtcm       = NULL;
+    factx.het_rows_per_thread = 0;
     const uint32_t n_blocks_htp = factx.n_blocks - het_gpu_blocks;
 
     // Cluster-selected pages: the host tagged this node (op_params[11..15]) and attached the shadow
@@ -5453,6 +5754,9 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     factx.cl_inplace = false;
     factx.cl_runs    = false;
     factx.cl_scatter = false;
+    factx.cl_gpu_runs = false;
+    factx.cl_gpu_select = false;
+    factx.cl_het_base = NULL;
     factx.cl_pos_map = NULL;
     factx.cl_flags   = 0;
     struct hvx_fa_cl_setup cls;
@@ -5483,8 +5787,11 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
         const size_t lists_bytes = !factx.cl_on ? 0
                                  : factx.cl_runs ? hex_round_up((size_t) nek2 * factx.cl_max_blk * sizeof(struct htp_fa_cluster_blk), 128)
                                  : hex_round_up((size_t) nek2 * factx.cl_n_pages_max * sizeof(uint16_t), 128);
-        const bool   cl_select   = factx.cl_on && factx.cl_density != 0;
+        const bool   cl_select   = factx.cl_on && factx.cl_density != 0 && !factx.cl_gpu_select;   // GPU_SELECT: the GPU picks the runs
         factx.cl_sel_c_stride = cl_select ? (size_t) factx.cl_sel_rows * factx.cl_cent_bytes : 0;
+        if (factx.cl_on && factx.cl_pos_runs) {
+            factx.cl_sel_c_stride = MAX(factx.cl_sel_c_stride, hex_round_up((factx.cl_rows_max + 31) / 32 * 4, 128));
+        }
         factx.cl_sel_s_stride = cl_select ? (size_t) (factx.cl_sel_rows / 32) * VLEN : 0;
         // + 32 runs: the select pass reads the table in whole 32-run pairs of vectors past n_cand
         factx.cl_sel_r_stride = (cl_select && factx.cl_runs) ? hex_round_up((size_t) (factx.cl_n_pages_max + 32) * sizeof(struct htp_fa_cluster_run), 128) : 0;
@@ -5503,6 +5810,11 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
             factx.cl_sel_c     = vtcm_seq_alloc(&vtcm_cur, factx.cl_sel_c_stride * octx->n_threads);
             factx.cl_sel_s     = vtcm_seq_alloc(&vtcm_cur, factx.cl_sel_s_stride * octx->n_threads);
             factx.cl_sel_r     = vtcm_seq_alloc(&vtcm_cur, factx.cl_sel_r_stride * octx->n_threads);
+            if (het_nsplit_req) {
+                // each merge thread DMAs its rows' GPU partials (het_nsplit x stride bytes per row) in here
+                factx.het_rows_per_thread = (rows_total + octx->n_threads - 1) / octx->n_threads;
+                factx.het_vtcm = vtcm_seq_alloc(&vtcm_cur, (size_t) octx->n_threads * factx.het_rows_per_thread * het_nsplit_req * factx.dec_stride_part);
+            }
             if ((size_t) (vtcm_cur - octx->ctx->vtcm_base) <= octx->ctx->vtcm_size) {
                 break;
             }
@@ -5516,10 +5828,49 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
         if (dec && factx.cl_on) {
             t_sel0 = HAP_perf_get_qtimer_count();
             memset(factx.cl_sel_prof, 0, sizeof(factx.cl_sel_prof));
+            factx.cl_overlap = factx.cl_gpu_runs && cl_select && !factx.cl_gpu_select && !factx.cl_pos_runs &&
+                (cls.hdr->flags & HTP_FA_CLUSTER_HDR_OVERLAP) && !(octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) &&
+                octx->op_params[HTP_FA_HETERO_OPP_GPU_NSPLIT] > 0 &&
+                (uint32_t) octx->op_params[HTP_FA_HETERO_OPP_SLOT] < HTP_FA_HETERO_MAX_SLOTS && factx.het_vtcm;
+            if (factx.cl_overlap) {
+                factx.cl_seq = hvx_fa_publish_ready(q, factx.cl_het_base, (uint32_t) octx->op_params[HTP_FA_HETERO_OPP_SLOT], false);
+                factx.cl_t_ready = HAP_perf_get_qtimer_count();
+            }
             if (cl_select && !(octx->flags & HTP_OPFLAGS_SKIP_COMPUTE)) {
                 work_queue_run(octx->ctx->work_queue, flash_attn_ext_f16_select_thread, &factx, octx->n_threads);
             }
-            hvx_fa_cl_copy_lists(&factx, &cls, nek2);   // host lists (density 0) and/or the echo
+            if (!factx.cl_overlap) hvx_fa_cl_copy_lists(&factx, &cls, nek2);
+            if (factx.cl_gpu_runs) {
+                // Hand the selected blocks (minus the HTP's KEEP share, taken from the front of the score-ordered
+                // list) to the GPU: per-head records in the control region, then the ready sequence below.
+                // GPU_SELECT: the GPU writes the records itself; this op attends only the dense tail.
+                const uint32_t slot   = (uint32_t) octx->op_params[HTP_FA_HETERO_OPP_SLOT];
+                const uint32_t nsplit = (uint32_t) octx->op_params[HTP_FA_HETERO_OPP_GPU_NSPLIT];
+                if (factx.cl_gpu_select && nsplit > 0 && slot < HTP_FA_HETERO_MAX_SLOTS && factx.het_vtcm) {
+                    for (uint32_t h = 0; h < nek2; ++h) {
+                        factx.cl_sel_n[h] = 0;
+                    }
+                    het_base   = factx.cl_het_base;
+                    het_slot   = slot;
+                    het_nsplit = nsplit;
+                } else if (factx.cl_pos_runs && nsplit > 0 && slot < HTP_FA_HETERO_MAX_SLOTS && factx.het_vtcm) {
+                    const uint64_t t_part = HAP_perf_get_qtimer_count();
+                    memset(factx.cl_partition_prof, 0, sizeof(factx.cl_partition_prof));
+                    work_queue_run(octx->ctx->work_queue, flash_attn_ext_f16_partition_thread, &factx, octx->n_threads);
+                    factx.cl_partition_us = (uint32_t) ((HAP_perf_get_qtimer_count() - t_part) * 10ull / 192ull);
+                    het_base = factx.cl_het_base;
+                    het_slot = slot;
+                    het_nsplit = nsplit;
+                } else if (nsplit > 0 && slot < HTP_FA_HETERO_MAX_SLOTS && factx.het_vtcm) {
+                    if (!factx.cl_overlap) {
+                        for (uint32_t h = 0; h < nek2; ++h) hvx_fa_cl_publish_head(&factx, h);
+                        qurt_mem_cache_clean((qurt_addr_t) (factx.cl_het_base + HTP_FA_HETERO_SEL_OFF), (size_t) nek2 * HTP_FA_HETERO_SEL_STRIDE, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+                    }
+                    het_base   = factx.cl_het_base;
+                    het_slot   = slot;
+                    het_nsplit = nsplit;
+                }
+            }
             t_sel1 = HAP_perf_get_qtimer_count();
         }
         factx.cl_next_unit = 0;
@@ -5528,18 +5879,30 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
     if (dec) {
         if (!(octx->flags & HTP_OPFLAGS_SKIP_COMPUTE)) {
             uint32_t het_seq = 0;
+            uint64_t het_t_ready = 0;
             if (het_base) {
-                // Q was flushed by the batch's per-op dirty-range flush; flush again explicitly so the
-                // GPU reads are never a stale-line question, then publish this op's sequence number.
-                const size_t q_row_bytes = q->ne[0] * ((q->type == HTP_TYPE_F32) ? 4 : 2);
-                for (uint32_t h = 0; h < neq2; ++h) {
-                    hex_l2flush((uint8_t *) (uintptr_t) q->data + h * q->nb[2], q_row_bytes);
+                if (factx.cl_overlap) {
+                    volatile uint32_t * ready = (volatile uint32_t *) (het_base + het_slot * HTP_FA_HETERO_SLOT_STRIDE);
+                    het_seq = factx.cl_seq;
+                    *ready = het_seq;
+                    qurt_mem_cache_clean((qurt_addr_t) ready, sizeof(uint32_t), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+                } else {
+                    het_seq = hvx_fa_publish_ready(q, het_base, het_slot, true);
                 }
-                volatile uint32_t * ready = (volatile uint32_t *) (het_base + het_slot * HTP_FA_HETERO_SLOT_STRIDE);
-                Q6_dcinva_A((void *) ready);
-                het_seq = *ready + 1;
-                *ready  = het_seq;
-                qurt_mem_cache_clean((qurt_addr_t) ready, sizeof(uint32_t), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+                het_t_ready = factx.cl_overlap ? factx.cl_t_ready : HAP_perf_get_qtimer_count();
+                if (factx.cl_on && (factx.cl_flags & HTP_FA_CLUSTER_FLAG_POLLFIRST)) {
+                    // timing probe: wait for done before doing anything else, so the recorded turnaround is the GPU's alone
+                    volatile uint32_t * done = (volatile uint32_t *) (het_base + het_slot * HTP_FA_HETERO_SLOT_STRIDE + 128);
+                    const uint64_t timeout = (uint64_t) HTP_FA_HETERO_DONE_TIMEOUT_US * 192ull / 10ull;
+                    for (;;) {
+                        Q6_dcinva_A((void *) done);
+                        if (*done == het_seq) break;
+                        if (HAP_perf_get_qtimer_count() - het_t_ready > timeout) break;
+                    }
+                    volatile uint32_t * turn_w = (volatile uint32_t *) (het_base + het_slot * HTP_FA_HETERO_SLOT_STRIDE + 16);
+                    *turn_w = (uint32_t) ((HAP_perf_get_qtimer_count() - het_t_ready) * 10ull / 192ull);
+                    qurt_mem_cache_clean((qurt_addr_t) turn_w, sizeof(uint32_t), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+                }
             }
 
             work_queue_run(octx->ctx->work_queue, flash_attn_ext_f16_dec_thread, &factx, octx->n_threads);
@@ -5555,19 +5918,19 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
                     if (*done == het_seq) break;
                     if (HAP_perf_get_qtimer_count() - t0 > timeout) { ok = false; break; }
                 }
-                // Feedback for the host's share controller: how long this op idled waiting for the GPU.
+                // Feedback for the host's share controller: how long this op idled waiting for the GPU, and
+                // the GPU's turnaround from ready to done as this op saw it.
                 {
+                    const uint64_t t_done = HAP_perf_get_qtimer_count();
                     volatile uint32_t * wait_w = (volatile uint32_t *) (het_base + het_slot * HTP_FA_HETERO_SLOT_STRIDE + 8);
-                    *wait_w = (uint32_t) ((HAP_perf_get_qtimer_count() - t0) * 10ull / 192ull);
-                    qurt_mem_cache_clean((qurt_addr_t) wait_w, sizeof(uint32_t), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+                    wait_w[0] = (uint32_t) ((t_done - t0) * 10ull / 192ull);
+                    wait_w[1] = (uint32_t) ((t_done - het_t_ready) * 10ull / 192ull);
+                    qurt_mem_cache_clean((qurt_addr_t) wait_w, 2 * sizeof(uint32_t), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
                 }
-                if (ok) {
-                    const uint8_t * parts = het_base + HTP_FA_HETERO_PARTS_OFF + (size_t) het_slot * HTP_FA_HETERO_PART_SLOT;
-                    const size_t parts_bytes = (size_t) neq1 * neq2 * neq3 * het_nsplit * factx.dec_stride_part;
-                    for (size_t off = 0; off < parts_bytes; off += HEX_L2_LINE_SIZE) {
-                        Q6_dcinva_A((void *) (parts + off));
-                    }
-                    factx.het_parts      = parts;
+                if (ok && factx.het_vtcm) {
+                    // the merge threads DMA their rows' partials into VTCM (the DMA bypasses L2, so no
+                    // line-by-line invalidation of the GPU-written region)
+                    factx.het_parts      = het_base + HTP_FA_HETERO_PARTS_OFF + (size_t) het_slot * HTP_FA_HETERO_PART_SLOT;
                     factx.het_gpu_nsplit = het_nsplit;
                 } else {
                     // Late GPU: merge the HTP partials only (wrong result, no hang) and count it.
@@ -5599,6 +5962,23 @@ int op_flash_attn_ext(struct htp_ops_context * octx) {
                         if (factx.cl_sel_prof[t][ph] > mx) mx = factx.cl_sel_prof[t][ph];
                     }
                     tw[5 + ph] = (uint32_t) (mx * 10ull / 192ull);
+                }
+                tw[9] = factx.cl_partition_us;
+                tw[14] = 0;
+                tw[15] = 0;
+                if (het_base) {
+                    const volatile uint32_t * wait_w = (const volatile uint32_t *) (het_base + het_slot * HTP_FA_HETERO_SLOT_STRIDE + 8);
+                    tw[14] = wait_w[0];
+                    tw[15] = wait_w[1];
+                }
+                tw[16] = factx.cl_dense_b0 * FLASH_ATTN_BLOCK_SIZE;
+                tw[17] = factx.cl_n_dense_blocks;
+                if (factx.cl_pos_runs) {
+                    for (int ph = 0; ph < 4; ++ph) {
+                        uint64_t mx = 0;
+                        for (int t = 0; t < HTP_MAX_NTHREADS; ++t) mx = MAX(mx, factx.cl_partition_prof[t][ph]);
+                        tw[10 + ph] = (uint32_t) (mx * 10ull / 192ull);
+                    }
                 }
                 qurt_mem_cache_clean((qurt_addr_t) tw, 128, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
             }

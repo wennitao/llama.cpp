@@ -160,6 +160,14 @@ enum htp_sync_probe_rec {
 #define HTP_FA_HETERO_MAX_SLOTS      30
 #define HTP_FA_HETERO_BUF_SIZE       (8 * 1024 * 1024)
 #define HTP_FA_HETERO_DONE_TIMEOUT_US 50000
+// Cluster GPU_RUNS hand-off inside the same control region: per KV head the blocks the GPU attends
+// ({ uint32 n; pad to 128 B; htp_fa_cluster_blk blk[MAX_BLK] }, DSP-written before ready) and the
+// work-group counter the GPU's last group uses to publish done (never reset: it reads want * n_groups).
+#define HTP_FA_HETERO_SEL_OFF        4096
+#define HTP_FA_HETERO_SEL_MAX_BLK    64
+#define HTP_FA_HETERO_SEL_STRIDE     (128 + 16 * HTP_FA_HETERO_SEL_MAX_BLK)
+#define HTP_FA_HETERO_SLOT_COUNTER   132            // slot s: s * HTP_FA_HETERO_SLOT_STRIDE + 132, the done line
+#define HTP_FA_HETERO_SLOT_LIST      140            // GPU_SELECT: the GPU wrote the records (== want), same line
 
 // Heterogeneous PREFILL fold (dev prototype; host env GGML_HEXAGON_FA_FOLD).
 //
@@ -306,8 +314,10 @@ struct htp_fa_fold_hdr {
 #define HTP_FA_CLUSTER_FLAG_ECHO        (1u << 4)              // write the lists the kernel used into echo_sel
 #define HTP_FA_CLUSTER_FLAG_COALESCE    (1u << 5)              // merge consecutive pages into one descriptor (reserved)
 #define HTP_FA_CLUSTER_FLAG_FOLD_SUM    (1u << 6)              // GQA score fold: sum over the group (else max)
+#define HTP_FA_CLUSTER_FLAG_POLLFIRST   (1u << 7)              // hetero timing: poll the GPU's done right after ready, before the dec pass
 #define HTP_FA_CLUSTER_FLAG_MINPAGES(f) (((f) >> 8) & 0xffu)   // minimum pages per head when a budget is used
 #define HTP_FA_CLUSTER_FLAG_FORCE(f)    (((f) >> 16) & 0xffu)  // always select the first F candidate pages of the layer (sink pages)
+#define HTP_FA_CLUSTER_FLAG_KEEP(f)     (((f) >> 24) & 0xffu)  // GPU_RUNS: percent of the selected blocks the HTP keeps (shadow rows); the rest go to the GPU
 #define HTP_FA_CLUSTER_PAGE_KEYS    64     // default and maximum page size; 16 and 32 are also valid (header.page_keys)
 #define HTP_FA_CLUSTER_HDR_INPLACE  (1u << 0)  // header.flags: pages are page_keys consecutive rows of the positional cache itself;
                                                // the shadow holds only descriptors (no K/V pages, pos_map or n_valid)
@@ -319,6 +329,21 @@ struct htp_fa_fold_hdr {
                                                // cluster order (off_runs table); the kernel takes runs whole until a row budget
 #define HTP_FA_CLUSTER_HDR_SCATTER  (1u << 4)  // header.flags (with RUNS): a run's rows are fetched from the positional cache at
                                                // pos_map[row], one linked 1D descriptor per K and V row; the shadow rows are unused
+#define HTP_FA_CLUSTER_HDR_GPU_RUNS (1u << 5)  // header.flags (with RUNS): the GPU attends the selected runs from the positional cache
+                                               // through pos_map. The op writes its per-head block lists (minus a KEEP share) into the
+                                               // hetero control region at hdr.hetero_off (bytes from the header), publishes ready
+                                               // (op_params[9] = slot, [10] = GPU partials per row), attends the dense tail and its
+                                               // kept runs, waits for done and merges the GPU partials.
+#define HTP_FA_CLUSTER_HDR_GPU_SELECT (1u << 6) // header.flags (with GPU_RUNS): the GPU also selects the runs (scores the centroids,
+                                               // greedy fill to the row budget) and writes the records itself; the op runs no select
+                                               // pass, keeps no runs, publishes ready right after setup and attends the dense tail.
+#define HTP_FA_CLUSTER_HDR_POS_RUNS (1u << 7) // no K/V shadow: HTP takes positional runs of at least KEEP rows (0 = GPU all)
+#define HTP_FA_CLUSTER_HDR_HOST_RUNS (1u << 8) // density 0: host_sel contains replay blocks, not page indices
+#define HTP_FA_CLUSTER_HDR_PREPARED (1u << 9) // position-sorted members and routing spans prepared per cluster
+#define HTP_FA_CLUSTER_HDR_GPU_ROWS (1u << 10) // KEEP limits GPU rows per head in units of 64
+#define HTP_FA_CLUSTER_HDR_OVERLAP  (1u << 11) // publish GPU records after each head's selection
+#define HTP_FA_CLUSTER_HDR_REORDER  (1u << 12) // K/V prefix is physically in cluster order; no shadow pages
+#define HTP_FA_CLUSTER_SPAN_HTP     (1u << 31)
 #define HTP_FA_CLUSTER_RUN_FORCED   (1u << 0)  // run.flags: always attended (the sink tokens), not charged to the budget
 #define HTP_FA_CLUSTER_MAX_LAYERS   128
 
@@ -357,7 +382,7 @@ struct htp_fa_cluster_header {
     uint64_t off_echo_sel;    // same shape, written by the kernel under HTP_FA_CLUSTER_FLAG_ECHO
     uint64_t off_centroids;   // [n_kv_heads][n_pages_max] x f16[D] (centroid_bytes rows)
     uint64_t off_pos_map;     // [n_kv_heads][n_pages_max] x uint32_t[page_keys]: positional row of each key
-    uint64_t off_n_valid;     // [n_pages_max] x uint16_t (reserved: pages are full in v1)
+    uint64_t off_n_valid;     // reserved; POS_RUNS: GPU records [count, HTP rows, HTP blocks, indexed], stride 128 + rows_max * 4
     uint64_t off_k_pages;     // [n_kv_heads][n_pages_max] x [page_keys][D] f16  (runs mode: [n_kv_heads][kv_size] rows in cluster order)
     uint64_t off_v_pages;     // same
     uint64_t off_runs;        // runs mode: [n_kv_heads][n_runs_max] x struct htp_fa_cluster_run (centroids are per run in that mode)
@@ -391,11 +416,36 @@ struct htp_fa_cluster_chunk {
 // aligned, page regions 16 KB aligned, layers 64 KB aligned.
 static inline uint64_t htp_fa_cluster_align(uint64_t x, uint64_t a) { return (x + a - 1) / a * a; }
 
+static inline uint64_t htp_fa_cluster_meta_offset(const struct htp_fa_cluster_header * h) {
+    return h->off_n_valid + ((h->flags & HTP_FA_CLUSTER_HDR_POS_RUNS)
+        ? (uint64_t) h->n_kv_heads * (128 + (uint64_t) h->n_pages_max * h->page_keys * 4)
+        : htp_fa_cluster_align((uint64_t) h->n_pages_max * 2, 128));
+}
+
+// Metadata starts with the minimum run length in a 128-byte header, then [head][positions, span ends].
+// Positions are sorted within each whole cluster. Adjacent short runs share one GPU span.
+static inline void htp_fa_cluster_prepare_spans(const uint32_t * pos, uint32_t * spans, uint32_t first, uint32_t count, uint32_t min_run) {
+    const uint32_t end = first + count;
+    uint32_t pending = first;
+    for (uint32_t i = first; i < end;) {
+        uint32_t j = i + 1;
+        while (j < end && pos[j] == pos[j - 1] + 1) j++;
+        if (min_run && j - i >= min_run) {
+            for (; pending < i; ++pending) spans[pending] = i;
+            for (; pending < j; ++pending) spans[pending] = j | HTP_FA_CLUSTER_SPAN_HTP;
+        }
+        i = j;
+    }
+    for (; pending < end; ++pending) spans[pending] = end;
+}
+
 static inline uint64_t htp_fa_cluster_layout_v2(struct htp_fa_cluster_header * h, uint32_t n_layers, uint32_t kv_size,
                                                 uint32_t n_kv_heads, uint32_t D, uint32_t page_keys, uint32_t avg_cluster, uint32_t hdr_flags) {
     memset(h, 0, sizeof(*h));
     const int inplace = (hdr_flags & HTP_FA_CLUSTER_HDR_INPLACE) != 0;
     const int runs    = (hdr_flags & HTP_FA_CLUSTER_HDR_RUNS) != 0;
+    const int pos_runs = runs && (hdr_flags & HTP_FA_CLUSTER_HDR_POS_RUNS) != 0;
+    const int no_pages = inplace || pos_runs || (hdr_flags & HTP_FA_CLUSTER_HDR_REORDER);
     h->flags       = hdr_flags;
     if (runs) {
         page_keys = HTP_FA_CLUSTER_PAGE_KEYS;   // rows are addressed individually; 64 keeps the row region 16 KB aligned
@@ -430,9 +480,10 @@ static inline uint64_t htp_fa_cluster_layout_v2(struct htp_fa_cluster_header * h
     h->off_echo_sel  = htp_fa_cluster_align(off, 128); off  = h->off_echo_sel  + (uint64_t) n_kv_heads * h->host_sel_stride;
     h->off_centroids = htp_fa_cluster_align(off, 128); off  = h->off_centroids + (uint64_t) n_kv_heads * n_units * h->centroid_bytes;
     h->off_pos_map   = htp_fa_cluster_align(off, 128); off  = h->off_pos_map   + (inplace ? 0 : (uint64_t) n_kv_heads * h->n_pages_max * page_keys * 4);
-    h->off_n_valid   = htp_fa_cluster_align(off, 128); off  = h->off_n_valid   + (inplace ? 0 : htp_fa_cluster_align((uint64_t) h->n_pages_max * 2, 128));
-    h->off_k_pages   = htp_fa_cluster_align(off, inplace ? 128 : 16384); off = h->off_k_pages + (inplace ? 0 : (uint64_t) n_kv_heads * h->n_pages_max * h->page_bytes);
-    h->off_v_pages   = htp_fa_cluster_align(off, inplace ? 128 : 16384); off = h->off_v_pages + (inplace ? 0 : (uint64_t) n_kv_heads * h->n_pages_max * h->page_bytes);
+    h->off_n_valid   = htp_fa_cluster_align(off, 128); off  = h->off_n_valid + (pos_runs ? (uint64_t) n_kv_heads * (128 + (uint64_t) h->n_pages_max * page_keys * 4) : inplace ? 0 : htp_fa_cluster_align((uint64_t) h->n_pages_max * 2, 128));
+    if (runs && (hdr_flags & HTP_FA_CLUSTER_HDR_PREPARED)) off += 128 + (uint64_t) n_kv_heads * h->n_pages_max * page_keys * 8;
+    h->off_k_pages   = htp_fa_cluster_align(off, no_pages ? 128 : 16384); off = h->off_k_pages + (no_pages ? 0 : (uint64_t) n_kv_heads * h->n_pages_max * h->page_bytes);
+    h->off_v_pages   = htp_fa_cluster_align(off, no_pages ? 128 : 16384); off = h->off_v_pages + (no_pages ? 0 : (uint64_t) n_kv_heads * h->n_pages_max * h->page_bytes);
     h->off_runs      = htp_fa_cluster_align(off, 128); off  = h->off_runs + (runs ? (uint64_t) n_kv_heads * h->n_runs_max * sizeof(struct htp_fa_cluster_run) : 0);
     h->layer_stride  = htp_fa_cluster_align(off, 65536);
     h->layer0_off    = htp_fa_cluster_align(HTP_FA_CLUSTER_DIR_OFF + (uint64_t) n_layers * HTP_FA_CLUSTER_DIR_STRIDE, 65536);
