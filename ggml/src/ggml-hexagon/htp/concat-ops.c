@@ -212,12 +212,53 @@ static void concat_generic(unsigned int nth, unsigned int ith, void * data) {
     }
 }
 
+static bool concat_is_contiguous(const struct htp_tensor * t, uint32_t type_size) {
+    return t->nb[0] == type_size && t->nb[1] == t->nb[0] * t->ne[0] && t->nb[2] == t->nb[1] * t->ne[1] &&
+           t->nb[3] == t->nb[2] * t->ne[2];
+}
+
+// All three tensors contiguous: dst is, for each index above dim, src0's slab followed by src1's,
+// so the op is two block copies per outer index instead of one scalar copy per element.
+static void concat_contiguous(unsigned int nth, unsigned int ith, void * data) {
+    struct htp_concat_context * cctx = (struct htp_concat_context *) data;
+    const struct htp_tensor * src0 = cctx->octx->src[0];
+    const struct htp_tensor * src1 = cctx->octx->src[1];
+    const struct htp_tensor * dst  = cctx->octx->dst;
+    const uint32_t dim = cctx->dim;
+
+    const size_t b0 = (size_t) src0->nb[dim] * src0->ne[dim];
+    const size_t b1 = (size_t) src1->nb[dim] * src1->ne[dim];
+    uint32_t outer = 1;
+    for (uint32_t i = dim + 1; i < 4; i++) {
+        outer *= dst->ne[i];
+    }
+    const uint32_t per = (outer + nth - 1) / nth;
+    const uint32_t o0 = MIN(ith * per, outer), o1 = MIN(o0 + per, outer);
+    for (uint32_t o = o0; o < o1; o++) {
+        uint8_t * d = (uint8_t *) dst->data + o * (b0 + b1);
+        hvx_copy_uu(d, (const uint8_t *) src0->data + o * b0, b0, 1);
+        hvx_copy_uu(d + b0, (const uint8_t *) src1->data + o * b1, b1, 1);
+    }
+}
+
 int op_concat(struct htp_ops_context * octx) {
     const struct htp_tensor * src0 = octx->src[0];
     const struct htp_tensor * src1 = octx->src[1];
     const struct htp_tensor * dst  = octx->dst;
 
     int dim = octx->op_params[0];
+
+    {
+        const uint32_t ts = (dst->type == HTP_TYPE_F32 || dst->type == HTP_TYPE_I32) ? 4 : 2;
+        if (src0->type == dst->type && src1->type == dst->type && concat_is_contiguous(src0, ts) &&
+            concat_is_contiguous(src1, ts) && concat_is_contiguous(dst, ts)) {
+            struct htp_concat_context cctx;
+            cctx.octx = octx;
+            cctx.dim  = dim;
+            worker_pool_run_func(octx->ctx->worker_pool, concat_contiguous, &cctx, octx->n_threads);
+            return HTP_STATUS_OK;
+        }
+    }
 
     bool is_2d = dst->ne[2] == 1 && dst->ne[3] == 1;
 
