@@ -5298,6 +5298,8 @@ static bool ggml_hexagon_hfold_ensure_buffer(ggml_hexagon_hfold * h, uint32_t ro
         if (!h->buf) { GGML_LOG_ERROR("ggml-hex: fa-fold: fold buffer alloc (%zu MB) failed\n", h->size >> 20); return false; }
         h->base = (uint8_t *) ggml_backend_buffer_get_base(h->buf);
         memset(h->base, 0, h->size);
+        // Keep the DSP sequence equal to the relay sequence when the buffer grows.
+        *(uint32_t *) (h->base + h->off_ctl) = h->seq;
         hetero_dc_civac(h->base, h->size);
         ggml_init_params ip = { ggml_tensor_overhead() * 2, nullptr, true };
         h->tctx = ggml_init(ip);
