@@ -349,7 +349,8 @@ public:
 
     ggml_tensor * self_sparse_sel  = nullptr; // I32 [u, NBq, 1, 1], experimental
     // XAttention's position-only inputs, filled by the host like the KQ mask so its graphs keep no CPU node:
-    ggml_tensor * self_xattn_idx     = nullptr; // I32 [n_tokens, n_head], rows reversed per 16 (xattn scorer)
+    ggml_tensor * self_xattn_idx     = nullptr; // I32 [n_tokens, n_head], rows reversed per 16 (xattn scorer, LLAMA_XATTN_*)
+    ggml_tensor * self_xattn_reduced = nullptr; // F32 [padded n_kv/16, n_tokens/16], reach of each 16x16 tile (LLAMA_XATTN_*)
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;

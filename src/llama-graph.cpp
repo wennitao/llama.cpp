@@ -619,6 +619,19 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         ggml_backend_tensor_set(self_xattn_idx, order.data(), 0, ggml_nbytes(self_xattn_idx));
     }
 
+    if (self_xattn_reduced && self_xattn_reduced->buffer && self_xattn_reduced->data) {
+        // llama_xattention_reduce_mask, from the KQ mask just written
+        GGML_ASSERT(self_kq_mask && self_kq_mask->data && ggml_backend_buffer_is_host(self_kq_mask->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(self_xattn_reduced->buffer));
+        const int64_t nk = self_xattn_reduced->ne[0];
+        auto * out = static_cast<float *>(self_xattn_reduced->data);
+        for (int64_t q = 0; q < self_xattn_reduced->ne[1]; ++q) {
+            for (int64_t k = 0; k < nk; ++k) {
+                out[q*nk + k] = k*16 < self_kq_mask->ne[0] && std::isfinite(llama_xattention_mask_at(self_kq_mask, k*16, q*16+15)) ? 0.0f : -1.0e30f;
+            }
+        }
+    }
+
     if (self_k_rot && self_k_rot->buffer) {
         mctx->set_input_k_rot(self_k_rot);
     }
@@ -662,9 +675,12 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
         }
     }
     res &= !self_xattn_idx || self_xattn_idx->ne[0] == params.ubatch.n_tokens;
+    res &= !self_xattn_reduced || (self_xattn_reduced->ne[0] == llama_xattention_padded_keys(mctx->get_n_kv())/16 &&
+                                   self_xattn_reduced->ne[1] == params.ubatch.n_tokens/16);
     {
         // XAttention's inputs exist exactly when the graph would build them
-        const bool want_idx = llama_sparse_attn_xattn() && self_sparse_sel && self_sparse_sel->ne[3] == 2;
+        const bool want_idx = (llama_sparse_attn_xattn() && self_sparse_sel && self_sparse_sel->ne[3] == 2) ||
+                              (llama_xattention_threshold() > 0.0f && params.cparams.flash_attn && params.ubatch.n_tokens > 256);
         res &= want_idx == (self_xattn_idx != nullptr);
     }
 
@@ -3477,10 +3493,16 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_sparse_sel = build_attn_inp_sparse_sel(ctx0, mctx_cur, ubatch, cparams);
 
         const bool xattn_scorer = inp->self_sparse_sel && inp->self_sparse_sel->ne[3] == 2 && llama_sparse_attn_xattn();
-        if (xattn_scorer) {
+        const bool xattn_base   = llama_xattention_threshold() > 0.0f && cparams.flash_attn && ubatch.n_tokens > 256;
+        if (xattn_scorer || xattn_base) {
             inp->self_xattn_idx = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, ubatch.n_tokens, hparams.n_head(0));
             ggml_set_input(inp->self_xattn_idx);
             ggml_set_name(inp->self_xattn_idx, "xattn_idx");
+        }
+        if (xattn_base) {
+            inp->self_xattn_reduced = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, llama_xattention_padded_keys(mctx_cur->get_n_kv())/16, ubatch.n_tokens/16);
+            ggml_set_input(inp->self_xattn_reduced);
+            ggml_set_name(inp->self_xattn_reduced, "xattn_reduced");
         }
     }
 
@@ -3566,6 +3588,13 @@ ggml_tensor * llm_graph_context::build_attn(
                            sparse_sel ? "ATTACHED" : "DECLINED (shape)", il,
                            (long long) q_cur->ne[0], (long long) q_cur->ne[1], (long long) q_cur->ne[2]);
         }
+    }
+
+    if (inp->self_xattn_reduced) {
+        // XAttention reads the host-filled inputs instead of building its CPU custom ops (build_attn_mha)
+        xattn_mask    = kq_mask;
+        xattn_indices = inp->self_xattn_idx;
+        xattn_reduced = inp->self_xattn_reduced;
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il,

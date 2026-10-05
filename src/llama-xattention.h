@@ -53,6 +53,14 @@ static void llama_xattention_reduce_mask(ggml_tensor * dst, int ith, int nth, vo
     }
 }
 
+// LLAMA_XATTN_SELECT=npu tags the cumulative selection so the Hexagon backend runs it on the DSP (HTP_OP_XATTN_SELECT,
+// the same walk over HVX-sorted priorities) instead of the CPU; the CPU op stays the reference and the fallback.
+static bool llama_xattention_select_npu() {
+    const char * value = getenv("LLAMA_XATTN_SELECT");
+    GGML_ASSERT(!value || strcmp(value, "npu") == 0 || strcmp(value, "cpu") == 0);
+    return value && strcmp(value, "npu") == 0;
+}
+
 static bool llama_xattention_gqa_union() {
     // LLAMA_XATTN_GQA=union shares one list per KV head (the OR of its query heads' masks) so a single
     // GQA FlashAttention runs; the default keeps upstream's independent query-head masks.
@@ -158,6 +166,13 @@ static ggml_tensor * llama_xattention_build(
     ggml_tensor * selection_args[] = {scores, mask};
     // rows are independent: the cumulative selection uses every CPU thread of the backend
     auto * membership = ggml_custom_4d(ctx, GGML_TYPE_F32, nbk, nbq, lists, 1, selection_args, 2, llama_xattention_select, GGML_N_TASKS_MAX, nullptr);
+    if (llama_xattention_select_npu()) {
+        // HTP_XATTN_SELECT_P_MAGIC / _THRESHOLD (ggml-hexagon htp-ops.h): slots past the custom-op header
+        const float threshold = (float) llama_xattention_threshold();
+        GGML_ASSERT((double) threshold == llama_xattention_threshold());
+        membership->op_params[12] = 0x58534c54;
+        memcpy(&membership->op_params[13], &threshold, sizeof(threshold));
+    }
     ggml_format_name(membership, "xattn_membership-%d", layer);
     return llama_block_sparse_attn(ctx, q, k, v, mask, membership, bs, bs, scale, layer, "xattn");
 }
