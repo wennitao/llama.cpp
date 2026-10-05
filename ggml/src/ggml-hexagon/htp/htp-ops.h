@@ -103,9 +103,18 @@ enum htp_op_code {
     HTP_OP_IM2COL,
     HTP_OP_XATTN_SCORE,
     HTP_OP_SYNC_PROBE,
+    HTP_OP_XATTN_SELECT,
 
     HTP_OP_INVALID
 };
+
+// HTP_OP_XATTN_SELECT: XAttention's cumulative block selection (argsort-ops.c), a GGML_OP_CUSTOM node that
+// src/llama-xattention.h tags in op_params slots the custom-op header (function, n_tasks, userdata) leaves free.
+enum htp_xattn_select_params {
+    HTP_XATTN_SELECT_P_MAGIC     = 12,
+    HTP_XATTN_SELECT_P_THRESHOLD = 13,
+};
+#define HTP_XATTN_SELECT_MAGIC 0x58534c54
 
 // HTP_OP_SYNC_PROBE: dev-only flag round-trip probe (host gates it behind GGML_HEXAGON_SYNC_PROBE=1).
 // The op raises a 'ready' word in src[0], spin-polls a 'done' word another agent (CPU or GPU) writes,

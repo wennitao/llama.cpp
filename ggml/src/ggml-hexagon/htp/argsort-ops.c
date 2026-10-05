@@ -3,6 +3,8 @@
 #include <math.h>
 #include <HAP_farf.h>
 #include <HAP_perf.h>
+#include <qurt.h>
+#include <qurt_memory.h>
 
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
@@ -510,5 +512,162 @@ int op_argsort(struct htp_ops_context * octx) {
     // Run jobs
     worker_pool_run_func(octx->ctx->worker_pool, job_func, &actx, n_threads);
 
+    return HTP_STATUS_OK;
+}
+
+// HTP_OP_XATTN_SELECT: XAttention's cumulative block selection -- llama_xattention_select in src/llama-xattention.h,
+// itself upstream's find_blocks_chunked -- run on the DSP, so the XAttention selector never leaves the NPU.
+//   src0  block masses [nk, nq, H*groups] f32, contiguous rows
+//   src1  the KQ mask (f16 or f32, [n_kv, n_tokens]); it locates each query block's diagonal key block
+//   dst   membership [nk, nq, H] f32 0/1, the OR over a GQA group's `groups` heads
+//   op_params[HTP_XATTN_SELECT_P_MAGIC] = HTP_XATTN_SELECT_MAGIC, [HTP_XATTN_SELECT_P_THRESHOLD] = threshold (f32 bits)
+// Per (row, head): the priorities (mandatory sink/diagonal blocks lifted above every other) are sorted by the argsort's
+// HVX bitonic network over a power-of-two row padded with -1, then the CPU op's double-precision cumulative walk runs
+// on the sorted order. The diagonal is found by bisection: in a causal mask whose cells are in position order (the
+// sparse prefill paths assert one sequence) a row's finite keys are a prefix, so this is the CPU op's last finite block
+// start. Only ties between exactly equal masses can order differently from the CPU op's stable sort.
+//
+// Tensor rows move between DDR and the stack only by HVX copies; the scalar walk touches the stack (and the KQ mask, a
+// graph input no op rewrites). Scalar loads allocate lines in L1D, which DMA writes do not invalidate: when src0's
+// memory was reused for a DMA-written tensor later in the batch (scale_bias's output in a 768-query ubatch), the
+// argsort that read it found these stale lines and the next FlashAttention ran wrong lists, deterministically.
+#define HTP_XATTN_SELECT_MAX_NK 256
+
+struct htp_xattn_select_context {
+    struct htp_ops_context * octx;
+    uint32_t                 rows_per_thread;
+    uint32_t                 width;
+    uint8_t *                vtcm_base;
+    size_t                   vtcm_per_thread;
+};
+
+// One scalar probe of the KQ mask; its L1D line is dropped again (the DSP never writes the mask, so nothing is lost)
+// so no stale copy can outlive the mask's memory.
+static inline bool xattn_mask_finite(const struct htp_tensor * mask, uint32_t key, uint32_t query) {
+    const uint8_t * p = (const uint8_t *) mask->data + (size_t) key*mask->nb[0] + (size_t) query*mask->nb[1];
+    const bool finite = mask->type == HTP_TYPE_F16 ? (*(const uint16_t *) p & 0x7c00) != 0x7c00
+                                                   : (*(const uint32_t *) p & 0x7f800000) != 0x7f800000;
+    Q6_dcinva_A((void *) p);
+    return finite;
+}
+
+static void htp_xattn_select_job(unsigned int n, unsigned int ith, void * data) {
+    struct htp_xattn_select_context * sctx = (struct htp_xattn_select_context *) data;
+    struct htp_ops_context * octx = sctx->octx;
+    const struct htp_tensor * scores = octx->src[0];
+    const struct htp_tensor * mask   = octx->src[1];
+    const struct htp_tensor * dst    = octx->dst;
+
+    const uint32_t nk = scores->ne[0], nq = scores->ne[1];
+    const uint32_t lists = dst->ne[2], groups = scores->ne[2] / lists;
+    const uint32_t bs = mask->ne[1] / nq;
+    const uint32_t W = sctx->width;
+    float threshold;
+    memcpy(&threshold, &octx->op_params[HTP_XATTN_SELECT_P_THRESHOLD], sizeof(float));
+
+    uint8_t * spad = sctx->vtcm_base + sctx->vtcm_per_thread * ith;
+    float *   vbuf = (float *) spad;
+    int32_t * ibuf = (int32_t *) (spad + hex_round_up(W * sizeof(float), 128));
+    // scalar work stays on the stack: a scalar VTCM access costs ~170 cycles, and scalar DDR loads go stale (above)
+    union { float f[HTP_XATTN_SELECT_MAX_NK]; int32_t i[HTP_XATTN_SELECT_MAX_NK]; } row;
+    float mass[HTP_XATTN_SELECT_MAX_NK];
+    float keep[HTP_XATTN_SELECT_MAX_NK];
+
+    const uint32_t start = sctx->rows_per_thread * ith;
+    const uint32_t end   = MIN(start + sctx->rows_per_thread, nq * lists);
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, start);
+
+    for (uint32_t r = start; r < end; r++) {
+        const uint32_t q = r % nq, j = r / nq;
+        for (uint32_t b = 0; b < nk; b++) {
+            keep[b] = 0.0f;
+        }
+
+        // last block whose first key query row (q+1)*bs-1 sees
+        const uint32_t query = (q + 1) * bs - 1;
+        int32_t lo = -1, hi = (int32_t) nk;            // finite(lo), !finite(hi)
+        while (hi - lo > 1) {
+            const int32_t mid = (lo + hi) / 2;
+            if (xattn_mask_finite(mask, (uint32_t) mid * bs, query)) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        const int32_t diagonal = lo;
+        if (diagonal >= 0) {     // the CPU op asserts; with none, nothing is selectable
+            keep[0] = keep[diagonal] = 1.0f;
+            const uint32_t n_mandatory = diagonal > (int32_t) q ? 2 : 1;
+
+            for (uint32_t h = j * groups; h < (j + 1) * groups; h++) {
+                hvx_copy_f32_uu((uint8_t *) mass, (const uint8_t *) scores->data + (size_t) q*scores->nb[1] + (size_t) h*scores->nb[2], nk);
+                asm volatile(" syncht\n" ::: "memory");   // HVX stores land before the scalar reloads (hvx-kernel gotcha)
+                double total = 0.0, forced = 0.0;
+                for (uint32_t b = 0; b < nk; b++) {
+                    // At offset zero, upstream's identity assignment replaces the sink column.
+                    const bool mandatory = (int32_t) b == diagonal || (b == 0 && diagonal > (int32_t) q);
+                    total  += mass[b];
+                    forced += mandatory ? mass[b] : 0.0;
+                    row.f[b] = mandatory ? 100000.0f * (1.0f + mass[b]) : mass[b];
+                }
+                for (uint32_t b = nk; b < W; b++) {
+                    row.f[b] = -1.0f;
+                }
+                asm volatile(" syncht\n" ::: "memory");   // scalar stores land before the HVX loads
+                hvx_copy_f32_au((uint8_t *) vbuf, (const uint8_t *) row.f, W);
+                bitonic_sort_generic_hvx((uint8_t *) vbuf, (uint8_t *) ibuf, (int) (W / 32), false);
+                hvx_copy_f32_ua((uint8_t *) row.i, (const uint8_t *) ibuf, W);
+                asm volatile(" syncht\n" ::: "memory");
+
+                // the CPU op's walk; other[i], its descending non-mandatory masses, are the masses ranked after the
+                // mandatory blocks, then n_mandatory zeros
+                const double required = total * threshold;
+                double cumulative = 0.0;
+                for (uint32_t rank = 0; rank < nk; rank++) {
+                    const int32_t b = row.i[rank];
+                    if (cumulative < required && b <= diagonal) {
+                        keep[b] = 1.0f;
+                    }
+                    if (rank == 1) {
+                        cumulative += forced;
+                    } else if (rank >= 2 && n_mandatory + rank - 2 < nk) {
+                        cumulative += mass[row.i[n_mandatory + rank - 2]];
+                    }
+                }
+            }
+        }
+        asm volatile(" syncht\n" ::: "memory");
+        hvx_copy_f32_uu((uint8_t *) dst->data + (size_t) q*dst->nb[1] + (size_t) j*dst->nb[2], (const uint8_t *) keep, nk);
+    }
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, start);
+}
+
+int op_xattn_select(struct htp_ops_context * octx) {
+    const struct htp_tensor * scores = octx->src[0];
+    const struct htp_tensor * dst    = octx->dst;
+    if (scores->type != HTP_TYPE_F32 || dst->type != HTP_TYPE_F32 || scores->ne[0] > HTP_XATTN_SELECT_MAX_NK || scores->ne[0] < 2) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+    uint32_t width = 32;
+    while (width < scores->ne[0]) {
+        width *= 2;
+    }
+    const uint32_t total_rows = dst->ne[1] * dst->ne[2];
+    const uint32_t n_threads  = MIN(total_rows, octx->n_threads);
+    const size_t   per_thread = hex_round_up(hex_round_up(width * sizeof(float), 128) + hex_round_up(width * sizeof(int32_t), 128), 256);
+    if (octx->ctx->vtcm_size < per_thread * n_threads) {
+        FARF(ERROR, "xattn-select: VTCM size too small. Needed %zu, have %zu", per_thread * n_threads, octx->ctx->vtcm_size);
+        return HTP_STATUS_VTCM_TOO_SMALL;
+    }
+    struct htp_xattn_select_context sctx;
+    sctx.octx            = octx;
+    sctx.rows_per_thread = (total_rows + n_threads - 1) / n_threads;
+    sctx.width           = width;
+    sctx.vtcm_base       = (uint8_t *) octx->ctx->vtcm_base;
+    sctx.vtcm_per_thread = per_thread;
+    worker_pool_run_func(octx->ctx->worker_pool, htp_xattn_select_job, &sctx, n_threads);
     return HTP_STATUS_OK;
 }

@@ -7750,6 +7750,9 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
             if (opt_sync_probe && (uint32_t) t->op_params[HTP_SYNC_PROBE_P_MAGIC] == HTP_SYNC_PROBE_MAGIC) {
                 return HTP_OP_SYNC_PROBE;
             }
+            if ((uint32_t) t->op_params[HTP_XATTN_SELECT_P_MAGIC] == HTP_XATTN_SELECT_MAGIC) {
+                return HTP_OP_XATTN_SELECT;
+            }
             break;
 
         case GGML_OP_UNARY:
@@ -8557,6 +8560,25 @@ static bool ggml_hexagon_supported_fill(const struct ggml_hexagon_session * sess
     GGML_UNUSED(sess);
 }
 
+// XAttention's cumulative selection (src/llama-xattention.h tags its CPU custom op; htp/argsort-ops.c):
+// scores [nk, nq, H*groups] f32 with contiguous rows, the f16/f32 KQ mask, membership [nk, nq, H] f32.
+static bool ggml_hexagon_supported_xattn_select(const struct ggml_tensor * op) {
+    if ((uint32_t) op->op_params[HTP_XATTN_SELECT_P_MAGIC] != HTP_XATTN_SELECT_MAGIC) {
+        return false;
+    }
+    const struct ggml_tensor * scores = op->src[0];
+    const struct ggml_tensor * mask   = op->src[1];
+    if (!scores || !mask || op->src[2] || op->type != GGML_TYPE_F32 || scores->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (mask->type != GGML_TYPE_F16 && mask->type != GGML_TYPE_F32) {
+        return false;
+    }
+    return scores->nb[0] == sizeof(float) && ggml_is_contiguous(op) && scores->ne[0] >= 2 && scores->ne[0] <= 256 &&
+           op->ne[0] == scores->ne[0] && op->ne[1] == scores->ne[1] && op->ne[3] == 1 && scores->ne[3] == 1 &&
+           scores->ne[2] % op->ne[2] == 0 && mask->ne[1] % scores->ne[1] == 0;
+}
+
 static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     auto sess = static_cast<ggml_hexagon_session *>(dev->context);
 
@@ -8659,7 +8681,8 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
             break;
 
         case GGML_OP_CUSTOM:
-            supp = opt_sync_probe && (uint32_t) op->op_params[HTP_SYNC_PROBE_P_MAGIC] == HTP_SYNC_PROBE_MAGIC;
+            supp = (opt_sync_probe && (uint32_t) op->op_params[HTP_SYNC_PROBE_P_MAGIC] == HTP_SYNC_PROBE_MAGIC) ||
+                   ggml_hexagon_supported_xattn_select(op);
             break;
 
         case GGML_OP_SET_ROWS:
