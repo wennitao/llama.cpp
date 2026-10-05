@@ -2133,6 +2133,69 @@ therefore includes any GPU-activity effect, and it vanishes under GPU throttling
 Operational: the adb tunnel died mid-run and a polling `adb devices` auto-started a LOCAL adb server that took
 port 5037, so the user's new ssh forward could not bind. Never run adb unless 5037 is the ssh listener.
 
+## 4n. Pooled-key scorer, XAttention's rule on the DSP, and the existing selectors on the NPU (2026-10-03, units e8b7f0c8 and c13eb13b)
+
+The paper's selector is now the pooled-key scorer (`LLAMA_SPARSE_ATTN_SCORER=pooledk`): reps4's four sampled query
+rows per 64-block against four key representatives that are each the mean of 16 consecutive keys, with the diagonal
+block causal at representative granularity. `pooled` also pools the queries, and `xattn` puts XAttention's stride-16
+antidiagonal into the same threshold pipeline, which separates its scorer from its cumulative rule. All three read
+raw cache rows and fall back to reps4, with a warning, when the K cache is not F16. RULER 4k on CUDA at 53.2% density
+(6500 prompts, paired within-task bootstrap): pooledk 86.40, reps4 85.62 (+0.78 [+0.37, +1.18]), XAttention B64
+86.39 (+0.01 [-0.36, +0.38]), the xattn scorer in our pipeline 86.36, dense 87.08.
+
+The XAttention baseline no longer leaves the NPU. `LLAMA_XATTN_SELECT=npu` runs its cumulative rule as one DSP op
+(`HTP_OP_XATTN_SELECT` in argsort-ops.c: the priorities sorted by the HVX bitonic network, then the CPU op's
+double-precision walk), and the reversed-row indices and reduced mask are host-filled graph inputs like the KQ mask.
+The DSP rule equals the CPU rule on all 112 per-layer chunk counts of a 4k prompt. The threshold must be exactly
+representable as a float (asserted; the study uses 0.9267578125). XAttention and the selectors below share one
+block-sparse tail (`src/llama-block-sparse.h`).
+
+Same protocol as 4m on unit e8b7f0c8 (runners in
+docs/papers/heterogeneous-inference/data/accuracy-validation/sm8750/ruler-prefill-pooledk/). Ours is
+`LLAMA_SPARSE_ATTN=thr:0.4308 LLAMA_SPARSE_ATTN_SCORER=pooledk`, the split adds
+`LLAMA_SPARSE_ATTN_CSTAR=2 LLAMA_SPARSE_ATTN_HEADSTART=8 GGML_HEXAGON_FA_FOLD=1`.
+
+| Prefill per prompt (s), median of 3 rounds | 4k | 8k |
+|---|---:|---:|
+| Dense | 2.22 | 5.81 |
+| XAttention + naive 64, per-head masks | 3.38 | 8.93 |
+| XAttention + naive 64, masks per K/V head | 2.45 | 6.01 |
+| Pooled keys + naive 64 | 2.14 | 4.94 |
+| Pooled keys + split (ours) | 1.99 | 4.64 |
+
+The split is 1.23x/1.30x faster than XAttention with masks per K/V head, 1.70x/1.93x than with per-head masks,
+11%/25% faster than dense, and 8%/7% faster than naive 64-block attention with the same scorer. With its rule on the
+DSP, XAttention is still slower than dense. Per layer over the prompt (4k/8k), its scoring and selection take
+9.5/27.8 ms (per K/V head) against 3.2/9.4 ms for ours (34%). Attention including selection takes 36.7/116.9 ms for
+XAttention, 22.3/60.7 ms for ours and 26.0/95.6 ms for dense. Executed block density 4k/8k: XAttention per head
+49.9/42.1%, per K/V head 60.7/53.1% (both as in 4m), pooled-key naive 41.5/34.5%, split 51.8/42.4%. Eight-chunk
+WikiText perplexity: dense 17.7145, XAttention per head 17.7994, per K/V head 17.6700, pooled-key naive 17.5159,
+split 17.5717. Dense and both XAttention arms equal 4m's values, so moving the rule to the DSP changed nothing
+numerically. As in 4m, no GPU keep-alive control was run.
+
+**The existing selectors on the NPU** (`LLAMA_SELECTOR=minference_vs|minference_bs|flexprefill|spargeattn|flashprefill|sampleattn`
+with `LLAMA_SELECTOR_PARAM`, `LLAMA_SELECTOR_GQA=head|union` and `LLAMA_SELECTOR_SELECT=cpu|npu`; unit c13eb13b, two
+rounds). Each estimator is built from standard NPU ops, each selection rule is one DSP op (`HTP_OP_SEL`, sel-ops.c),
+and attention is the same block-sparse kernel at 53.2% density. None prefills faster than dense at 4k with one list
+per K/V head. MInference vertical-slash, FlexPrefill, SampleAttention and SpargeAttn take 1.16-1.37x the dense time.
+MInference block-sparse and FlashPrefill reach parity (1.02x, 1.00x) but score 9.3 and 2.7 RULER 4k points below
+dense. There are two costs:
+
+- Token-level estimation (the softmax of probe queries over every key, reduced along columns and diagonals) runs on
+  HVX and takes 20-57% of a dense prefill. SpargeAttn's self-similarity takes 23-28%, XAttention's antidiagonal
+  12-14%.
+- One list per query head forfeits the kernel's GQA sharing: attention takes 0.95-4.1x the dense time at about half
+  the pairs. One list per K/V head adds 5.7-9.7 points of density.
+
+Two silent faults were fixed along the way:
+
+- HTP same-shape binary ops with src1 broadcast over dim 1 (`ne11 == 1`) read the rows after the broadcast row.
+  SpargeAttn's key smoothing hit it: adding the mean `[128, 1, 8]` across `[128, 1024, 8]`, token t of head h read
+  mean row h+t. One src1 row per block is now fetched and reused (a zero-stride DMA is not legal on the engine).
+- The split's head start clamped `us` in place (`ggml_clamp` is always in place) while `us` had other consumers, so
+  per-tile counts read zero on 768-query microbatches with op batching on the HTP. It now clamps `us * hs`. Split
+  timings taken with a head start before this fix are suspect.
+
 ## 5. What would change the answer
 
 - **Events in both backends.** OpenCL already uses `cl_event` throughout (its `synchronize` is a
