@@ -348,6 +348,8 @@ public:
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
     ggml_tensor * self_sparse_sel  = nullptr; // I32 [u, NBq, 1, 1], experimental
+    // XAttention's position-only inputs, filled by the host like the KQ mask so its graphs keep no CPU node:
+    ggml_tensor * self_xattn_idx     = nullptr; // I32 [n_tokens, n_head], rows reversed per 16 (xattn scorer)
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -1189,7 +1191,9 @@ struct llm_graph_context {
             ggml_tensor ** cnt_out = nullptr,
             // Heterogeneous split (LLAMA_SPARSE_ATTN_CSTAR): receives the exception
             // membership for FLASH_ATTN_EXT src[8]; null otherwise.
-            ggml_tensor ** exc_out = nullptr) const;
+            ggml_tensor ** exc_out = nullptr,
+            // LLAMA_SPARSE_ATTN_SCORER=xattn: the antidiagonal row order, I32 [n_tokens, n_head].
+            ggml_tensor * xidx = nullptr) const;
 
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]

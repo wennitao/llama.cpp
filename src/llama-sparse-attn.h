@@ -156,9 +156,18 @@ static inline bool llama_sparse_attn_pooled_q() {
     return s && strcmp(s, "pooled") == 0;
 }
 
+// LLAMA_SPARSE_ATTN_SCORER=xattn scores with XAttention's stride-16 antidiagonal (Xu et al. 2025) in the same
+// threshold pipeline: each score is the mean of a 16x16 tile's antidiagonal logits, computed as one product of Q rows
+// reversed within each 16-row group against K rows concatenated per group (16*d-wide rows). The normalization, block
+// sums, GQA-shared lists and rule are this pipeline's, so it isolates the scorer from XAttention's cumulative rule.
+static inline bool llama_sparse_attn_xattn() {
+    const char * s = getenv("LLAMA_SPARSE_ATTN_SCORER");
+    return s && strcmp(s, "xattn") == 0;
+}
+
 static inline bool llama_sparse_attn_reps4() {
     const char * s = getenv("LLAMA_SPARSE_ATTN_SCORER");
-    return s && (strcmp(s, "reps4") == 0 || llama_sparse_attn_pooled());
+    return s && (strcmp(s, "reps4") == 0 || llama_sparse_attn_pooled() || llama_sparse_attn_xattn());
 }
 
 // n_kv_blocks the HMX kernel will choose for a given u. Transcribed from

@@ -608,6 +608,17 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    if (self_xattn_idx && self_xattn_idx->buffer && self_xattn_idx->data) {
+        // the antidiagonal row order: row i of a 16-row group reads row 15 - i, the same for every head
+        // (llama_xattention_reverse_indices)
+        std::vector<int32_t> order(ggml_nelements(self_xattn_idx));
+        for (size_t i = 0; i < order.size(); ++i) {
+            const int32_t t = int32_t(i % self_xattn_idx->ne[0]);
+            order[i] = t/16*16 + 15 - t%16;
+        }
+        ggml_backend_tensor_set(self_xattn_idx, order.data(), 0, ggml_nbytes(self_xattn_idx));
+    }
+
     if (self_k_rot && self_k_rot->buffer) {
         mctx->set_input_k_rot(self_k_rot);
     }
@@ -649,6 +660,12 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
                                                                  : LLAMA_SPARSE_ATTN_BQ;
             res &= self_sparse_sel->ne[1] == (params.ubatch.n_tokens + bq_leaf - 1) / bq_leaf;
         }
+    }
+    res &= !self_xattn_idx || self_xattn_idx->ne[0] == params.ubatch.n_tokens;
+    {
+        // XAttention's inputs exist exactly when the graph would build them
+        const bool want_idx = llama_sparse_attn_xattn() && self_sparse_sel && self_sparse_sel->ne[3] == 2;
+        res &= want_idx == (self_xattn_idx != nullptr);
     }
 
     return res;
@@ -2842,6 +2859,39 @@ static ggml_tensor * llama_sparse_reps4_probs(ggml_context * ctx, ggml_tensor * 
     return llama_sparse_reps4_reduce(ctx, s, m, 1.0f / sqrtf((float) d), Hkv, NBq, NBk);
 }
 
+// XAttention's stride-16 antidiagonal (LLAMA_SPARSE_ATTN_SCORER=xattn) as a representative scorer, [NBk, NBq, Hkv].
+// The product is upstream's and llama_xattention_build's: Q rows reversed inside each 16-row group (xidx, [Lq, Hq]),
+// all 64 K rows of every block concatenated 16 per row, so one F16 product of 16*d-wide rows sums a 16x16 tile's
+// antidiagonal; with 1/16 in the scale it is the antidiagonal's mean logit. The mask, normalization and averages are
+// the pooled scorers' (causal at representative granularity, as XAttention's reduced mask).
+static ggml_tensor * llama_sparse_xattn_probs(ggml_context * ctx, ggml_tensor * q_cur, ggml_tensor * k_rows, ggml_tensor * xidx,
+                                              ggml_tensor * m, int64_t Hkv, int64_t NBq, int64_t NBk) {
+    const int64_t d   = q_cur->ne[0];
+    const int64_t Hq  = q_cur->ne[1];
+    const int64_t Lq  = q_cur->ne[2];
+    const int64_t bs  = LLAMA_SPARSE_ATTN_BS;
+    const int64_t NBp = llama_sparse_reps4_padded(NBk);
+    GGML_ASSERT(Lq == NBq*bs && xidx->ne[0] == Lq && xidx->ne[1] == Hq);
+    GGML_ASSERT(k_rows->ne[0] == d*Hkv && k_rows->ne[1] == bs && k_rows->ne[2] == NBk);
+
+    ggml_tensor * rq = ggml_get_rows(ctx, ggml_permute(ctx, q_cur, 0, 2, 1, 3), xidx);           // [d, Lq, Hq] F32
+    rq = ggml_reshape_3d(ctx, rq, 16*d, Lq/16, Hq);
+
+    ggml_tensor * k = ggml_view_3d(ctx, k_rows, d, Hkv, NBk*bs, (size_t) d*ggml_element_size(k_rows), k_rows->nb[1], 0);
+    k = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));                                       // [d, NBk*bs, Hkv] F16
+    if (NBp != NBk) {
+        // zero keys, masked in m; HTP PAD is F32-only, so fill + concat as llama_xattention_build does
+        ggml_tensor * zeros = ggml_fill(ctx, ggml_reshape_3d(ctx, ggml_view_1d(ctx, k, d*(NBp - NBk)*bs*Hkv, 0), d, (NBp - NBk)*bs, Hkv), 0.0f);
+        k = ggml_concat(ctx, k, zeros, 1);
+    }
+    k = ggml_reshape_3d(ctx, k, 16*d, 4*NBp, Hkv);
+
+    ggml_tensor * s = ggml_mul_mat(ctx, k, rq);                  // [4*NBp, 4*NBq, Hq]
+    ggml_mul_mat_set_prec(s, GGML_PREC_F32);
+
+    return llama_sparse_reps4_reduce(ctx, s, m, 1.0f / (16.0f*sqrtf((float) d)), Hkv, NBq, NBk);
+}
+
 // meanpool block scoring: mean(Q rows of a query block) . mean(K rows of a KV block).
 //
 // Both reductions use the WHOLE ROW as the unit -- [n_embd_gqa, rows, blocks] -- because in
@@ -2857,7 +2907,8 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
         const llama_kv_cache_context * mctx_cur,
         int il,
         ggml_tensor ** cnt_out,
-        ggml_tensor ** exc_out) const {
+        ggml_tensor ** exc_out,
+        ggml_tensor * xidx) const {
     const int64_t bs   = LLAMA_SPARSE_ATTN_BS;
     const int64_t qsub = LLAMA_SPARSE_ATTN_QSUB;
     const int64_t ksub = LLAMA_SPARSE_ATTN_KSUB;
@@ -2959,23 +3010,26 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
             // cannot be added, and BF16 sums would lose precision); pooling Q needs the [d, Hq, Lq] row layout.
             ggml_tensor * k_src = mctx_cur->get_k_pool_src(ctx0, il, bs, bs);
             bool pooled = llama_sparse_attn_pooled();
-            if (pooled && k_src->type != GGML_TYPE_F16) {
+            bool xattn  = llama_sparse_attn_xattn();
+            if ((pooled || xattn) && k_src->type != GGML_TYPE_F16) {
                 static bool once = false;
                 if (!once) {
                     once = true;
                     LLAMA_LOG_WARN("sparse-attn: LLAMA_SPARSE_ATTN_SCORER=%s needs an F16 K cache (have %s), using reps4\n",
                                    getenv("LLAMA_SPARSE_ATTN_SCORER"), ggml_type_name(k_src->type));
                 }
-                pooled = false;
+                pooled = xattn = false;
             }
+            GGML_ASSERT(!xattn || xidx);
             const bool pooled_q = pooled && llama_sparse_attn_pooled_q() &&
                 q_cur->nb[1] == (size_t) d*ggml_element_size(q_cur) && q_cur->nb[2] == (size_t) Hq*q_cur->nb[1];
             if (sparse_reps4_bias != bias) {
                 sparse_reps4_bias = bias;
-                sparse_reps4_mask = llama_sparse_reps4_mask(ctx0, b3, NBq, NBk, pooled);
+                sparse_reps4_mask = llama_sparse_reps4_mask(ctx0, b3, NBq, NBk, pooled || xattn);
             }
-            pm = llama_sparse_reps4_probs(ctx0, q_cur, pooled ? k_src : mctx_cur->get_k_pool_src(ctx0, il, bs, ksub),
-                                          sparse_reps4_mask, Hkv, NBq, NBk, bq, pooled, pooled_q);
+            pm = xattn ? llama_sparse_xattn_probs(ctx0, q_cur, k_src, xidx, sparse_reps4_mask, Hkv, NBq, NBk) :
+                         llama_sparse_reps4_probs(ctx0, q_cur, pooled ? k_src : mctx_cur->get_k_pool_src(ctx0, il, bs, ksub),
+                                                  sparse_reps4_mask, Hkv, NBq, NBk, bq, pooled, pooled_q);
             cb(pm, "sparse_reps4_prob", il);
         } else {
             pm = ggml_soft_max(ctx0, ggml_add(ctx0, sc, b3));
@@ -3421,6 +3475,13 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_kq_mask_cnv = inp->self_kq_mask;
 
         inp->self_sparse_sel = build_attn_inp_sparse_sel(ctx0, mctx_cur, ubatch, cparams);
+
+        const bool xattn_scorer = inp->self_sparse_sel && inp->self_sparse_sel->ne[3] == 2 && llama_sparse_attn_xattn();
+        if (xattn_scorer) {
+            inp->self_xattn_idx = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, ubatch.n_tokens, hparams.n_head(0));
+            ggml_set_input(inp->self_xattn_idx);
+            ggml_set_name(inp->self_xattn_idx, "xattn_idx");
+        }
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -3489,7 +3550,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * sparse_cnt = nullptr;
     ggml_tensor * sparse_exc = nullptr;
     if (inp->get_sparse_sel()) {
-        sparse_sel = build_sparse_sel(q_cur, inp->get_sparse_sel(), mctx_cur, il, &sparse_cnt, &sparse_exc);
+        sparse_sel = build_sparse_sel(q_cur, inp->get_sparse_sel(), mctx_cur, il, &sparse_cnt, &sparse_exc, inp->self_xattn_idx);
 
         // The bias leaf existing does NOT mean the selection reached the op: build_sparse_sel
         // can decline on shape, and the backend can still reject src[5] and run dense.
