@@ -2947,7 +2947,9 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
             ggml_tensor * tid  = ggml_cumsum(ctx0, ggml_reshape_1d(ctx0, ones, (NBq / R) * Hkv));        // 1..N
             hs = ggml_clamp(ctx0, ggml_scale_bias(ctx0, tid, -BIGF, ((float) head_start + 0.5f) * BIGF), 0.0f, 1.0f);   // tid <= K
             hs = ggml_reshape_3d(ctx0, hs, 1, NBq / R, Hkv);
-            um = ggml_clamp(ctx0, ggml_add(ctx0, um, ggml_mul(ctx0, ggml_clamp(ctx0, us, 0.0f, 1.0f), hs)), 0.0f, 1.0f);
+            // clamp(us * hs), not clamp(us) * hs: ggml_clamp works in place, and us has other consumers -- clamping it in
+            // place corrupted per-tile counts on the HTP (zero counts on 768-query microbatches with op batching).
+            um = ggml_clamp(ctx0, ggml_add(ctx0, um, ggml_clamp(ctx0, ggml_mul(ctx0, us, hs), 0.0f, 1.0f)), 0.0f, 1.0f);
         }
         cb(um, "sparse_union", il);
 
