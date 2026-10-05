@@ -137,9 +137,28 @@ static inline bool llama_sparse_attn_debug() {
 // Block scorer for threshold selection. LLAMA_SPARSE_ATTN_SCORER=reps4 scores every query
 // head's four sampled rows against four K representatives per block; the default is the
 // sampled mean.
+//
+// LLAMA_SPARSE_ATTN_SCORER=pooled keeps that recipe but makes every representative the mean of
+// 16 consecutive rows, so all 64 query and key rows of a block are read: each score is then the
+// exact mean logit of a 16x16 tile, the quantity XAttention's antidiagonal samples. Measured on
+// exact attention over RULER 4k/8k (prerope-selector-20261001): +3.2 points of the non-forced
+// mass and -20% sparse-output error against reps4 at equal density.
+//
+// LLAMA_SPARSE_ATTN_SCORER=pooledk pools only the keys and keeps reps4's sampled query rows: on the same exact-attention
+// audit it keeps nearly all of the gain (+2.9 of the +3.2 points) for about half the pooling cost.
+static inline bool llama_sparse_attn_pooled() {
+    const char * s = getenv("LLAMA_SPARSE_ATTN_SCORER");
+    return s && (strcmp(s, "pooled") == 0 || strcmp(s, "pooledk") == 0);
+}
+
+static inline bool llama_sparse_attn_pooled_q() {
+    const char * s = getenv("LLAMA_SPARSE_ATTN_SCORER");
+    return s && strcmp(s, "pooled") == 0;
+}
+
 static inline bool llama_sparse_attn_reps4() {
     const char * s = getenv("LLAMA_SPARSE_ATTN_SCORER");
-    return s && strcmp(s, "reps4") == 0;
+    return s && (strcmp(s, "reps4") == 0 || llama_sparse_attn_pooled());
 }
 
 // n_kv_blocks the HMX kernel will choose for a given u. Transcribed from

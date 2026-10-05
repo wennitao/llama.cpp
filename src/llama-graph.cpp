@@ -2724,7 +2724,14 @@ static int64_t llama_sparse_reps4_padded(int64_t NBk) {
     return GGML_PAD(NBk, 8);
 }
 
-static ggml_tensor * llama_sparse_reps4_mask(ggml_context * ctx, ggml_tensor * b3, int64_t NBq, int64_t NBk) {
+// causal (the pooled scorers): inside a row's diagonal block, pooled query row s (queries 16s..16s+15) sees
+// only the representatives r <= s, the ones that start no later than its last query. Like the forced diagonal of
+// set_input_sparse_bias, this assumes the ubatch starts on a 64-token boundary with cells in position order (true
+// for every prefill path here: aligned 1024/256 microbatches on a cleared cache); otherwise it is still never
+// tighter than causal, only leakier, and never worse than whole-block reach. The sampled scorer
+// keeps whole-block reach, as validated. Measured on exact attention: whole-block reach costs the pooled
+// scorer 0.5 points of non-forced mass, and leaving the diagonal out of the softmax costs 3.5.
+static ggml_tensor * llama_sparse_reps4_mask(ggml_context * ctx, ggml_tensor * b3, int64_t NBq, int64_t NBk, bool causal) {
     const int64_t nqs = LLAMA_SPARSE_ATTN_QSUB;
     const int64_t nr  = 4;
     const int64_t NBp = llama_sparse_reps4_padded(NBk);
@@ -2734,7 +2741,45 @@ static ggml_tensor * llama_sparse_reps4_mask(ggml_context * ctx, ggml_tensor * b
         // zero padding lands there, and 0 / -1e9 entries shift back exactly
         m = ggml_scale_bias(ctx, ggml_pad(ctx, ggml_scale_bias(ctx, m, 1.0f, 1e9f), 0, (int) (NBp - NBk), 0, 0), 1.0f, -1e9f);
     }
-    return ggml_reshape_2d(ctx, ggml_repeat_4d(ctx, m, nr, NBp, nqs, NBq), nr*NBp, nqs*NBq);
+    ggml_tensor * r = ggml_repeat_4d(ctx, m, nr, NBp, nqs, NBq);
+    if (causal) {
+        GGML_ASSERT(NBp >= nr && NBq >= nqs);
+        // The diagonal block is the last reachable one: bias 0 with a -1e9 successor. With the successor's
+        // bias nx (shifted view, -1e9 past the end), (m - nx) / 1e9 is 1 there and 0 everywhere else.
+        ggml_tensor * m2 = ggml_reshape_2d(ctx, m, NBp, NBq);
+        ggml_tensor * nx = ggml_cont(ctx, ggml_view_2d(ctx, m2, NBp - 1, NBq, m2->nb[1], ggml_element_size(m2)));
+        nx = ggml_scale_bias(ctx, ggml_pad(ctx, ggml_scale_bias(ctx, nx, 1.0f, 1e9f), 1, 0, 0, 0), 1.0f, -1e9f);
+        ggml_tensor * dg = ggml_clamp(ctx, ggml_scale(ctx, ggml_add(ctx, m2, ggml_scale(ctx, nx, -1.0f)), 1e-9f), 0.0f, 1.0f);
+        // -1e9 where representative r > sampled row s: TRI keeps i0 > i1 of an all-ones [nr, nqs]
+        ggml_tensor * ones = ggml_scale_bias(ctx, ggml_cont(ctx, ggml_view_2d(ctx, m2, nr, nqs, m2->nb[1], 0)), 0.0f, 1.0f);
+        ggml_tensor * up   = ggml_scale(ctx, ggml_tri(ctx, ones, GGML_TRI_TYPE_UPPER), -1e9f);
+        ggml_tensor * dr   = ggml_repeat_4d(ctx, ggml_reshape_4d(ctx, dg, 1, NBp, 1, NBq), nr, NBp, nqs, NBq);
+        r = ggml_add(ctx, r, ggml_mul(ctx, dr, ggml_reshape_4d(ctx, up, nr, 1, nqs, 1)));
+    }
+    return ggml_reshape_2d(ctx, r, nr*NBp, nqs*NBq);
+}
+
+// Representative scores s [nr*NBp, nqs*NBq, Hq] -> block probabilities [NBk, NBq, Hkv]: every query representative is
+// normalized over the key representatives m lets it see, the probabilities are summed within each key block, and the
+// query representatives of a block and the G heads of a group are averaged.
+static ggml_tensor * llama_sparse_reps4_reduce(ggml_context * ctx, ggml_tensor * s, ggml_tensor * m, float scale,
+                                               int64_t Hkv, int64_t NBq, int64_t NBk) {
+    const int64_t nqs = LLAMA_SPARSE_ATTN_QSUB;
+    const int64_t nr  = 4;
+    const int64_t Hq  = s->ne[2];
+    const int64_t G   = Hq / Hkv;
+    const int64_t NBp = llama_sparse_reps4_padded(NBk);
+    GGML_ASSERT(s->ne[0] == nr*NBp && s->ne[1] == nqs*NBq);
+
+    ggml_tensor * p = ggml_soft_max_ext(ctx, s, m, scale, 0.0f);
+    p = ggml_sum_rows(ctx, ggml_reshape_4d(ctx, p, nr, NBp, nqs*NBq, Hq));                  // [1, NBp, nqs*NBq, Hq]
+    if (NBp != NBk) {
+        p = ggml_reshape_2d(ctx, p, NBp, nqs*NBq*Hq);
+        p = ggml_cont(ctx, ggml_view_2d(ctx, p, NBk, nqs*NBq*Hq, p->nb[1], 0));
+    }
+    p = llama_sparse_halve1_views(ctx, ggml_reshape_4d(ctx, p, NBk, nqs, NBq, Hq), nqs);     // [NBk, 1, NBq, Hq]
+    p = llama_sparse_halve1_views(ctx, ggml_reshape_3d(ctx, p, NBk*NBq, G, Hkv), G);        // [NBk*NBq, 1, Hkv]
+    return ggml_scale(ctx, ggml_reshape_3d(ctx, p, NBk, NBq, Hkv), 1.0f / (float) (nqs*G));
 }
 
 // Four-representative block probabilities, [NBk, NBq, Hkv], one row per fine query block.
@@ -2744,41 +2789,57 @@ static ggml_tensor * llama_sparse_reps4_mask(ggml_context * ctx, ggml_tensor * b
 // normalized over all visible representatives, the probabilities are summed within each block,
 // and the sampled rows and the G heads of a group are averaged. The ops are those of the
 // validated standalone graph (variant 19): Q as a strided view, representatives unpacked.
-static ggml_tensor * llama_sparse_reps4_probs(ggml_context * ctx, ggml_tensor * q_cur, ggml_tensor * k_samples,
-                                              ggml_tensor * m, int64_t Hkv, int64_t NBq, int64_t NBk, int64_t bq) {
+//
+// pooled (LLAMA_SPARSE_ATTN_SCORER=pooled): k_rows holds ALL bs rows of every block, and each
+// representative is the mean of 16 consecutive rows on both sides instead of a sample -- every
+// query and key of a block is read, and a score is the exact mean logit of a 16x16 tile. K is
+// summed by halving straight from the F16 cache view (only the sums are widened; sums of 16 keys
+// stay below 4.7e3 on Qwen3-1.7B, so F16 holds them for any |k| < 4094); Q is summed in F32. Both are divided BEFORE the product: the
+// HMX product of the raw sums (256x the mean logit) reaches 1.1e5 and overflows F16 to inf.
+static ggml_tensor * llama_sparse_reps4_probs(ggml_context * ctx, ggml_tensor * q_cur, ggml_tensor * k_rows,
+                                              ggml_tensor * m, int64_t Hkv, int64_t NBq, int64_t NBk, int64_t bq,
+                                              bool pooled, bool pooled_q) {
     const int64_t d   = q_cur->ne[0];
     const int64_t Hq  = q_cur->ne[1];
-    const int64_t G   = Hq / Hkv;
     const int64_t nqs = LLAMA_SPARSE_ATTN_QSUB;
-    const int64_t nks = LLAMA_SPARSE_ATTN_KSUB;
+    const int64_t nks = pooled ? LLAMA_SPARSE_ATTN_BS : LLAMA_SPARSE_ATTN_KSUB;  // K rows read per block
     const int64_t nr  = 4;
 
-    // K: [d*Hkv, nks, NBk] -> pairs [d*Hkv, nks/nr, nr*NBk] -> means [d, nr*NBk, Hkv], representative
+    // K: [d*Hkv, nks, NBk] -> groups [d*Hkv, nks/nr, nr*NBk] -> means [d, nr*NBk, Hkv], representative
     // index nr*block + r. Rounded to F16: Hexagon's HMX takes a batched (GQA) product only with an
     // F16 src0, and its F32 fallback does not fit VTCM with the strided Q view.
     const int64_t NBp = llama_sparse_reps4_padded(NBk);
-    ggml_tensor * k = ggml_reshape_3d(ctx, ggml_cast(ctx, k_samples, GGML_TYPE_F32), d*Hkv, nks/nr, nr*NBk);
-    k = ggml_scale(ctx, llama_sparse_halve1_views(ctx, k, nks/nr), (float) nr / (float) nks);
+    ggml_tensor * k;
+    if (pooled) {
+        GGML_ASSERT(k_rows->ne[0] == d*Hkv && k_rows->ne[1] == nks && k_rows->ne[2] == NBk);
+        k = ggml_view_3d(ctx, k_rows, d*Hkv, nks/nr, nr*NBk, k_rows->nb[1], (size_t)(nks/nr)*k_rows->nb[1], 0);
+        k = ggml_cast(ctx, llama_sparse_halve1_views(ctx, k, nks/nr), GGML_TYPE_F32);   // sums of 16 rows
+        k = ggml_scale(ctx, k, (float) nr / (float) nks);                                 // means
+    } else {
+        k = ggml_reshape_3d(ctx, ggml_cast(ctx, k_rows, GGML_TYPE_F32), d*Hkv, nks/nr, nr*NBk);
+        k = ggml_scale(ctx, llama_sparse_halve1_views(ctx, k, nks/nr), (float) nr / (float) nks);
+    }
     if (NBp != NBk) {
         k = ggml_pad(ctx, ggml_reshape_2d(ctx, k, d*Hkv, nr*NBk), 0, (int) (nr*(NBp - NBk)), 0, 0);  // zero, masked in m
     }
     k = ggml_cast(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, k, d, Hkv, nr*NBp), 0, 2, 1, 3), GGML_TYPE_F16);
 
-    // Q: rows 0, bq/nqs, ... of every fine block, [d, nqs*NBq, Hq], row index nqs*block + s
-    ggml_tensor * q = ggml_view_3d(ctx, q_cur, d, nqs*NBq, Hq, (size_t)(bq/nqs)*q_cur->nb[2], q_cur->nb[1], 0);
+    // Q: [d, nqs*NBq, Hq], row index nqs*block + s. Sampled (reps4, pooledk): rows 0, bq/nqs, ... of every fine
+    // block, a strided view. Pooled: the means of rows s*bq/nqs .. (s+1)*bq/nqs - 1, all heads of a token halved
+    // together as one row ([d*Hq, bq/nqs, nqs*NBq] over dim 1), then the same head-inner view.
+    ggml_tensor * q;
+    if (pooled_q) {
+        ggml_tensor * qs = ggml_view_3d(ctx, q_cur, d*Hq, bq/nqs, nqs*NBq, q_cur->nb[2], (size_t)(bq/nqs)*q_cur->nb[2], 0);
+        qs = ggml_scale(ctx, llama_sparse_halve1_views(ctx, qs, bq/nqs), (float) nqs / (float) bq);  // means, [d*Hq, 1, nqs*NBq]
+        q = ggml_view_3d(ctx, qs, d, nqs*NBq, Hq, qs->nb[2], (size_t) d*ggml_element_size(qs), 0);
+    } else {
+        q = ggml_view_3d(ctx, q_cur, d, nqs*NBq, Hq, (size_t)(bq/nqs)*q_cur->nb[2], q_cur->nb[1], 0);
+    }
 
     ggml_tensor * s = ggml_mul_mat(ctx, k, q);                   // [nr*NBp, nqs*NBq, Hq]
     ggml_mul_mat_set_prec(s, GGML_PREC_F32);
 
-    ggml_tensor * p = ggml_soft_max_ext(ctx, s, m, 1.0f / sqrtf((float) d), 0.0f);
-    p = ggml_sum_rows(ctx, ggml_reshape_4d(ctx, p, nr, NBp, nqs*NBq, Hq));                  // [1, NBp, nqs*NBq, Hq]
-    if (NBp != NBk) {
-        p = ggml_reshape_2d(ctx, p, NBp, nqs*NBq*Hq);
-        p = ggml_cont(ctx, ggml_view_2d(ctx, p, NBk, nqs*NBq*Hq, p->nb[1], 0));
-    }
-    p = llama_sparse_halve1_views(ctx, ggml_reshape_4d(ctx, p, NBk, nqs, NBq, Hq), nqs);     // [NBk, 1, NBq, Hq]
-    p = llama_sparse_halve1_views(ctx, ggml_reshape_3d(ctx, p, NBk*NBq, G, Hkv), G);        // [NBk*NBq, 1, Hkv]
-    return ggml_scale(ctx, ggml_reshape_3d(ctx, p, NBk, NBq, Hkv), 1.0f / (float) (nqs*G));
+    return llama_sparse_reps4_reduce(ctx, s, m, 1.0f / sqrtf((float) d), Hkv, NBq, NBk);
 }
 
 // meanpool block scoring: mean(Q rows of a query block) . mean(K rows of a KV block).
@@ -2846,7 +2907,8 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
         static bool once = false;
         if (!once) {
             once = true;
-            LLAMA_LOG_ERROR("sparse-attn: LLAMA_SPARSE_ATTN_SCORER=reps4 needs LLAMA_SPARSE_ATTN=thr:<c>, using the mean scorer\n");
+            LLAMA_LOG_ERROR("sparse-attn: LLAMA_SPARSE_ATTN_SCORER=%s needs LLAMA_SPARSE_ATTN=thr:<c>, using the mean scorer\n",
+                            getenv("LLAMA_SPARSE_ATTN_SCORER"));
         }
     }
 
@@ -2893,12 +2955,27 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
 
         ggml_tensor * pm;
         if (reps4) {
+            // The pooled scorers sum raw cache rows by halving, which needs an F16 K cache (a quantized cache
+            // cannot be added, and BF16 sums would lose precision); pooling Q needs the [d, Hq, Lq] row layout.
+            ggml_tensor * k_src = mctx_cur->get_k_pool_src(ctx0, il, bs, bs);
+            bool pooled = llama_sparse_attn_pooled();
+            if (pooled && k_src->type != GGML_TYPE_F16) {
+                static bool once = false;
+                if (!once) {
+                    once = true;
+                    LLAMA_LOG_WARN("sparse-attn: LLAMA_SPARSE_ATTN_SCORER=%s needs an F16 K cache (have %s), using reps4\n",
+                                   getenv("LLAMA_SPARSE_ATTN_SCORER"), ggml_type_name(k_src->type));
+                }
+                pooled = false;
+            }
+            const bool pooled_q = pooled && llama_sparse_attn_pooled_q() &&
+                q_cur->nb[1] == (size_t) d*ggml_element_size(q_cur) && q_cur->nb[2] == (size_t) Hq*q_cur->nb[1];
             if (sparse_reps4_bias != bias) {
                 sparse_reps4_bias = bias;
-                sparse_reps4_mask = llama_sparse_reps4_mask(ctx0, b3, NBq, NBk);
+                sparse_reps4_mask = llama_sparse_reps4_mask(ctx0, b3, NBq, NBk, pooled);
             }
-            pm = llama_sparse_reps4_probs(ctx0, q_cur, mctx_cur->get_k_pool_src(ctx0, il, bs, ksub), sparse_reps4_mask,
-                                          Hkv, NBq, NBk, bq);
+            pm = llama_sparse_reps4_probs(ctx0, q_cur, pooled ? k_src : mctx_cur->get_k_pool_src(ctx0, il, bs, ksub),
+                                          sparse_reps4_mask, Hkv, NBq, NBk, bq, pooled, pooled_q);
             cb(pm, "sparse_reps4_prob", il);
         } else {
             pm = ggml_soft_max(ctx0, ggml_add(ctx0, sc, b3));
