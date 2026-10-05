@@ -26,6 +26,7 @@
 
 #include "llama-sparse-attn.h"
 #include "llama-xattention.h"
+#include "llama-selectors.h"
 
 // dedup helpers
 
@@ -3264,6 +3265,21 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         GGML_ASSERT(use_flash_attn && q->ne[1] % 256 == 0 && n_stream == 1);
         GGML_ASSERT(!sparse_sel && !sinks && !v_mla && !hparams.attn_soft_cap && hparams.f_max_alibi_bias == 0.0f);
     }
+    // existing selectors (llama-selectors.h): their probes assume an aligned ubatch at the end of the keys
+    bool use_selector = !use_xattention && llama_selector_name() && q->ne[1] > 256;
+    if (use_selector) {
+        GGML_ASSERT(use_flash_attn && q->ne[1] % 256 == 0 && n_stream == 1);
+        GGML_ASSERT(!sparse_sel && !sinks && !v_mla && !hparams.attn_soft_cap && hparams.f_max_alibi_bias == 0.0f);
+        if (ubatch.pos && ubatch.pos[0] + (int64_t) ubatch.n_tokens != k->ne[1]) {
+            static bool once = false;
+            if (!once) {
+                once = true;
+                LLAMA_LOG_ERROR("selector: ubatch at %d + %u does not end at n_kv %lld, running dense\n",
+                                ubatch.pos[0], ubatch.n_tokens, (long long) k->ne[1]);
+            }
+            use_selector = false;
+        }
+    }
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -3288,6 +3304,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 xattn_reduced = inputs.second;
             }
             cur = llama_xattention_build(ctx0, q, k, v, kq_mask, xattn_indices, xattn_reduced, kq_scale, il);
+        } else if (use_selector) {
+            cur = llama_selector_build(ctx0, q, k, v, kq_mask, kq_scale, il);
         } else {
             cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                       hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);

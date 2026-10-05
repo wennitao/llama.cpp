@@ -2334,6 +2334,11 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (llama_sparse_attn_cstar() != 0 || llama_sparse_attn_exact()) {
         res += 48u * model.hparams.n_layer();
     }
+    // The existing selectors (llama-selectors.h: LLAMA_SELECTOR) add a probe, halving sums, the skewed diagonal view,
+    // block means, the rule and per-lane packing: ~100 nodes per layer.
+    if (getenv("LLAMA_SELECTOR")) {
+        res += 160u * model.hparams.n_layer();
+    }
 
     uint32_t n_sampling_nodes = 0;
     uint32_t n_sampling_nodes_max = 0;

@@ -5,7 +5,7 @@
 #include <cstring>
 
 // Block-sparse attention from 0/1 block memberships, as the Hexagon kernel runs it: every selector that hands the
-// kernel per-block lists (XAttention, src/llama-xattention.h) ends here.
+// kernel per-block lists (XAttention, src/llama-xattention.h; the existing selectors, src/llama-selectors.h) ends here.
 //
 // membership [nbk, nbq, lists] F32 0/1, one row per bq-query block: lists == hq is one list per query head and runs one
 // FlashAttention per GQA lane (lane g holds heads g, g+groups, ...; the kernel takes one list per K/V head); lists ==
@@ -50,4 +50,18 @@ static ggml_tensor * llama_block_sparse_attn(
         joined = joined ? ggml_concat(ctx, joined, part, 1) : part;
     }
     return ggml_reshape_3d(ctx, joined, v->ne[0], hq, lq);
+}
+
+// [nbk, nbq, hq] per query head -> [nbk, nbq, hkv]: the OR over each GQA group (query head h = kv*groups + g), by
+// halving adds of views (groups a power of two) and a clamp.
+static ggml_tensor * llama_block_sparse_union(ggml_context * ctx, ggml_tensor * m, int64_t hkv) {
+    const int64_t nbk = m->ne[0], nbq = m->ne[1], groups = m->ne[2]/hkv;
+    GGML_ASSERT(m->ne[2] == groups*hkv && (groups & (groups - 1)) == 0 && ggml_is_contiguous(m));
+    ggml_tensor * a = ggml_reshape_3d(ctx, m, nbk*nbq, groups, hkv);
+    for (int64_t n = groups; n > 1; n /= 2) {
+        ggml_tensor * lo = ggml_view_3d(ctx, a, a->ne[0], n/2, a->ne[2], a->nb[1], a->nb[2], 0);
+        ggml_tensor * hi = ggml_view_3d(ctx, a, a->ne[0], n/2, a->ne[2], a->nb[1], a->nb[2], (size_t)(n/2)*a->nb[1]);
+        a = ggml_add(ctx, lo, hi);
+    }
+    return ggml_reshape_3d(ctx, ggml_clamp(ctx, a, 0.0f, 1.0f), nbk, nbq, hkv);
 }
