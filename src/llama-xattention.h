@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "llama-block-sparse.h"
 
 #include <algorithm>
 #include <cmath>
@@ -158,40 +159,7 @@ static ggml_tensor * llama_xattention_build(
     // rows are independent: the cumulative selection uses every CPU thread of the backend
     auto * membership = ggml_custom_4d(ctx, GGML_TYPE_F32, nbk, nbq, lists, 1, selection_args, 2, llama_xattention_select, GGML_N_TASKS_MAX, nullptr);
     ggml_format_name(membership, "xattn_membership-%d", layer);
-    // As in the four-representative path: the HTP sort is much slower at non-power-of-two lengths,
-    // so members sort as 2, other blocks as 1 and padding as 0, and the first nbk entries are kept.
-    int64_t width = 32;
-    while (width < nbk) { width *= 2; }
-    auto * key = ggml_scale_bias(ctx, membership, 1.0f, 1.0f);
-    if (width != nbk) { key = ggml_pad(ctx, key, int(width-nbk), 0, 0, 0); }
-    auto * ranked = ggml_argsort(ctx, key, GGML_SORT_ORDER_DESC);
-    ranked = ggml_view_3d(ctx, ranked, nbk, nbq, lists, ranked->nb[1], ranked->nb[2], 0);
-    auto * counts = ggml_reshape_2d(ctx, ggml_sum_rows(ctx, membership), nbq, lists);
-    ggml_format_name(counts, "xattn_counts-%d", layer);
-    if (shared || groups == 1) {
-        auto * out = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_sparse(out, ranked, bs, bs);
-        ggml_flash_attn_ext_set_sparse_cnt(out, counts);
-        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
-        ggml_format_name(out, "xattn_fa-%d", layer);
-        return out;
-    }
-    // Independent query-head lists: one FlashAttention per GQA lane (lane g holds heads g, g+groups, ...),
-    // each lane's output viewed as [DV, 1, hkv, lq], so concatenating on dim 1 restores head order.
-    ggml_tensor * joined = nullptr;
-    for (int64_t lane = 0; lane < groups; ++lane) {
-        auto * q_lane = ggml_view_3d(ctx, q, d, lq, hkv, q->nb[1], groups*q->nb[2], lane*q->nb[2]);
-        auto * selection = ggml_view_3d(ctx, ranked, nbk, nbq, hkv, ranked->nb[1], groups*ranked->nb[2], lane*ranked->nb[2]);
-        auto * count = ggml_view_2d(ctx, counts, nbq, hkv, groups*counts->nb[1], lane*counts->nb[1]);
-        auto * partial = ggml_flash_attn_ext(ctx, q_lane, k, v, mask, scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_sparse(partial, selection, bs, bs);
-        ggml_flash_attn_ext_set_sparse_cnt(partial, count);
-        ggml_flash_attn_ext_set_prec(partial, GGML_PREC_F32);
-        ggml_format_name(partial, "xattn_fa_%d-%d", int(lane), layer);
-        auto * part = ggml_reshape_4d(ctx, partial, v->ne[0], 1, hkv, lq);
-        joined = joined ? ggml_concat(ctx, joined, part, 1) : part;
-    }
-    return ggml_reshape_3d(ctx, joined, v->ne[0], hq, lq);
+    return llama_block_sparse_attn(ctx, q, k, v, mask, membership, bs, bs, scale, layer, "xattn");
 }
 
 static ggml_tensor * llama_xattention_build(
