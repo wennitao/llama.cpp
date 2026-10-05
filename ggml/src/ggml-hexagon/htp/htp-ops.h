@@ -104,9 +104,26 @@ enum htp_op_code {
     HTP_OP_XATTN_SCORE,
     HTP_OP_SYNC_PROBE,
     HTP_OP_XATTN_SELECT,
+    HTP_OP_SEL,
 
     HTP_OP_INVALID
 };
+
+// HTP_OP_SEL: the existing selectors' selection rules (sel-ops.c), a GGML_OP_CUSTOM node that src/llama-selectors.h
+// tags with LLAMA_SEL_MAGIC in op_params[6]; [7] mode, [8..11] the mode's parameters.
+enum htp_sel_params {
+    HTP_SEL_P_MAGIC = 6,
+    HTP_SEL_P_MODE  = 7,
+};
+enum htp_sel_mode {
+    HTP_SEL_MODE_VS     = 1,
+    HTP_SEL_MODE_FLEX   = 2,
+    HTP_SEL_MODE_BS     = 3,
+    HTP_SEL_MODE_SPARGE = 4,
+    HTP_SEL_MODE_FLASH  = 5,
+    HTP_SEL_MODE_SAMPLE = 6,
+};
+#define HTP_SEL_MAGIC 0x534c4354
 
 // HTP_OP_XATTN_SELECT: XAttention's cumulative block selection (argsort-ops.c), a GGML_OP_CUSTOM node that
 // src/llama-xattention.h tags in op_params slots the custom-op header (function, n_tasks, userdata) leaves free.

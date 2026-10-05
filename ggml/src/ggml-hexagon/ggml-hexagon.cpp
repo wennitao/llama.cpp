@@ -7753,6 +7753,9 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
             if ((uint32_t) t->op_params[HTP_XATTN_SELECT_P_MAGIC] == HTP_XATTN_SELECT_MAGIC) {
                 return HTP_OP_XATTN_SELECT;
             }
+            if ((uint32_t) t->op_params[HTP_SEL_P_MAGIC] == HTP_SEL_MAGIC) {
+                return HTP_OP_SEL;
+            }
             break;
 
         case GGML_OP_UNARY:
@@ -8579,6 +8582,55 @@ static bool ggml_hexagon_supported_xattn_select(const struct ggml_tensor * op) {
            scores->ne[2] % op->ne[2] == 0 && mask->ne[1] % scores->ne[1] == 0;
 }
 
+// The existing selectors' rules (src/llama-selectors.h tags its CPU custom ops; htp/sel-ops.c): contiguous F32 tensors,
+// at most 256 blocks per row; per-head modes take rows of whole vectors up to 16k keys, FlexPrefill's flattened map at
+// most 1024 entries.
+static bool ggml_hexagon_supported_sel(const struct ggml_tensor * op) {
+    if ((uint32_t) op->op_params[HTP_SEL_P_MAGIC] != HTP_SEL_MAGIC) {
+        return false;
+    }
+    const int32_t mode = op->op_params[HTP_SEL_P_MODE];
+    static const int n_srcs[] = {0, 2, 4, 1, 3, 1, 2};
+    const int n_src = mode >= HTP_SEL_MODE_VS && mode <= HTP_SEL_MODE_SAMPLE ? n_srcs[mode] : 0;
+    if (!n_src || op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op) || op->ne[0] > 256 || op->ne[3] != 1) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        const struct ggml_tensor * s = op->src[i];
+        if ((i < n_src) != (s != nullptr) || (s && (s->type != GGML_TYPE_F32 || !ggml_is_contiguous(s)))) {
+            return false;
+        }
+    }
+    const int64_t hq = op->ne[2];
+    switch (mode) {
+        case HTP_SEL_MODE_VS:
+        case HTP_SEL_MODE_FLEX:
+        case HTP_SEL_MODE_SAMPLE: {
+            const int64_t nk = op->src[0]->ne[0];
+            if (nk % 32 || nk > 16384 || op->src[1]->ne[0] != nk || op->src[0]->ne[2] != hq || op->src[1]->ne[2] != hq) {
+                return false;
+            }
+            if (mode == HTP_SEL_MODE_VS) {
+                // forced entries are the largest keys: the budgets must cover them (always at the study's budgets)
+                return nk == op->ne[0]*64 && op->op_params[8] >= 30 && op->op_params[9] >= 100;
+            }
+            if (mode == HTP_SEL_MODE_SAMPLE) {
+                return nk % op->ne[0] == 0;
+            }
+            return op->ne[0]*op->ne[1] <= 1024 && nk % op->ne[0] == 0 && op->src[2]->ne[0] == op->ne[0] &&
+                   op->src[3]->ne[0] == op->ne[0] && op->src[3]->ne[1] == op->ne[1] && op->src[2]->ne[2] == hq && op->src[3]->ne[2] == hq;
+        }
+        case HTP_SEL_MODE_BS:
+        case HTP_SEL_MODE_FLASH:
+            return ggml_are_same_shape(op->src[0], op);
+        case HTP_SEL_MODE_SPARGE:
+            // scores [nbk, nq, hq], query similarity [1, hq, nq], key similarity [1, nbk, hkv]
+            return ggml_are_same_shape(op->src[0], op) && op->src[1]->ne[0] == 1 && op->src[1]->ne[1] == hq &&
+                   op->src[1]->ne[2] == op->ne[1] && op->src[2]->ne[0] == 1 && op->src[2]->ne[1] == op->ne[0] && hq % op->src[2]->ne[2] == 0;
+    }
+    return false;
+}
+
 static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     auto sess = static_cast<ggml_hexagon_session *>(dev->context);
 
@@ -8682,7 +8734,7 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_CUSTOM:
             supp = (opt_sync_probe && (uint32_t) op->op_params[HTP_SYNC_PROBE_P_MAGIC] == HTP_SYNC_PROBE_MAGIC) ||
-                   ggml_hexagon_supported_xattn_select(op);
+                   ggml_hexagon_supported_xattn_select(op) || ggml_hexagon_supported_sel(op);
             break;
 
         case GGML_OP_SET_ROWS:

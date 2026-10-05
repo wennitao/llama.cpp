@@ -804,6 +804,9 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_XATTN_SELECT:
             return op_xattn_select(octx);
 
+        case HTP_OP_SEL:
+            return op_sel(octx);
+
         case HTP_OP_INVALID:
             break;
     }
