@@ -27,6 +27,7 @@
 #include "llama-sparse-attn.h"
 #include "llama-xattention.h"
 #include "llama-selectors.h"
+#include "llama-shadowattn.h"
 
 // dedup helpers
 
@@ -3280,6 +3281,24 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             use_selector = false;
         }
     }
+    // ShadowAttn (llama-shadowattn.h): its rows see keys 0..n_kv-n_tokens+i, so the same aligned ubatch. The worst-case
+    // reservation (every position 0, n_kv the whole cache) builds its graph too, so that the compute buffer holds the
+    // estimation's scores from the start rather than growing inside a timed prefill.
+    bool use_shadowattn = !use_xattention && !use_selector && llama_shadowattn_ratio() > 0.0 && q->ne[1] > 256;
+    if (use_shadowattn) {
+        GGML_ASSERT(use_flash_attn && !v_trans && n_stream == 1);
+        GGML_ASSERT(!sparse_sel && !sinks && !v_mla && !hparams.attn_soft_cap && hparams.f_max_alibi_bias == 0.0f);
+        const bool reserve = ubatch.pos && ubatch.pos[ubatch.n_tokens - 1] == ubatch.pos[0];
+        if (!reserve && ubatch.pos && ubatch.pos[0] + (int64_t) ubatch.n_tokens != k->ne[1]) {
+            static bool once = false;
+            if (!once) {
+                once = true;
+                LLAMA_LOG_ERROR("shadowattn: ubatch at %d + %u does not end at n_kv %lld, running dense\n",
+                                ubatch.pos[0], ubatch.n_tokens, (long long) k->ne[1]);
+            }
+            use_shadowattn = false;
+        }
+    }
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -3306,6 +3325,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             cur = llama_xattention_build(ctx0, q, k, v, kq_mask, xattn_indices, xattn_reduced, kq_scale, il);
         } else if (use_selector) {
             cur = llama_selector_build(ctx0, q, k, v, kq_mask, kq_scale, il);
+        } else if (use_shadowattn) {
+            cur = llama_shadowattn_build(ctx0, q, k, v, kq_scale, il);
         } else {
             cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                       hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
