@@ -5517,6 +5517,8 @@ struct ggml_hexagon_hfold_job {
     size_t   em_bytes = 0;
     float    scale = 0.0f;
     const uint8_t * q_base = nullptr, * k_base = nullptr, * v_base = nullptr, * m_base = nullptr;   // host VAs (FOLD_CHECK)
+    ggml_backend_buffer_t src_buf[GGML_MAX_SRC] = {};   // the node's source buffers when tagged: a freed buffer drops
+                                                        // the job without reading the node, which llama may have freed
     hfold_chain chain;                 // GPU chain state (enqueued when; events to release)
 };
 
@@ -6025,6 +6027,7 @@ static bool ggml_hexagon_hfold_prepare(ggml_hexagon_session * sess, ggml_tensor 
     auto hbase = [](const ggml_tensor * t) { return (const uint8_t *) static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context)->base; };
     job.q_base = hbase(q); job.k_base = hbase(k); job.v_base = hbase(v); job.m_base = hbase(m);
     n->src[7] = h->ctrl;
+    for (int i = 0; i < GGML_MAX_SRC; ++i) job.src_buf[i] = n->src[i] ? n->src[i]->buffer : nullptr;
     h->jobs[n] = job;
     if (opt_verbose || h->jobs.size() == 1) {
         GGML_LOG_INFO("ggml-hex: fa-fold: tagged %s: %u tokens x %u heads (%u KV heads, G %u), %u KV blocks, %u sub-blocks\n",
@@ -6740,11 +6743,11 @@ static void ggml_hexagon_hfold_buffer_freed(ggml_hexagon_session * sess, ggml_ba
     auto ii = h->images.find(sbuf->fd);  if (ii != h->images.end())  { clReleaseMemObject(ii->second); h->images.erase(ii); }
     auto iu = h->images_u32.find(sbuf->fd); if (iu != h->images_u32.end()) { clReleaseMemObject(iu->second); h->images_u32.erase(iu); }
     auto ia = h->aliases.find(sbuf->fd); if (ia != h->aliases.end()) { clReleaseMemObject(ia->second); h->aliases.erase(ia); }
-    // jobs that referenced this buffer are stale; the next graph build re-prepares them
+    // jobs that referenced this buffer are stale; the next graph build re-prepares them. Compare the buffers recorded
+    // at tagging: at teardown llama frees the graph's nodes before the scheduler's compute buffer.
     for (auto it = h->jobs.begin(); it != h->jobs.end();) {
-        const ggml_tensor * n = it->first;
         bool uses = false;
-        for (int i = 0; i < GGML_MAX_SRC && !uses; ++i) uses = n->src[i] && n->src[i]->buffer == buffer;
+        for (int i = 0; i < GGML_MAX_SRC && !uses; ++i) uses = it->second.src_buf[i] == buffer;
         it = uses ? h->jobs.erase(it) : std::next(it);
     }
     HEX_VERBOSE("ggml-hex: fa-fold: dropped the alias of freed buffer fd %d base %p\n", sbuf->fd, (void *) sbuf->base);
