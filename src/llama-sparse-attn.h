@@ -58,6 +58,15 @@ static inline float llama_sparse_attn_thr() {
     return (c > 0.0f && c < 100.0f) ? c : 0.0f;
 }
 
+// Own-exception threshold for the split: LLAMA_SPARSE_ATTN_EXC_THR=<c_lo> (below the thr:<c> threshold; 0 or unset =
+// off). The shared list is cut from the thr:<c> selection as always; each sub-block's GPU exceptions come from its own
+// selection at c_lo, so the GPU takes extra blocks while the NPU's work is unchanged (head-start tiles stay NPU-only).
+static inline float llama_sparse_attn_exc_thr() {
+    const char * s = getenv("LLAMA_SPARSE_ATTN_EXC_THR");
+    const float c = s ? (float) atof(s) : 0.0f;
+    return (c > 0.0f && c < 100.0f) ? c : 0.0f;
+}
+
 // Heterogeneous split: LLAMA_SPARSE_ATTN_CSTAR=<c>, 0 (the default) = off.
 //
 // One 256-query tile is R = BQ/BS fine 64-query sub-blocks, and c(b) counts how many of

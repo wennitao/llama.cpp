@@ -3070,9 +3070,14 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
         ggml_tensor * av = ggml_view_3d(ctx0, bias, 1, NBq, 1, bias->nb[1], bias->nb[2],
                                         (size_t) NBk * bias->nb[0]);
         pm = ggml_mul(ctx0, pm, av);
-        pm = ggml_scale_bias(ctx0, pm, BIGF, -c * BIGF);
         ggml_tensor * fr = ggml_view_3d(ctx0, bias, NBk, NBq, 1, bias->nb[1], bias->nb[2],
                                         bias->nb[3]);
+        // The split's own-exception selection (LLAMA_SPARSE_ATTN_EXC_THR): the same p * avail cut at the lower threshold,
+        // forced blocks included; only the GPU's half reads it. scale_bias makes a new tensor, so pm is read twice safely.
+        const float c_lo = llama_sparse_attn_exc_thr();
+        ggml_tensor * pm_lo = c_lo > 0.0f && c_lo < c ?
+            ggml_clamp(ctx0, ggml_add(ctx0, ggml_scale_bias(ctx0, pm, BIGF, -c_lo * BIGF), fr), 0.0f, 1.0f) : nullptr;
+        pm = ggml_scale_bias(ctx0, pm, BIGF, -c * BIGF);
         pm = ggml_clamp(ctx0, ggml_add(ctx0, pm, fr), 0.0f, 1.0f);
         cb(pm, "sparse_mem", il);
 
@@ -3135,7 +3140,7 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
             //
             // pm is re-binarised first: the same 1e-9 band would otherwise let a member
             // weigh 0.3 and make the count below fractional.
-            ggml_tensor * pmb = ggml_clamp(ctx0, ggml_scale_bias(ctx0, pm, BIGF, -0.5f * BIGF), 0.0f, 1.0f);
+            ggml_tensor * pmb = ggml_clamp(ctx0, ggml_scale_bias(ctx0, pm_lo ? pm_lo : pm, BIGF, -0.5f * BIGF), 0.0f, 1.0f);
             ggml_tensor * em  = ggml_mul(ctx0,
                                          ggml_reshape_4d(ctx0, pmb, NBk, R, NBq / R, Hkv),
                                          ggml_reshape_4d(ctx0, ggml_scale_bias(ctx0, um, -1.0f, 1.0f),
