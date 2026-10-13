@@ -294,6 +294,100 @@ int main(int argc, char ** argv) {
     run(/*hide_tail=*/true, /*with_fold=*/true, &ms_instore, HTP_FA_FOLD_F_INSTORE);
     compare("fold-instore");
 
+    // The partial in tile row order (HTP_FA_FOLD_F_TILE_ROWS): the same rows, permuted, so dst must equal the head-major
+    // in-store fold bit for bit. Also with an f16 accumulator, and with every other 64-token sub-block empty.
+    const size_t n_out = (size_t) o.lq * o.nh * D;
+    const std::vector<uint8_t> part_hm(fold + L.off_m, fold + L.off_acc + rows * L.part_stride);
+    std::vector<uint8_t> part_mixed = part_hm;
+    for (size_t hrow = 0; hrow < rows; hrow++) {
+        if (((hrow % o.lq) / 64) % 2 == 1) {
+            ((float *) part_mixed.data())[hrow]                             = -10000.0f;
+            ((float *) (part_mixed.data() + (L.off_l - L.off_m)))[hrow]     = 0.0f;
+            memset(part_mixed.data() + (L.off_acc - L.off_m) + hrow * L.part_stride, 0, L.part_stride);
+        }
+    }
+    auto put_partial = [&](const std::vector<uint8_t> & src, bool tile_rows, bool acc_f16) {
+        const float * sm = (const float *) src.data();
+        const float * sl = (const float *) (src.data() + (L.off_l - L.off_m));
+        const float * sa = (const float *) (src.data() + (L.off_acc - L.off_m));
+        for (int h = 0; h < o.nh; h++) {
+            for (int t = 0; t < o.lq; t++) {
+                const size_t hr = (size_t) h * o.lq + t;
+                const size_t r  = tile_rows ? ((size_t) (h / G) * o.lq + t) * G + h % G : hr;
+                fm[r] = sm[hr];
+                fl[r] = sl[hr];
+                if (acc_f16) {
+                    uint16_t * pa = (uint16_t *) (fold + L.off_acc + r * D * sizeof(uint16_t));
+                    for (size_t e = 0; e < D; e++) pa[e] = f2h(sa[hr * D + e]);
+                } else {
+                    memcpy(fold + L.off_acc + r * L.part_stride, sa + hr * D, D * sizeof(float));
+                }
+            }
+        }
+    };
+    auto same_bits = [&](const char * name, const std::vector<float> & want) {
+        size_t bad = 0;
+        for (size_t i = 0; i < n_out; i++) bad += memcmp(&dst[i], &want[i], sizeof(float)) != 0;
+        printf("  %-22s %zu of %zu outputs differ from head-major%s\n", name, bad, n_out, bad ? "  <-- MISMATCH" : " (bit-exact)");
+    };
+    if (!HTP_FA_FOLD_TILE_ROWS_OK(o.lq, G)) {
+        printf("  tile-rows arms skipped: 32 does not divide lq * G\n");
+    } else {
+        const uint32_t IS = HTP_FA_FOLD_F_INSTORE, TR = HTP_FA_FOLD_F_TILE_ROWS, F16 = HTP_FA_FOLD_F_ACC_F16;
+        double ms_tr = 0;
+        const struct { const char * name; const std::vector<uint8_t> * part; bool f16; } arms[] = {
+            { "tile-rows",           &part_hm,    false },
+            { "tile-rows acc16",     &part_hm,    true  },
+            { "tile-rows mixed",     &part_mixed, false },
+            { "tile-rows mixed16",   &part_mixed, true  },
+        };
+        // A rejected op (the DSP answers INVAL_PARAMS, which the backend only logs) leaves dst as it was: fill dst with a
+        // NaN sentinel before each run and treat any surviving sentinel word as "did not run", never as a mismatch.
+        // TILE_ROWS needs Br % 32 == 0; without a selection the chunk-size search steps Br by ceil(32 / G), so this
+        // harness reaches it at G = 1, 2, 4, 8 but not at G = 3 (the live split, Br 256, covers G = 3).
+        const uint32_t sentinel = 0x7fc0deadu;
+        auto fill_sentinel = [&]() { for (size_t i = 0; i < n_out; i++) memcpy(&dst[i], &sentinel, sizeof(float)); };
+        auto unwritten     = [&]() { size_t n = 0; for (size_t i = 0; i < n_out; i++) n += memcmp(&dst[i], &sentinel, sizeof(float)) == 0; return n; };
+        bool tr_ran = true;
+        for (const auto & a : arms) {
+            put_partial(*a.part, false, a.f16);
+            fill_sentinel();
+            run(/*hide_tail=*/true, /*with_fold=*/true, &ms_tr, IS | (a.f16 ? F16 : 0u));
+            if (const size_t left = unwritten()) {
+                printf("  %-22s not run: the head-major reference left %zu of %zu outputs unwritten (op rejected)\n", a.name, left, n_out);
+                tr_ran = false;
+                break;
+            }
+            const std::vector<float> want(dst, dst + n_out);
+            put_partial(*a.part, true, a.f16);
+            fill_sentinel();
+            run(/*hide_tail=*/true, /*with_fold=*/true, &ms_tr, IS | TR | (a.f16 ? F16 : 0u));
+            if (const size_t left = unwritten()) {
+                printf("  %-22s not run: the DSP rejected TILE_ROWS at this shape (%zu of %zu outputs unwritten; Br %% 32 != 0 at G = %d?)\n",
+                       a.name, left, n_out, G);
+                tr_ran = false;
+                break;
+            }
+            same_bits(a.name, want);
+        }
+        // interleaved min-of-3: the in-store fold's cost, head-major vs tile rows, f16 accumulator (the deployed partial)
+        double t_hm = 1e9, t_tr = 1e9, t_d = 1e9, ms = 0;
+        for (int rep = 0; rep < 3 && tr_ran; rep++) {
+            run(false, false, &ms);                                    t_d  = std::min(t_d, ms);
+            put_partial(part_hm, false, true);
+            run(true, true, &ms, IS | F16);                            t_hm = std::min(t_hm, ms);
+            put_partial(part_hm, true, true);
+            run(true, true, &ms, IS | TR | F16);                       t_tr = std::min(t_tr, ms);
+        }
+        if (tr_ran) {
+            printf("min-of-3 interleaved, f16 partial  dense %.3f ms   fold-instore %.3f (%+.0f us)   tile-rows %.3f (%+.0f us)   => %+.0f us\n",
+                   t_d, t_hm, 1e3 * (t_hm - t_d), t_tr, 1e3 * (t_tr - t_d), 1e3 * (t_tr - t_hm));
+        } else {
+            printf("min-of-3 interleaved: skipped (the tile-row arms did not run at this shape)\n");
+        }
+        put_partial(part_hm, false, false);   // the arms below read the head-major f32 partial
+    }
+
     // explicit merge: HTP spills its own partial, then a separate pass merges both from DDR
     double ms_spill = 0;
     memset(dst, 0, (size_t) o.lq * o.nh * D * sizeof(float));

@@ -50,6 +50,7 @@ if (GGML_HEXAGON)
 endif()
 
 if (GGML_HEXAGON AND GGML_OPENCL)
+    add_subdirectory(fa-exc-bench)
     add_subdirectory(hetero-sync-probe)
     add_subdirectory(hetero-decode-attn)
     add_subdirectory(cluster-kmeans-bench)

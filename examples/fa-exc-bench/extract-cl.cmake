@@ -1,0 +1,20 @@
+# cmake -DIN=<ggml-hexagon.cpp> -DOUT=<header> -P extract-cl.cmake
+# Writes the fold kernels' OpenCL source (the raw string ggml_hexagon_hfold_cl_src of IN) to OUT as a C++ raw string,
+# so the bench always compiles the production kernels.
+file(READ "${IN}" src)
+set(key "ggml_hexagon_hfold_cl_src = R\"CL(")
+string(FIND "${src}" "${key}" a)
+if (a LESS 0)
+    message(FATAL_ERROR "fa-exc-bench: no ggml_hexagon_hfold_cl_src in ${IN}")
+endif()
+string(LENGTH "${key}" klen)
+math(EXPR a "${a} + ${klen}")
+string(SUBSTRING "${src}" ${a} -1 rest)
+string(FIND "${rest}" ")CL\";" b)
+if (b LESS 0)
+    message(FATAL_ERROR "fa-exc-bench: unterminated ggml_hexagon_hfold_cl_src in ${IN}")
+endif()
+string(SUBSTRING "${rest}" 0 ${b} body)
+file(WRITE "${OUT}.tmp" "// generated from ggml-hexagon.cpp by extract-cl.cmake\nstatic const char * fa_exc_bench_cl_src = R\"CL(${body})CL\";\n")
+execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${OUT}.tmp" "${OUT}")
+file(REMOVE "${OUT}.tmp")
