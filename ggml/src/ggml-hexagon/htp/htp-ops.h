@@ -258,6 +258,14 @@ enum htp_sync_probe_rec {
 // ACC_F16 (with INSTORE, not SPILL): the producer writes the partial's accumulator rows as f16
 // (row stride dv * 2). Halves the 7 MB per op the fold reads; the HTP's own accumulator is f16.
 #define HTP_FA_FOLD_F_ACC_F16         (1u << 15)
+// TILE_ROWS (with INSTORE, not SPILL; DV 128, Br % 32 == 0): the producer writes the partial in the HMX tile's row
+// order (row formula below): a tile's rows are one run, so the store loads m and l as vectors and reads acc rows in order.
+// Only for shapes where every tile starts on a 128 B line of m and l (HTP_FA_FOLD_TILE_ROWS_OK): the fold then never
+// touches a line of a stage the producer has not delivered. The GPU kernel applies the same rule.
+#define HTP_FA_FOLD_F_TILE_ROWS       (1u << 16)
+#define HTP_FA_FOLD_TILE_ROWS_OK(neq1, G) ((((uint64_t) (neq1) * (G)) % 32) == 0)
+// m of a producer row without keys (its l and acc are 0); the GPU's M_EMPTY
+#define HTP_FA_FOLD_M_EMPTY           (-10000.0f)
 // STAGE_QBH (with STAGED, implies STAGE_QB ordering): one stage per (query block, KV head), stage
 // k = qb * n_kv_heads + kv_head, so the first exception tile of a query block waits for one KV
 // head's partial rather than the whole block's. Needs hdr.off_done (the slot line holds 32 words).
@@ -288,6 +296,7 @@ enum htp_fa_fold_status_word {
     HTP_FA_FOLD_ST_WAIT_US_SUM,    // STAGED: blocked time summed over ops (mean = / ops)
     HTP_FA_FOLD_ST_BUDGET_OPS,     // STAGED: ops that applied the in-kernel budget (header budget_milli)
     HTP_FA_FOLD_ST_BUDGET_REJECTED,// STAGED: ops with a budget whose shapes it could not take (they ran the plain split)
+    HTP_FA_FOLD_ST_TILE_ROWS,      // STAGED: ops that read the partial in tile row order (HTP_FA_FOLD_F_TILE_ROWS)
     HTP_FA_FOLD_ST_N
 };
 
@@ -295,7 +304,8 @@ enum htp_fa_fold_status_word {
 // the diagonal is built, so interleaving them with acc made every gather touch a 640 B line for
 // 8 bytes of payload; split out, a tile's m and l are 1 KB of contiguous stream per GQA head.
 // All offsets are 128-aligned byte offsets from the header. Row r of (sequence ib3, head iq2,
-// token iq1) is r = (ib3 * neq2 + iq2) * neq1 + iq1, and holds:
+// token iq1) is r = (ib3 * neq2 + iq2) * neq1 + iq1, or with HTP_FA_FOLD_F_TILE_ROWS (G = neq2 / n_kv_heads)
+// r = ((ib3 * n_kv_heads + iq2 / G) * neq1 + iq1) * G + iq2 % G, and holds:
 //   m[r]        f32, the running max in NATURAL log units (-INFINITY or very negative = empty)
 //   l[r]        f32, the running sum
 //   acc[r][dv]  f32, the UNNORMALISED accumulator

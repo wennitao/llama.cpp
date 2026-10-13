@@ -152,10 +152,21 @@ static int    opt_fa_fold_acq = 0;         // GGML_HEXAGON_FA_FOLD_ACQ=1: acquir
 static int    opt_fa_fold_qatomic = 0;     // GGML_HEXAGON_FA_FOLD_QATOMIC=1: Q through atomic loads
 static int    opt_fa_fold_wgfence = 0;     // GGML_HEXAGON_FA_FOLD_WGFENCE=1: per-work-group all-SVM-devices release fence
 static int    opt_fa_fold_acc16 = 1;       // GGML_HEXAGON_FA_FOLD_ACC16=0: the GPU writes the partial accumulator as f32 instead of f16 (f16 halves the fold's reads; exact within f16 rounding)
+static int    opt_fa_fold_tile_rows = 0;   // GGML_HEXAGON_FA_FOLD_TILE_ROWS=1: the GPU writes the partial in the DSP tile's row order (HTP_FA_FOLD_F_TILE_ROWS): the in-store fold loads m and l as vectors (same output bits)
 // KNAT=1 (K in its natural layout through an image, no staging, first stage ~115 us after ready)
 // is 80-100 us per op faster but its perplexity did not reproduce across runs (19.6350 x2 /
 // 19.7070) with the reference check clean, so it stays opt-in until that is understood.
 static int    opt_fa_fold_knat = 0;        // GGML_HEXAGON_FA_FOLD_KNAT=1: read K in its natural layout through an image of the cache (no K^T staging, no tables)
+// GGML_HEXAGON_FA_FOLD_EXC=<bits>: fa_exc data-path variants (examples/fa-exc-bench times them alone):
+//   1 = K^T and V as 16-byte texels through uint32 views (FA_EXC_TEX128), bit-exact
+//   2 = softmax fused into the QK threads (FA_EXC_FSM): m and acc bit-exact, l up to f32 reassociation
+//   4 = Q through a uint32 view, i.e. the texture cache (FA_EXC_QIMG), bit-exact
+//   8 = P kept in f16 like the NPU's (FA_EXC_P16, implies 2): half the local memory per work-group
+//  16 = two blocks per iteration, 4 rows x 8 keys per QK thread (FA_EXC_QK2B, implies 8): half the K^T reads per FMA
+// GGML_HEXAGON_FA_FOLD_CLOPTS: extra build options for the fold kernels (diagnostics, e.g. -DFA_EXC_LDS_PAD=4096).
+enum { HFOLD_EXC_TEX128 = 1, HFOLD_EXC_FSM = 2, HFOLD_EXC_QIMG = 4, HFOLD_EXC_P16 = 8, HFOLD_EXC_QK2B = 16 };
+static int    opt_fa_fold_exc = 0;
+static std::string opt_fa_fold_clopts;
 static int    opt_fa_fold_preq_idle = 0;   // GGML_HEXAGON_FA_FOLD_PREQ_IDLE_US: PREQ=-3 waits this long after the previous chain before enqueuing
 static int    opt_fa_fold_qmap = 0;        // GGML_HEXAGON_FA_FOLD_QMAP=1: enqueue a map/unmap of Q and the membership in the chain after the gate
 static int    opt_fa_fold_gate_delay = 0;  // GGML_HEXAGON_FA_FOLD_GATE_DELAY=<polls>: diagnostic hold after ready (~30 us per poll)
@@ -4590,11 +4601,68 @@ __kernel void keepalive(__global float4 * p, const int n4, const int iters, __gl
 #ifndef ACC_F16
 #define ACC_F16 0   // 1: the partial's accumulator rows are written as half (HTP_FA_FOLD_F_ACC_F16)
 #endif
+#ifndef TILE_ROWS
+#define TILE_ROWS 0 // 1: partial rows in the DSP tile's order when 32 | Sq * G, the G heads of a KV head interleaved per token (HTP_FA_FOLD_F_TILE_ROWS)
+#endif
 #ifndef K_NAT
 #define K_NAT 0     // 1: read K from the cache in its natural [key][d] layout through an image (no K^T staging, no tables)
 #endif
 #ifndef WG_FENCE
 #define WG_FENCE 0  // 1: every work-group releases at all-SVM-devices scope before its stage count (else device scope; the last group's acq_rel fence covers the rest)
+#endif
+// fa_exc data-path variants (GGML_HEXAGON_FA_FOLD_EXC bits); each keeps the plain path's per-element operation order
+#ifndef FA_EXC_TEX128
+#define FA_EXC_TEX128 0   // 1: K^T and V read as 16-byte texels (8 halves) through a uint32 RGBA view; the staging kernels write K^T the same way
+#endif
+#ifndef FA_EXC_FSM
+#define FA_EXC_FSM 0      // 1: softmax fused into the QK threads: row max by subgroup shuffles, P stored once, 2 barriers per block
+#endif
+#ifndef FA_EXC_QIMG
+#define FA_EXC_QIMG 0     // 1: Q rows read through a uint32 RGBA view (texture cache) instead of global loads
+#endif
+#ifndef FA_EXC_P16
+#define FA_EXC_P16 0      // 1 (implies FSM): P kept in f16, the NPU's precision: half the local memory per work-group
+#endif
+#ifndef FA_EXC_QK2B
+#define FA_EXC_QK2B 0     // 1 (implies P16): two blocks per iteration, 4 rows x 8 keys per QK thread (half the K^T reads per FMA)
+#endif
+#ifndef FA_EXC_LDS_PAD
+#define FA_EXC_LDS_PAD 0  // diagnostic: bytes of extra local memory per fa_exc work-group (occupancy probe)
+#endif
+#if K_NAT || KT_BUF
+#undef FA_EXC_TEX128
+#define FA_EXC_TEX128 0
+#endif
+#if K_NAT
+#undef FA_EXC_QK2B
+#define FA_EXC_QK2B 0
+#endif
+#if Q_ATOMIC
+#undef FA_EXC_QIMG
+#define FA_EXC_QIMG 0
+#endif
+#if FA_EXC_QK2B
+#undef FA_EXC_P16
+#define FA_EXC_P16 1
+#endif
+#if FA_EXC_P16
+#undef FA_EXC_FSM
+#define FA_EXC_FSM 1
+#endif
+#define FA_EXC_NBLK (FA_EXC_QK2B ? 2 : 1)   // blocks per iteration
+// the fused softmax's row max: subgroup shuffles where available, else (or with -DFA_EXC_NO_SHFL) through local memory.
+// The host passes -D cl_qcom_subgroup_shuffle=1 or -D cl_khr_subgroup_shuffle=1 from CL_DEVICE_EXTENSIONS (only with
+// cl_khr_subgroups), as ggml-opencl does: Adreno's compiler does not predefine the extension macros, so a guard on
+// predefined macros alone compiles the shuffles out.
+#if FA_EXC_FSM && !defined(FA_EXC_NO_SHFL) && (defined(cl_qcom_subgroup_shuffle) || defined(cl_khr_subgroup_shuffle))
+#pragma OPENCL EXTENSION cl_khr_subgroups : enable
+#if defined(cl_qcom_subgroup_shuffle)
+#pragma OPENCL EXTENSION cl_qcom_subgroup_shuffle : enable
+#define EXC_SHFL_XOR(x, m) qcom_sub_group_shuffle_xor((x), (uint) (m), CLK_SUB_GROUP_SHUFFLE_WIDTH_WAVE_SIZE_QCOM, 0.0f)
+#else
+#pragma OPENCL EXTENSION cl_khr_subgroup_shuffle : enable
+#define EXC_SHFL_XOR(x, m) sub_group_shuffle_xor((x), (uint) (m))
+#endif
 #endif
 #if Q_ATOMIC
 inline float4 q_load4(__global const float * p) {
@@ -4701,6 +4769,35 @@ void compact(__global const uint * svm, const uint want,
     }
 }
 
+#if FA_EXC_TEX128
+// 8 keys (k8 * 8 ..) x 8 dims (dg * 8 ..) of one KV head as 8 texels of 16 bytes, 8 consecutive keys at one d. The texel
+// index is in 16-byte units: kt_base_tex (8-byte units, even) / 2 + kvh * FA_D * M_8 + d * M_8 + k8, M_8 = n_stage / 8.
+inline void kt_write8(__write_only image1d_buffer_t kt_img, const int tex, const int M_8,
+                      const half8 k0, const half8 k1, const half8 k2, const half8 k3, const half8 k4, const half8 k5, const half8 k6, const half8 k7) {
+    write_imageui(kt_img, tex,           as_uint4((half8)(k0.s0, k1.s0, k2.s0, k3.s0, k4.s0, k5.s0, k6.s0, k7.s0)));
+    write_imageui(kt_img, tex + 1 * M_8, as_uint4((half8)(k0.s1, k1.s1, k2.s1, k3.s1, k4.s1, k5.s1, k6.s1, k7.s1)));
+    write_imageui(kt_img, tex + 2 * M_8, as_uint4((half8)(k0.s2, k1.s2, k2.s2, k3.s2, k4.s2, k5.s2, k6.s2, k7.s2)));
+    write_imageui(kt_img, tex + 3 * M_8, as_uint4((half8)(k0.s3, k1.s3, k2.s3, k3.s3, k4.s3, k5.s3, k6.s3, k7.s3)));
+    write_imageui(kt_img, tex + 4 * M_8, as_uint4((half8)(k0.s4, k1.s4, k2.s4, k3.s4, k4.s4, k5.s4, k6.s4, k7.s4)));
+    write_imageui(kt_img, tex + 5 * M_8, as_uint4((half8)(k0.s5, k1.s5, k2.s5, k3.s5, k4.s5, k5.s5, k6.s5, k7.s5)));
+    write_imageui(kt_img, tex + 6 * M_8, as_uint4((half8)(k0.s6, k1.s6, k2.s6, k3.s6, k4.s6, k5.s6, k6.s6, k7.s6)));
+    write_imageui(kt_img, tex + 7 * M_8, as_uint4((half8)(k0.s7, k1.s7, k2.s7, k3.s7, k4.s7, k5.s7, k6.s7, k7.s7)));
+}
+
+inline void stage_k_item8(__global const uchar * kbuf, const int k_off, const int k_nb1, const int k_nb2,
+                          __write_only image1d_buffer_t kt_img, const int kt_base_tex, __global const int * abs_row,
+                          const int n_stage, const int k8, const int dg, const int kvh) {
+    half8 kr[8];
+    for (int cc = 0; cc < 8; ++cc) {
+        const int ki  = k8 * 8 + cc;
+        const int tok = abs_row[ki >> 6] * FA2_BK + (ki & (FA2_BK - 1));
+        kr[cc] = vload8(0, (__global const half *)(kbuf + k_off + (long) tok * k_nb1 + (long) kvh * k_nb2) + dg * 8);
+    }
+    const int M_8 = n_stage >> 3;
+    kt_write8(kt_img, (kt_base_tex >> 1) + kvh * FA_D * M_8 + (dg * 8) * M_8 + k8, M_8, kr[0], kr[1], kr[2], kr[3], kr[4], kr[5], kr[6], kr[7]);
+}
+#endif
+
 inline void stage_k_item(__global const uchar * kbuf, const int k_off, const int k_nb1, const int k_nb2,
                          __write_only image1d_buffer_t kt_img, const int kt_base_tex,
                          __global const uchar * tabs, const int abs_off, const int abs_stride, const int n_stage,
@@ -4736,12 +4833,17 @@ __kernel void stage_k(__global const uchar * kbuf, const int k_off, const int k_
                       __global const uint * svm, const uint want) {
     if (!gate_open(svm, want)) return;
     mark_start((__global uint *) svm, want, 4);
-    const int k4  = get_global_id(0);   // 4 keys
+    const int k4  = get_global_id(0);   // 4 keys (8 with FA_EXC_TEX128)
     const int dg  = get_global_id(1);   // 8 dims
     const int kvh = get_global_id(2);
     __global const int * cnt = (__global const int *)(tabs + cnt_off);
+#if FA_EXC_TEX128
+    if (k4 * 8 >= cnt[kvh]) return;
+    stage_k_item8(kbuf, k_off, k_nb1, k_nb2, kt_img, kt_base_tex, (__global const int *)(tabs + abs_off) + kvh * abs_stride, n_stage, k4, dg, kvh);
+#else
     if (k4 * 4 >= cnt[kvh]) return;
     stage_k_item(kbuf, k_off, k_nb1, k_nb2, kt_img, kt_base_tex, tabs, abs_off, abs_stride, n_stage, k4, dg, kvh);
+#endif
 }
 
 // Persistent form: n_pwg work-groups of 128 pull units of (KV head, 8 consecutive k4) from a
@@ -4766,7 +4868,12 @@ void stage_k_p(__global const uchar * kbuf, const int k_off, const int k_nb1, co
     if (t == 0) cur_head = -1;
     // units of 32 keys per head: the op's own blocks (a head never has more exception keys than nbk * 64), or the
     // staging capacity n_stage; the K^T layout keeps the capacity stride either way
+#if FA_EXC_TEX128
+    // units of 64 keys: 8 groups of 8 keys (one 16-byte texel per d) x 16 groups of 8 dims
+    const int kb_per_head = kb_per_head_arg > 0 ? (kb_per_head_arg + 1) / 2 : n_stage / 64;
+#else
     const int kb_per_head = kb_per_head_arg > 0 ? kb_per_head_arg : (n_stage / 4 + 7) / 8;
+#endif
     const int n_units = nkvh * kb_per_head;
     for (;;) {
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -4810,6 +4917,20 @@ void stage_k_p(__global const uchar * kbuf, const int k_off, const int k_nb1, co
                 lcnt[kvh * num_sb + sb] = s;
             }
         }
+#if FA_EXC_TEX128
+        const int k8 = kb * 8 + t / 16;
+        const int dg = t % 16;
+        if (k8 * 8 < cnt_l) {
+            half8 kr[8];
+            for (int cc = 0; cc < 8; ++cc) {
+                const int ki  = k8 * 8 + cc;
+                const int tok = abs_l[ki >> 6] * FA2_BK + (ki & (FA2_BK - 1));
+                kr[cc] = vload8(0, (__global const half *)(kbuf + k_off + (long) tok * k_nb1 + (long) kvh * k_nb2) + dg * 8);
+            }
+            const int M_8 = n_stage >> 3;
+            kt_write8(kt_img, (kt_base_tex >> 1) + kvh * FA_D * M_8 + (dg * 8) * M_8 + k8, M_8, kr[0], kr[1], kr[2], kr[3], kr[4], kr[5], kr[6], kr[7]);
+        }
+#else
         const int k4 = kb * 8 + t / 16;
         const int dg = t % 16;
         if (k4 * 4 < cnt_l) {
@@ -4843,8 +4964,13 @@ void stage_k_p(__global const uchar * kbuf, const int k_off, const int k_nb1, co
             write_imageh(kt_img, tex + 7 * M_4, (half4)(kr[0].s7, kr[1].s7, kr[2].s7, kr[3].s7));
 #endif
         }
+#endif  // FA_EXC_TEX128
     }
 }
+
+#if FA_EXC_FSM
+inline float exc_max8(const float8 v) { const float4 h4 = fmax(v.lo, v.hi); const float2 h2 = fmax(h4.lo, h4.hi); return fmax(h2.s0, h2.s1); }
+#endif
 
 // One work-group = 32 query rows of one head over that sub-block's exception blocks. Emits the
 // UNNORMALISED (m, l, acc) per row; a row without exceptions leaves the empty partial.
@@ -4865,16 +4991,37 @@ void fa_exc(__read_only image1d_buffer_t kt_img, __read_only image1d_buffer_t v_
             __global uint * svm, const uint want, const int chain, const int gpu_done, const int qbh,
             const int nkvh, const int qb32_per_stage, const int scnt_off, const int done_off, const int stamp_off, const int n_stages_arg,
             __read_only image1d_buffer_t k_img, const int k_base_tex, const int k_tok_tex, const int k_head_tex,
-            __global uchar * embuf, const int em_off, const int nbk) {
+            __global uchar * embuf, const int em_off, const int nbk,
+            __read_only image1d_buffer_t q_img) {
     if (!gate_open(svm, want)) return;
     ENTRY_ACQUIRE();
     mark_start(svm, want, 5);
     const int t  = get_local_id(0);
+#if FA_EXC_P16
+    // P in f16 for FA_EXC_NBLK blocks; the float view holds the row max partials when there is no subgroup shuffle
+    __local union { float f[FA2_BQ][FA2_BK * FA_EXC_NBLK / 2]; half h[FA2_BQ][FA2_BK * FA_EXC_NBLK]; } P_u;
+    #define EXC_PSTORE8(R, C, V) vstore_half8_rte((V), 0, &P_u.h[R][C])
+    #define EXC_PLOAD8(R, C)     vload_half8(0, &P_u.h[R][C])
+    #define EXC_PLOAD4(R, C)     vload_half4(0, &P_u.h[R][C])
+    #define EXC_MXF(R, C)        P_u.f[R][C]
+#else
     __local float S_lds[FA2_BQ][FA2_BK];
+    #define EXC_PSTORE8(R, C, V) vstore8((V), 0, &S_lds[R][C])
+    #define EXC_PLOAD8(R, C)     vload8(0, &S_lds[R][C])
+    #define EXC_PLOAD4(R, C)     vload4(0, &S_lds[R][C])
+    #define EXC_MXF(R, C)        S_lds[R][C]
+#endif
     __local float m_run[FA2_BQ]; __local float l_run[FA2_BQ]; __local float a_sh[FA2_BQ];
     __local int   unit_sh;
+#if FA_EXC_QK2B
+    __local float a_sh1[FA2_BQ];      // the second block's rescale factors
+    __local float tmx[2][FA2_BQ];     // per block, the tile max of each row
+#endif
 #if K_NAT
     __local int   list_sh[STAGE_NBK_MAX]; __local int n_list_sh;
+#endif
+#if FA_EXC_LDS_PAD > 0
+    __local uint lds_pad[(FA_EXC_LDS_PAD + 3) / 4];
 #endif
     const int hpl     = qbh ? G : G * nkvh;            // heads per stage
     const int n_units = n_stages_arg * qb32_per_stage * hpl;
@@ -4936,13 +5083,188 @@ void fa_exc(__read_only image1d_buffer_t kt_img, __read_only image1d_buffer_t v_
     const int q_row_f = q_nb1 >> 2;
     __global const half * Mk = (__global const half *)(mbuf + mask_off);
     const int mask_row_h = mask_nb1 >> 1;
+#if FA_EXC_QIMG
+    // 16-byte texels: the host keeps q_off, q_nb1 and q_nb2 multiples of 16
+    const int q_tex = (q_off + bh * q_nb2) >> 4, q_row_tex = q_nb1 >> 4;
+    #define EXC_QLOAD4(QR, I) as_float4(read_imageui(q_img, q_tex + (QR) * q_row_tex + ((I) >> 2)))
+#else
+    #define EXC_QLOAD4(QR, I) q_load4(Qh + (long) (QR) * q_row_f + (I))
+#endif
+#if FA_EXC_QK2B
+    // running max of this thread's four QK rows of the two-block loop (and two of the single-block loop that takes an odd
+    // last entry), (threads 0-31) the running sum of row t, in registers; read from local memory rather than set from a
+    // literal, so -INFINITY is compared at run time as in the plain path
+    float m_q0 = m_run[((t >> 3) & 7) * 4], m_q1 = m_run[((t >> 3) & 7) * 4 + 1], m_q2 = m_run[((t >> 3) & 7) * 4 + 2], m_q3 = m_run[((t >> 3) & 7) * 4 + 3];
+    float m_r0 = 0.0f, m_r1 = 0.0f;
+    float l_q  = l_run[t & (FA2_BQ - 1)];
+#elif FA_EXC_FSM
+    // running max of this thread's two QK rows and (threads 0-31) the running sum of row t, in registers; read from
+    // local memory rather than set from a literal, so -INFINITY is compared at run time as in the plain path
+    float m_r0 = m_run[(t >> 3) * 2], m_r1 = m_run[(t >> 3) * 2 + 1];
+    float l_q  = l_run[t & (FA2_BQ - 1)];
+#endif
 
 #if K_NAT
     const int n_list = n_list_sh;   // visible: the barrier above followed thread 0's scan
 #else
     const int n_list = (cnt_row < top_k) ? cnt_row : top_k;
 #endif
-    for (int s = 0; s < n_list; ++s) {
+#if FA_EXC_QK2B
+    // two list entries per iteration: threads 0-63 run QK for the first, 64-127 for the second, 4 rows x 8 keys each (half
+    // the K^T reads per FMA); one f16 tile holds both blocks' P. Per element the FSM / P16 path's operations, in its order.
+    // An odd last entry goes through the single-block loop below (all 128 threads on one block).
+    int s_tail = 0;
+    for (int s = 0; s + 1 < n_list; s += 2) {
+        const int cb0 = idx_row[s];
+        if (cb0 < 0) { s_tail = n_list; break; }
+        if (cb0 >= n_blk_kvh) {
+            if (t == 0) atomic_inc((volatile __global int *)(tabs + err_off));
+            s_tail = n_list;
+            break;
+        }
+        // the plain path computes the first entry, then stops at a second that is negative or out of range
+        int nb = 2, cb1 = idx_row[s + 1];
+        bool stop = false;
+        if (cb1 < 0 || cb1 >= n_blk_kvh) {
+            if (cb1 >= 0 && t == 0) atomic_inc((volatile __global int *)(tabs + err_off));
+            stop = true; nb = 1; cb1 = cb0;
+        }
+        const int vka = abs_tab[kvh * abs_stride + cb0] * FA2_BK;
+        const int vkb = abs_tab[kvh * abs_stride + cb1] * FA2_BK;
+        {
+            const int blk = t >> 6, mt = t & 7, nt = (t >> 3) & 7;    // block, keys mt * 8 .., rows nt * 4 ..
+            const int qr0 = min(q0 + nt * 4,     Sq - 1), qr1 = min(q0 + nt * 4 + 1, Sq - 1);
+            const int qr2 = min(q0 + nt * 4 + 2, Sq - 1), qr3 = min(q0 + nt * 4 + 3, Sq - 1);
+            float8 c0 = (float8)0, c1 = (float8)0, c2 = (float8)0, c3 = (float8)0;
+            if (blk < nb) {
+                const int kbase = kt_head + (((blk ? cb1 : cb0) * FA2_BK) >> 2) + mt * 2;
+                for (int i = 0; i < FA_D; i += 4) {
+                    const int tb = kbase + i * M_4kv;
+                    half8 B0, B1, B2, B3;
+#if KT_BUF
+                    __global const half * kt = (__global const half *) hbuf;
+                    B0 = vload8(0, kt + (long) (tb            ) * 4);
+                    B1 = vload8(0, kt + (long) (tb +     M_4kv) * 4);
+                    B2 = vload8(0, kt + (long) (tb + 2 * M_4kv) * 4);
+                    B3 = vload8(0, kt + (long) (tb + 3 * M_4kv) * 4);
+#elif FA_EXC_TEX128
+                    B0 = as_half8(read_imageui(kt_img, (tb            ) >> 1));
+                    B1 = as_half8(read_imageui(kt_img, (tb +     M_4kv) >> 1));
+                    B2 = as_half8(read_imageui(kt_img, (tb + 2 * M_4kv) >> 1));
+                    B3 = as_half8(read_imageui(kt_img, (tb + 3 * M_4kv) >> 1));
+#else
+                    B0.s0123 = read_imageh(kt_img, tb);              B0.s4567 = read_imageh(kt_img, tb + 1);
+                    B1.s0123 = read_imageh(kt_img, tb + M_4kv);      B1.s4567 = read_imageh(kt_img, tb + M_4kv + 1);
+                    B2.s0123 = read_imageh(kt_img, tb + 2 * M_4kv);  B2.s4567 = read_imageh(kt_img, tb + 2 * M_4kv + 1);
+                    B3.s0123 = read_imageh(kt_img, tb + 3 * M_4kv);  B3.s4567 = read_imageh(kt_img, tb + 3 * M_4kv + 1);
+#endif
+                    const float4 w0 = EXC_QLOAD4(qr0, i), w1 = EXC_QLOAD4(qr1, i), w2 = EXC_QLOAD4(qr2, i), w3 = EXC_QLOAD4(qr3, i);
+                    // d-major, so one converted K vector is live at a time; every row still adds dims i .. i + 3 in order
+                    float8 b = convert_float8(B0); c0 += b*w0.s0; c1 += b*w1.s0; c2 += b*w2.s0; c3 += b*w3.s0;
+                    b = convert_float8(B1);        c0 += b*w0.s1; c1 += b*w1.s1; c2 += b*w2.s1; c3 += b*w3.s1;
+                    b = convert_float8(B2);        c0 += b*w0.s2; c1 += b*w1.s2; c2 += b*w2.s2; c3 += b*w3.s2;
+                    b = convert_float8(B3);        c0 += b*w0.s3; c1 += b*w1.s3; c2 += b*w2.s3; c3 += b*w3.s3;
+                }
+            }
+            // an absent second block's threads see only the mask (finite, unused): every lane takes the shuffles
+            const int kb = (blk ? vkb : vka) + mt * 8;
+            float8 sv0 = c0 * scale; sv0 += convert_float8(vload8(0, Mk + (long) qr0 * mask_row_h + kb));
+            float8 sv1 = c1 * scale; sv1 += convert_float8(vload8(0, Mk + (long) qr1 * mask_row_h + kb));
+            float8 sv2 = c2 * scale; sv2 += convert_float8(vload8(0, Mk + (long) qr2 * mask_row_h + kb));
+            float8 sv3 = c3 * scale; sv3 += convert_float8(vload8(0, Mk + (long) qr3 * mask_row_h + kb));
+            float mx0 = exc_max8(sv0), mx1 = exc_max8(sv1), mx2 = exc_max8(sv2), mx3 = exc_max8(sv3);
+            float ta0, ta1, ta2, ta3, tb0, tb1, tb2, tb3;   // per row, the tile max of the first and the second block
+#ifdef EXC_SHFL_XOR
+            if (get_max_sub_group_size() >= 8) {
+                for (int xm = 1; xm < 8; xm <<= 1) {
+                    mx0 = fmax(mx0, EXC_SHFL_XOR(mx0, xm)); mx1 = fmax(mx1, EXC_SHFL_XOR(mx1, xm));
+                    mx2 = fmax(mx2, EXC_SHFL_XOR(mx2, xm)); mx3 = fmax(mx3, EXC_SHFL_XOR(mx3, xm));
+                }
+                if (mt == 0) { tmx[blk][nt * 4] = mx0; tmx[blk][nt * 4 + 1] = mx1; tmx[blk][nt * 4 + 2] = mx2; tmx[blk][nt * 4 + 3] = mx3; }
+                barrier(CLK_LOCAL_MEM_FENCE);
+                ta0 = tmx[0][nt * 4]; ta1 = tmx[0][nt * 4 + 1]; ta2 = tmx[0][nt * 4 + 2]; ta3 = tmx[0][nt * 4 + 3];
+                tb0 = tmx[1][nt * 4]; tb1 = tmx[1][nt * 4 + 1]; tb2 = tmx[1][nt * 4 + 2]; tb3 = tmx[1][nt * 4 + 3];
+            } else
+#endif
+            {
+                // through the (free) P tile's float view: row r, column block * 8 + mt
+                EXC_MXF(nt * 4,     blk * 8 + mt) = mx0; EXC_MXF(nt * 4 + 1, blk * 8 + mt) = mx1;
+                EXC_MXF(nt * 4 + 2, blk * 8 + mt) = mx2; EXC_MXF(nt * 4 + 3, blk * 8 + mt) = mx3;
+                barrier(CLK_LOCAL_MEM_FENCE);
+                ta0 = exc_max8(vload8(0, &EXC_MXF(nt * 4,     0))); tb0 = exc_max8(vload8(0, &EXC_MXF(nt * 4,     8)));
+                ta1 = exc_max8(vload8(0, &EXC_MXF(nt * 4 + 1, 0))); tb1 = exc_max8(vload8(0, &EXC_MXF(nt * 4 + 1, 8)));
+                ta2 = exc_max8(vload8(0, &EXC_MXF(nt * 4 + 2, 0))); tb2 = exc_max8(vload8(0, &EXC_MXF(nt * 4 + 2, 8)));
+                ta3 = exc_max8(vload8(0, &EXC_MXF(nt * 4 + 3, 0))); tb3 = exc_max8(vload8(0, &EXC_MXF(nt * 4 + 3, 8)));
+                barrier(CLK_LOCAL_MEM_FENCE);
+            }
+            // the plain path's steps for the first block, then the second, on row nt * 4 + R
+            #define EXC_STEP2(R) { \
+                const float mna = fmax(m_q##R, ta##R); \
+                const float aa  = (m_q##R == -INFINITY) ? 0.0f : native_exp(m_q##R - mna); \
+                const float mnb = fmax(mna, tb##R); \
+                const float ab  = (mna == -INFINITY) ? 0.0f : native_exp(mna - mnb); \
+                if (blk < nb) EXC_PSTORE8(nt * 4 + (R), blk * FA2_BK + mt * 8, select(native_exp(sv##R - (blk ? mnb : mna)), (float8)0, isinf(sv##R))); \
+                if (t < 64 && mt == 0) { a_sh[nt * 4 + (R)] = aa; a_sh1[nt * 4 + (R)] = ab; } \
+                m_q##R = nb > 1 ? mnb : mna; }
+            EXC_STEP2(0) EXC_STEP2(1) EXC_STEP2(2) EXC_STEP2(3)
+            #undef EXC_STEP2
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (t < FA2_BQ) {
+            // row t's sums, block by block, in the plain path's order (8 strided lane sums, then 4-2-1)
+            float8 l8 = (float8)0;
+            for (int k = 0; k < FA2_BK; k += 8) l8 += EXC_PLOAD8(t, k);
+            float4 l4 = l8.lo + l8.hi; float2 l2 = l4.lo + l4.hi;
+            l_q = a_sh[t] * l_q + (l2.s0 + l2.s1);
+            if (nb > 1) {
+                l8 = (float8)0;
+                for (int k = 0; k < FA2_BK; k += 8) l8 += EXC_PLOAD8(t, FA2_BK + k);
+                l4 = l8.lo + l8.hi; l2 = l4.lo + l4.hi;
+                l_q = a_sh1[t] * l_q + (l2.s0 + l2.s1);
+            }
+        }
+        for (int bb = 0; bb < nb; ++bb) {
+            const int vk0 = bb ? vkb : vka;
+            if (bb) { o0 *= a_sh1[pv_nt * 4 + 0]; o1 *= a_sh1[pv_nt * 4 + 1]; o2 *= a_sh1[pv_nt * 4 + 2]; o3 *= a_sh1[pv_nt * 4 + 3]; }
+            else    { o0 *= a_sh [pv_nt * 4 + 0]; o1 *= a_sh [pv_nt * 4 + 1]; o2 *= a_sh [pv_nt * 4 + 2]; o3 *= a_sh [pv_nt * 4 + 3]; }
+            for (int kk = 0; kk < FA2_BK; kk += 4) {
+                const int vt = v_head + (vk0 + kk) * v_tok_tex + pv_mt * 2;
+                half8 V0, V1, V2, V3;
+#if FA_EXC_TEX128
+                V0 = as_half8(read_imageui(v_img, (vt                ) >> 1));
+                V1 = as_half8(read_imageui(v_img, (vt +     v_tok_tex) >> 1));
+                V2 = as_half8(read_imageui(v_img, (vt + 2 * v_tok_tex) >> 1));
+                V3 = as_half8(read_imageui(v_img, (vt + 3 * v_tok_tex) >> 1));
+#else
+                V0.s0123 = read_imageh(v_img, vt);                   V0.s4567 = read_imageh(v_img, vt + 1);
+                V1.s0123 = read_imageh(v_img, vt + v_tok_tex);       V1.s4567 = read_imageh(v_img, vt + v_tok_tex + 1);
+                V2.s0123 = read_imageh(v_img, vt + 2 * v_tok_tex);   V2.s4567 = read_imageh(v_img, vt + 2 * v_tok_tex + 1);
+                V3.s0123 = read_imageh(v_img, vt + 3 * v_tok_tex);   V3.s4567 = read_imageh(v_img, vt + 3 * v_tok_tex + 1);
+#endif
+                const int pc = bb * FA2_BK + kk;
+                const float4 p0 = EXC_PLOAD4(pv_nt * 4 + 0, pc), p1 = EXC_PLOAD4(pv_nt * 4 + 1, pc);
+                const float4 p2 = EXC_PLOAD4(pv_nt * 4 + 2, pc), p3 = EXC_PLOAD4(pv_nt * 4 + 3, pc);
+                // key-major, so one converted V vector is live at a time; every row still adds keys kk .. kk + 3 in order
+                float8 v = convert_float8(V0); o0 += v*p0.s0; o1 += v*p1.s0; o2 += v*p2.s0; o3 += v*p3.s0;
+                v = convert_float8(V1);        o0 += v*p0.s1; o1 += v*p1.s1; o2 += v*p2.s1; o3 += v*p3.s1;
+                v = convert_float8(V2);        o0 += v*p0.s2; o1 += v*p1.s2; o2 += v*p2.s2; o3 += v*p3.s2;
+                v = convert_float8(V3);        o0 += v*p0.s3; o1 += v*p1.s3; o2 += v*p2.s3; o3 += v*p3.s3;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (stop) { s_tail = n_list; break; }
+        s_tail = s + 2;
+    }
+    if (s_tail < n_list) {
+        // hand the running max to the single-block loop's row mapping
+        if (t < 64 && (t & 7) == 0) { m_run[(t >> 3) * 4] = m_q0; m_run[(t >> 3) * 4 + 1] = m_q1; m_run[(t >> 3) * 4 + 2] = m_q2; m_run[(t >> 3) * 4 + 3] = m_q3; }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        m_r0 = m_run[(t >> 3) * 2]; m_r1 = m_run[(t >> 3) * 2 + 1];
+    }
+#else
+    const int s_tail = 0;
+#endif
+    for (int s = s_tail; s < n_list; ++s) {
 #if K_NAT
         const int cb  = list_sh[s];          // absolute block
         const int vk0 = cb * FA2_BK;
@@ -4990,6 +5312,12 @@ void fa_exc(__read_only image1d_buffer_t kt_img, __read_only image1d_buffer_t v_
                 B1 = vload8(0, kt + (long) (tb +     M_4kv) * 4);
                 B2 = vload8(0, kt + (long) (tb + 2 * M_4kv) * 4);
                 B3 = vload8(0, kt + (long) (tb + 3 * M_4kv) * 4);
+#elif FA_EXC_TEX128
+                // one 16-byte texel = this thread's 8 keys at one d (tb and M_4kv are even)
+                B0 = as_half8(read_imageui(kt_img, (tb            ) >> 1));
+                B1 = as_half8(read_imageui(kt_img, (tb +     M_4kv) >> 1));
+                B2 = as_half8(read_imageui(kt_img, (tb + 2 * M_4kv) >> 1));
+                B3 = as_half8(read_imageui(kt_img, (tb + 3 * M_4kv) >> 1));
 #else
                 B0.s0123 = read_imageh(kt_img, tb);              B0.s4567 = read_imageh(kt_img, tb + 1);
                 B1.s0123 = read_imageh(kt_img, tb + M_4kv);      B1.s4567 = read_imageh(kt_img, tb + M_4kv + 1);
@@ -4997,20 +5325,61 @@ void fa_exc(__read_only image1d_buffer_t kt_img, __read_only image1d_buffer_t v_
                 B3.s0123 = read_imageh(kt_img, tb + 3 * M_4kv);  B3.s4567 = read_imageh(kt_img, tb + 3 * M_4kv + 1);
 #endif
                 const float8 b0 = convert_float8(B0), b1 = convert_float8(B1), b2 = convert_float8(B2), b3 = convert_float8(B3);
-                const float4 wa = q_load4(Qh + (long) qr0 * q_row_f + i);
-                const float4 wb = q_load4(Qh + (long) qr1 * q_row_f + i);
+                const float4 wa = EXC_QLOAD4(qr0, i);
+                const float4 wb = EXC_QLOAD4(qr1, i);
                 c0 += b0*wa.s0; c0 += b1*wa.s1; c0 += b2*wa.s2; c0 += b3*wa.s3;
                 c1 += b0*wb.s0; c1 += b1*wb.s1; c1 += b2*wb.s2; c1 += b3*wb.s3;
             }
 #endif
             const int kb = vk0 + mt * 8;
+#if FA_EXC_FSM
+            // the plain path's softmax on this thread's 2 rows x 8 keys: the row max is exact in any order, P and the
+            // rescale factor use the same expressions; the row sums are taken from P below in the plain path's order
+            float8 sv0 = c0 * scale; sv0 += convert_float8(vload8(0, Mk + (long) qr0 * mask_row_h + kb));
+            float8 sv1 = c1 * scale; sv1 += convert_float8(vload8(0, Mk + (long) qr1 * mask_row_h + kb));
+            float4 h4 = fmax(sv0.lo, sv0.hi); float2 h2 = fmax(h4.lo, h4.hi); float mx0 = fmax(h2.s0, h2.s1);
+            h4 = fmax(sv1.lo, sv1.hi); h2 = fmax(h4.lo, h4.hi); float mx1 = fmax(h2.s0, h2.s1);
+#ifdef EXC_SHFL_XOR
+            // the 8 threads of a row pair are 8 consecutive lanes of a subgroup (an Adreno wave is 64 or 128 lanes)
+            if (get_max_sub_group_size() >= 8) {
+                mx0 = fmax(mx0, EXC_SHFL_XOR(mx0, 1)); mx1 = fmax(mx1, EXC_SHFL_XOR(mx1, 1));
+                mx0 = fmax(mx0, EXC_SHFL_XOR(mx0, 2)); mx1 = fmax(mx1, EXC_SHFL_XOR(mx1, 2));
+                mx0 = fmax(mx0, EXC_SHFL_XOR(mx0, 4)); mx1 = fmax(mx1, EXC_SHFL_XOR(mx1, 4));
+            } else
+#endif
+            {
+                // through the (free) P tile: row r, column mt holds the thread's partial max until the P writes below
+                EXC_MXF(nt * 2, mt) = mx0; EXC_MXF(nt * 2 + 1, mt) = mx1;
+                barrier(CLK_LOCAL_MEM_FENCE);
+                float8 r8 = vload8(0, &EXC_MXF(nt * 2, 0));     h4 = fmax(r8.lo, r8.hi); h2 = fmax(h4.lo, h4.hi); mx0 = fmax(h2.s0, h2.s1);
+                r8        = vload8(0, &EXC_MXF(nt * 2 + 1, 0)); h4 = fmax(r8.lo, r8.hi); h2 = fmax(h4.lo, h4.hi); mx1 = fmax(h2.s0, h2.s1);
+                barrier(CLK_LOCAL_MEM_FENCE);
+            }
+            const float mn0 = fmax(m_r0, mx0), mn1 = fmax(m_r1, mx1);
+            const float a0 = (m_r0 == -INFINITY) ? 0.0f : native_exp(m_r0 - mn0);
+            const float a1 = (m_r1 == -INFINITY) ? 0.0f : native_exp(m_r1 - mn1);
+            EXC_PSTORE8(nt * 2,     mt * 8, select(native_exp(sv0 - mn0), (float8)0, isinf(sv0)));
+            EXC_PSTORE8(nt * 2 + 1, mt * 8, select(native_exp(sv1 - mn1), (float8)0, isinf(sv1)));
+            if (mt == 0) { a_sh[nt * 2] = a0; a_sh[nt * 2 + 1] = a1; }
+            m_r0 = mn0; m_r1 = mn1;
+#else
             #define EMITS(NN, CV, QR) { float8 v = (CV) * scale; \
                 v += convert_float8(vload8(0, Mk + (long) (QR) * mask_row_h + kb)); \
                 vstore8(v, 0, &S_lds[nt * 2 + (NN)][mt * 8]); }
             EMITS(0, c0, qr0); EMITS(1, c1, qr1);
             #undef EMITS
+#endif
         }
         barrier(CLK_LOCAL_MEM_FENCE);
+#if FA_EXC_FSM
+        if (t < FA2_BQ) {
+            // row t's sum, in the plain path's order (8 strided lane sums, then 4-2-1)
+            float8 l8 = (float8)0;
+            for (int k = 0; k < FA2_BK; k += 8) l8 += EXC_PLOAD8(t, k);
+            float4 l4 = l8.lo + l8.hi; float2 l2 = l4.lo + l4.hi;
+            l_q = a_sh[t] * l_q + (l2.s0 + l2.s1);
+        }
+#else
         if (t < FA2_BQ) {
             const int q = t; __local float * row = S_lds[q];
             float8 mx = (float8)(-INFINITY);
@@ -5028,17 +5397,26 @@ void fa_exc(__read_only image1d_buffer_t kt_img, __read_only image1d_buffer_t v_
             l_run[q] = a * l_run[q] + (l2.s0 + l2.s1); m_run[q] = m_new; a_sh[q] = a;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
+#endif
         o0 *= a_sh[pv_nt * 4 + 0]; o1 *= a_sh[pv_nt * 4 + 1]; o2 *= a_sh[pv_nt * 4 + 2]; o3 *= a_sh[pv_nt * 4 + 3];
         for (int kk = 0; kk < FA2_BK; kk += 4) {
             const int vt = v_head + (vk0 + kk) * v_tok_tex + pv_mt * 2;
             half8 V0, V1, V2, V3;
+#if FA_EXC_TEX128
+            // one 16-byte texel = 8 dims of one key (vt and v_tok_tex are even)
+            V0 = as_half8(read_imageui(v_img, (vt                ) >> 1));
+            V1 = as_half8(read_imageui(v_img, (vt +     v_tok_tex) >> 1));
+            V2 = as_half8(read_imageui(v_img, (vt + 2 * v_tok_tex) >> 1));
+            V3 = as_half8(read_imageui(v_img, (vt + 3 * v_tok_tex) >> 1));
+#else
             V0.s0123 = read_imageh(v_img, vt);                   V0.s4567 = read_imageh(v_img, vt + 1);
             V1.s0123 = read_imageh(v_img, vt + v_tok_tex);       V1.s4567 = read_imageh(v_img, vt + v_tok_tex + 1);
             V2.s0123 = read_imageh(v_img, vt + 2 * v_tok_tex);   V2.s4567 = read_imageh(v_img, vt + 2 * v_tok_tex + 1);
             V3.s0123 = read_imageh(v_img, vt + 3 * v_tok_tex);   V3.s4567 = read_imageh(v_img, vt + 3 * v_tok_tex + 1);
+#endif
             const float8 v0 = convert_float8(V0), v1 = convert_float8(V1), v2 = convert_float8(V2), v3 = convert_float8(V3);
-            float4 p0 = vload4(0, &S_lds[pv_nt * 4 + 0][kk]); float4 p1 = vload4(0, &S_lds[pv_nt * 4 + 1][kk]);
-            float4 p2 = vload4(0, &S_lds[pv_nt * 4 + 2][kk]); float4 p3 = vload4(0, &S_lds[pv_nt * 4 + 3][kk]);
+            float4 p0 = EXC_PLOAD4(pv_nt * 4 + 0, kk); float4 p1 = EXC_PLOAD4(pv_nt * 4 + 1, kk);
+            float4 p2 = EXC_PLOAD4(pv_nt * 4 + 2, kk); float4 p3 = EXC_PLOAD4(pv_nt * 4 + 3, kk);
             o0 += v0*p0.s0; o0 += v1*p0.s1; o0 += v2*p0.s2; o0 += v3*p0.s3;
             o1 += v0*p1.s0; o1 += v1*p1.s1; o1 += v2*p1.s2; o1 += v3*p1.s3;
             o2 += v0*p2.s0; o2 += v1*p2.s1; o2 += v2*p2.s2; o2 += v3*p2.s3;
@@ -5046,9 +5424,28 @@ void fa_exc(__read_only image1d_buffer_t kt_img, __read_only image1d_buffer_t v_
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
+    #undef EXC_QLOAD4
+#if FA_EXC_QK2B
+    // the epilogue reads the running max and sum from local memory (from the loop that ran last)
+    if (s_tail < n_list) {
+        if ((t & 7) == 0) { m_run[(t >> 3) * 2] = m_r0; m_run[(t >> 3) * 2 + 1] = m_r1; }
+    } else if (t < 64 && (t & 7) == 0) {
+        m_run[(t >> 3) * 4] = m_q0; m_run[(t >> 3) * 4 + 1] = m_q1; m_run[(t >> 3) * 4 + 2] = m_q2; m_run[(t >> 3) * 4 + 3] = m_q3;
+    }
+    if (t < FA2_BQ) l_run[t] = l_q;
+#elif FA_EXC_FSM
+    // the epilogue reads the running max and sum from local memory
+    if ((t & 7) == 0) { m_run[(t >> 3) * 2] = m_r0; m_run[(t >> 3) * 2 + 1] = m_r1; }
+    if (t < FA2_BQ) l_run[t] = l_q;
+#endif
+#if FA_EXC_LDS_PAD > 0
+    if (n_list < 0) { lds_pad[t % ((FA_EXC_LDS_PAD + 3) / 4)] = (uint) t; barrier(CLK_LOCAL_MEM_FENCE); l_run[t & (FA2_BQ - 1)] = (float) lds_pad[(t + 1) % ((FA_EXC_LDS_PAD + 3) / 4)]; }
+#endif
 
     barrier(CLK_LOCAL_MEM_FENCE);
-    const long r0 = (long) bh * Sq + q0;
+    const int  tr = TILE_ROWS && ((Sq * G) & 31) == 0;   // HTP_FA_FOLD_TILE_ROWS_OK
+    const long r0 = tr ? ((long) kvh * Sq + q0) * G + (bh - kvh * G) : (long) bh * Sq + q0;
+    const long rs = tr ? G : 1;
     __global float * Fm = (__global float *)(hbuf + f_m);
     __global float * Fl = (__global float *)(hbuf + f_l);
 #if ACC_F16
@@ -5058,15 +5455,15 @@ void fa_exc(__read_only image1d_buffer_t kt_img, __read_only image1d_buffer_t v_
 #endif
     if (t < FA2_BQ && q0 + t < Sq) {
         const float l = l_run[t];
-        Fm[r0 + t] = (l > 0.0f) ? m_run[t] : M_EMPTY;
-        Fl[r0 + t] = l;
+        Fm[r0 + t * rs] = (l > 0.0f) ? m_run[t] : M_EMPTY;
+        Fl[r0 + t * rs] = l;
     }
 #if ACC_F16
     #define OWRITE(NN, OV) { const int q = pv_nt * 4 + (NN); const float l = l_run[q]; \
-        if (q0 + q < Sq) vstore_half8((l > 0.0f) ? (OV) : (float8)0, 0, Fa + (r0 + q) * FA_D + pv_d0); }
+        if (q0 + q < Sq) vstore_half8((l > 0.0f) ? (OV) : (float8)0, 0, Fa + (r0 + q * rs) * FA_D + pv_d0); }
 #else
     #define OWRITE(NN, OV) { const int q = pv_nt * 4 + (NN); const float l = l_run[q]; \
-        if (q0 + q < Sq) vstore8((l > 0.0f) ? (OV) : (float8)0, 0, Fa + (r0 + q) * FA_D + pv_d0); }
+        if (q0 + q < Sq) vstore8((l > 0.0f) ? (OV) : (float8)0, 0, Fa + (r0 + q * rs) * FA_D + pv_d0); }
 #endif
     OWRITE(0, o0); OWRITE(1, o1); OWRITE(2, o2); OWRITE(3, o3);
     #undef OWRITE
@@ -5097,6 +5494,10 @@ void fa_exc(__read_only image1d_buffer_t kt_img, __read_only image1d_buffer_t v_
     if (chain != 2) break;
     barrier(CLK_LOCAL_MEM_FENCE);
     }   // persistent loop
+    #undef EXC_PSTORE8
+    #undef EXC_PLOAD8
+    #undef EXC_PLOAD4
+    #undef EXC_MXF
 }
 )CL";
 
@@ -5105,7 +5506,7 @@ struct hfold_chain { bool enq = false; std::chrono::steady_clock::time_point t_e
 struct ggml_hexagon_hfold_job {
     const ggml_tensor * node = nullptr;
     uint32_t want = 0;
-    cl_mem   q = nullptr, k = nullptr, v_img = nullptr, m = nullptr, k_img = nullptr;
+    cl_mem   q = nullptr, k = nullptr, v_img = nullptr, m = nullptr, k_img = nullptr, q_img = nullptr;
     uint32_t q_off = 0, q_nb1 = 0, q_nb2 = 0, k_off = 0, k_nb1 = 0, k_nb2 = 0, v_off = 0, v_nb1 = 0, v_nb2 = 0, m_off = 0, m_nb1 = 0;
     uint32_t Sq = 0, nh = 0, nkvh = 0, G = 0, nbk = 0, num_sb = 0, num_qb = 0;
     uint32_t br = 0, n_stages = 0;      // the kernel's query tile rows; stages = query blocks or KV heads
@@ -5151,6 +5552,7 @@ struct ggml_hexagon_hfold {
     uint64_t         n_keep = 0;
     size_t           max_img_texels = 0;
     cl_mem           hbuf = nullptr, kt_img = nullptr;           // alias + K^T texture view of buf
+    cl_mem           kt_img_u32 = nullptr;                       // uint32 RGBA view of buf (16-byte K^T texels, HFOLD_EXC_TEX128)
     cl_mem           ready_sub = nullptr;                        // sub-buffer of hbuf at the ready word (gate polls it)
     uint64_t         n_gate_ion = 0;                             // gates opened by the ION word before the SVM mirror
     uint8_t *        svm_tabs = nullptr;                         // SVMTAB probe: tables here instead of buf
@@ -5158,6 +5560,7 @@ struct ggml_hexagon_hfold {
     size_t           svm_tabs_bytes = 0, svm_q_bytes = 0;
     std::unordered_map<int, cl_mem> aliases;                     // by rpcmem fd
     std::unordered_map<int, cl_mem> images;                      // RGBA-half view of a whole alias, by fd
+    std::unordered_map<int, cl_mem> images_u32;                  // RGBA-uint32 view of a whole alias, by fd (HFOLD_EXC_TEX128 / _QIMG)
     std::unordered_map<const ggml_tensor *, ggml_hexagon_hfold_job> jobs;
     uint32_t seq = 0;
 
@@ -5167,8 +5570,32 @@ struct ggml_hexagon_hfold {
     std::deque<std::vector<ggml_hexagon_hfold_job>> batches;
     bool                    stop = false, busy = false;
     uint64_t n_batches = 0, n_jobs = 0, n_ready_timeouts = 0, n_gpu_err = 0;
+    uint64_t n_tr_jobs = 0;   // jobs whose partial is in tile row order (GGML_HEXAGON_FA_FOLD_TILE_ROWS and the shape allows it)
+    uint64_t n_tr_alloc = 0;  // of those, posted since the fold buffer (and its status words) was last allocated
+    bool     tr_verified = false;   // the skel has counted a tile-row op (hfold_check_tile_rows)
     double   us_ready = 0, us_gpu = 0;   // summed over jobs: ready wait, GPU (first enqueue -> last head done)
 };
+
+// A skel that predates HTP_FA_FOLD_F_TILE_ROWS reads the GPU partial head-major: wrong rows, finite outputs, no error
+// anywhere. Called where every op of the jobs counted in n_tr_alloc has finished (the next graph_compute with the
+// default synchronous flush, or teardown): the DSP must have counted at least one of them in HTP_FA_FOLD_ST_TILE_ROWS.
+static void hfold_check_tile_rows(ggml_hexagon_hfold * h) {
+    if (!opt_fa_fold_tile_rows || h->tr_verified || !h->n_tr_alloc || !h->base) return;
+    hetero_dc_civac(h->base + h->off_ctl + HTP_FA_HETERO_STATUS_OFF, HTP_FA_FOLD_ST_N * sizeof(uint32_t));
+    const volatile uint32_t * st = (const volatile uint32_t *) (h->base + h->off_ctl + HTP_FA_HETERO_STATUS_OFF);
+    if (!st[HTP_FA_FOLD_ST_TILE_ROWS]) {
+        GGML_ABORT("ggml-hex: fa-fold: GGML_HEXAGON_FA_FOLD_TILE_ROWS=1 but no DSP op of %llu tile-row jobs read tile rows: "
+                   "the skel predates HTP_FA_FOLD_F_TILE_ROWS (deploy the host library and the skel together)",
+                   (unsigned long long) h->n_tr_alloc);
+    }
+    h->tr_verified = true;
+}
+
+// The GPU partial's row of (query head bh, token t): head-major, or the DSP tile's order (GGML_HEXAGON_FA_FOLD_TILE_ROWS).
+static size_t hfold_prow(const ggml_hexagon_hfold_job & j, uint32_t bh, uint32_t t) {
+    const bool tr = opt_fa_fold_tile_rows && HTP_FA_FOLD_TILE_ROWS_OK(j.Sq, j.G);
+    return tr ? ((size_t) (bh / j.G) * j.Sq + t) * j.G + bh % j.G : (size_t) bh * j.Sq + t;
+}
 
 static bool hfold_cl_check(cl_int err, const char * what) {
     if (err != CL_SUCCESS) {
@@ -5228,6 +5655,38 @@ static cl_mem ggml_hexagon_hfold_image(ggml_hexagon_hfold * h, ggml_backend_buff
     return img;
 }
 
+// RGBA-uint32 view over a whole alias: one texel = 16 bytes, read as raw bits (8 halves or 4 floats).
+static cl_mem ggml_hexagon_hfold_image_u32(ggml_hexagon_hfold * h, ggml_backend_buffer_t buffer) {
+    auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(buffer->context);
+    auto it = h->images_u32.find(sbuf->fd);
+    if (it != h->images_u32.end()) {
+        return it->second;
+    }
+    cl_mem alias = ggml_hexagon_hfold_alias(h, buffer);
+    if (!alias) return nullptr;
+    const size_t texels = (sbuf->size & ~(size_t) 4095) / 16;
+    if (texels > h->max_img_texels) {
+        GGML_LOG_ERROR("ggml-hex: fa-fold: buffer fd %d needs %zu 16-byte texels, the device caps a 1D image buffer at %zu\n",
+                       sbuf->fd, texels, h->max_img_texels);
+        return nullptr;
+    }
+    cl_image_format fmt = { CL_RGBA, CL_UNSIGNED_INT32 };
+    cl_image_desc   dk; memset(&dk, 0, sizeof(dk));
+    dk.image_type  = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+    dk.image_width = texels;
+    dk.buffer      = alias;
+    cl_int err;
+    cl_mem img = clCreateImage(h->ctx, CL_MEM_READ_WRITE, &fmt, &dk, nullptr, &err);
+    if (!hfold_cl_check(err, "clCreateImage (RGBA uint32 view)")) return nullptr;
+    h->images_u32[sbuf->fd] = img;
+    return img;
+}
+
+// the K^T image the staging kernels write and fa_exc reads: both use the same view
+static cl_mem hfold_kt_image(const ggml_hexagon_hfold * h) {
+    return (opt_fa_fold_exc & HFOLD_EXC_TEX128) ? h->kt_img_u32 : h->kt_img;
+}
+
 static void ggml_hexagon_hfold_relay_main(ggml_hexagon_hfold * h);
 static void ggml_hexagon_hfold_log_summary(ggml_hexagon_hfold * h);
 static void hfold_enqueue_chain(ggml_hexagon_hfold * h, const ggml_hexagon_hfold_job & j, hfold_chain & c);
@@ -5277,7 +5736,33 @@ static bool ggml_hexagon_hfold_init(ggml_hexagon_session * sess) {
         if (opt_fa_fold_qatomic) bopts += " -DQ_ATOMIC=1";
         if (opt_fa_fold_wgfence) bopts += " -DWG_FENCE=1";
         if (opt_fa_fold_acc16)   bopts += " -DACC_F16=1";
+        if (opt_fa_fold_tile_rows) bopts += " -DTILE_ROWS=1";
         if (opt_fa_fold_knat)    bopts += " -DK_NAT=1";
+        if (opt_fa_fold_exc & HFOLD_EXC_TEX128) bopts += " -DFA_EXC_TEX128=1";
+        if (opt_fa_fold_exc & HFOLD_EXC_FSM)    bopts += " -DFA_EXC_FSM=1";
+        if (opt_fa_fold_exc & HFOLD_EXC_QIMG)   bopts += " -DFA_EXC_QIMG=1";
+        if (opt_fa_fold_exc & HFOLD_EXC_P16)    bopts += " -DFA_EXC_P16=1";
+        if (opt_fa_fold_exc & HFOLD_EXC_QK2B)   bopts += " -DFA_EXC_QK2B=1";
+        if (opt_fa_fold_exc & (HFOLD_EXC_FSM | HFOLD_EXC_P16 | HFOLD_EXC_QK2B)) {
+            // the fused softmax's row max uses subgroup shuffles only if the extension macro is defined (kernel note)
+            size_t ext_len = 0;
+            clGetDeviceInfo(h->dev, CL_DEVICE_EXTENSIONS, 0, nullptr, &ext_len);
+            std::string ext(ext_len, '\0');
+            clGetDeviceInfo(h->dev, CL_DEVICE_EXTENSIONS, ext_len, ext.data(), nullptr);
+            const char * path = ext.find("cl_khr_subgroups") == std::string::npos ? "local memory (no cl_khr_subgroups)"
+                                                                                  : "local memory (no subgroup shuffle extension)";
+            if (ext.find("cl_khr_subgroups") != std::string::npos) {
+                if (ext.find("cl_qcom_subgroup_shuffle") != std::string::npos) {
+                    bopts += " -D cl_qcom_subgroup_shuffle=1"; path = "cl_qcom_subgroup_shuffle";
+                } else if (ext.find("cl_khr_subgroup_shuffle") != std::string::npos) {
+                    bopts += " -D cl_khr_subgroup_shuffle=1"; path = "cl_khr_subgroup_shuffle";
+                }
+            }
+            if (opt_fa_fold_clopts.find("FA_EXC_NO_SHFL") != std::string::npos) path = "local memory (FA_EXC_NO_SHFL)";
+            GGML_LOG_INFO("ggml-hex: fa-fold: fused softmax row max through %s\n", path);
+        }
+        if (!opt_fa_fold_clopts.empty())        bopts += " " + opt_fa_fold_clopts;
+        if (opt_fa_fold_exc || !opt_fa_fold_clopts.empty()) GGML_LOG_INFO("ggml-hex: fa-fold: kernel build options '%s'\n", bopts.c_str());
         err = clBuildProgram(h->prog, 1, &h->dev, bopts.c_str(), nullptr, nullptr);
     }
     if (err != CL_SUCCESS) {
@@ -5363,6 +5848,7 @@ static void ggml_hexagon_hfold_wait_idle(ggml_hexagon_hfold * h) {
 static bool ggml_hexagon_hfold_ensure_buffer(ggml_hexagon_hfold * h, uint32_t rows, uint32_t neq1, uint32_t nkvh, uint32_t D,
                                              uint32_t nbk_cap, uint32_t num_sb_cap, bool qbh) {
     auto al = [](size_t v, size_t a) { return (v + a - 1) & ~(a - 1); };
+    const bool tile_rows = opt_fa_fold_tile_rows && HTP_FA_FOLD_TILE_ROWS_OK(neq1, rows / neq1 / nkvh);   // this shape, as fa_exc decides
     const bool fits = h->buf && rows <= h->rows && neq1 <= h->neq1 && nkvh == h->nkvh && D == h->D &&
                       nbk_cap <= h->nbk_cap && num_sb_cap <= h->num_sb_cap;
     if (!fits) {
@@ -5371,6 +5857,8 @@ static bool ggml_hexagon_hfold_ensure_buffer(ggml_hexagon_hfold * h, uint32_t ro
         if (h->buf) {
             auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(h->buf->context);
             if (h->ready_sub) { clReleaseMemObject(h->ready_sub); h->ready_sub = nullptr; }
+            auto iu = h->images_u32.find(sbuf->fd); if (iu != h->images_u32.end()) { clReleaseMemObject(iu->second); h->images_u32.erase(iu); }
+            h->kt_img_u32 = nullptr;
             auto ia = h->aliases.find(sbuf->fd); if (ia != h->aliases.end()) { clReleaseMemObject(ia->second); h->aliases.erase(ia); }
             auto ii = h->images.find(sbuf->fd);  if (ii != h->images.end())  { clReleaseMemObject(ii->second); h->images.erase(ii); }
             if (h->tctx) { ggml_free(h->tctx); h->tctx = nullptr; }
@@ -5399,6 +5887,7 @@ static bool ggml_hexagon_hfold_ensure_buffer(ggml_hexagon_hfold * h, uint32_t ro
         if (!h->buf) { GGML_LOG_ERROR("ggml-hex: fa-fold: fold buffer alloc (%zu MB) failed\n", h->size >> 20); return false; }
         h->base = (uint8_t *) ggml_backend_buffer_get_base(h->buf);
         memset(h->base, 0, h->size);
+        h->n_tr_alloc = 0; h->tr_verified = false;   // the status words start over
         // Keep the DSP sequence equal to the relay sequence when the buffer grows.
         *(uint32_t *) (h->base + h->off_ctl) = h->seq;
         hetero_dc_civac(h->base, h->size);
@@ -5411,6 +5900,10 @@ static bool ggml_hexagon_hfold_ensure_buffer(ggml_hexagon_hfold * h, uint32_t ro
         h->hbuf   = ggml_hexagon_hfold_alias(h, h->buf);
         h->kt_img = h->hbuf ? ggml_hexagon_hfold_image(h, h->buf) : nullptr;
         if (!h->hbuf || !h->kt_img) return false;
+        if (opt_fa_fold_exc & HFOLD_EXC_TEX128) {
+            h->kt_img_u32 = ggml_hexagon_hfold_image_u32(h, h->buf);
+            if (!h->kt_img_u32) return false;
+        }
         if (h->ready_sub) { clReleaseMemObject(h->ready_sub); h->ready_sub = nullptr; }
         {
             cl_int err2 = CL_SUCCESS;
@@ -5441,7 +5934,8 @@ static bool ggml_hexagon_hfold_ensure_buffer(ggml_hexagon_hfold * h, uint32_t ro
     hdr.off_m = (uint32_t) h->off_m; hdr.off_l = (uint32_t) h->off_l; hdr.off_acc = (uint32_t) h->off_acc;
     hdr.flags = HTP_FA_FOLD_F_LIVE | HTP_FA_FOLD_F_FLUSH_KV | HTP_FA_FOLD_F_STAGED | HTP_FA_FOLD_F_INSTORE |
                 (opt_fa_fold_flush ? 0u : HTP_FA_FOLD_F_NOFLUSH) | (opt_fa_fold_stage_qb ? HTP_FA_FOLD_F_STAGE_QB : 0u) |
-                (qbh ? HTP_FA_FOLD_F_STAGE_QBH : 0u) | (opt_fa_fold_acc16 ? HTP_FA_FOLD_F_ACC_F16 : 0u) | (uint32_t) opt_fa_fold_probe;
+                (qbh ? HTP_FA_FOLD_F_STAGE_QBH : 0u) | (opt_fa_fold_acc16 ? HTP_FA_FOLD_F_ACC_F16 : 0u) |
+                (tile_rows ? HTP_FA_FOLD_F_TILE_ROWS : 0u) | (uint32_t) opt_fa_fold_probe;
     hdr.slot = 0; hdr.off_ctl = (uint32_t) h->off_ctl; hdr.timeout_us = 2000000;
     hdr.off_exc = 0; hdr.exc_nbk = 0;   // the membership is src[8]
     hdr.off_done = (uint32_t) h->off_done;
@@ -5510,6 +6004,18 @@ static bool ggml_hexagon_hfold_prepare(ggml_hexagon_session * sess, ggml_tensor 
     job.m_off = off(m); job.m_nb1 = (uint32_t) m->nb[1];
     job.em_off = off(em);
     if (job.v_off % 8 || job.k_off % 8) return false;
+    // 16-byte texel variants address whole texels (hexagon tensors are 128-byte aligned, so this never declines in practice)
+    if ((opt_fa_fold_exc & HFOLD_EXC_TEX128) && (job.v_off % 16 || job.v_nb1 % 16 || job.v_nb2 % 16)) {
+        GGML_LOG_ERROR("ggml-hex: fa-fold: %s: V view not 16-byte aligned for GGML_HEXAGON_FA_FOLD_EXC bit 1; node not split\n", n->name);
+        return false;
+    }
+    if ((opt_fa_fold_exc & HFOLD_EXC_QIMG) && job.q_off % 16) {
+        GGML_LOG_ERROR("ggml-hex: fa-fold: %s: Q view not 16-byte aligned for GGML_HEXAGON_FA_FOLD_EXC bit 4; node not split\n", n->name);
+        return false;
+    }
+    if (opt_fa_fold_exc & HFOLD_EXC_TEX128) job.v_img = ggml_hexagon_hfold_image_u32(h, v->buffer);
+    if (opt_fa_fold_exc & HFOLD_EXC_QIMG)   job.q_img = ggml_hexagon_hfold_image_u32(h, q->buffer);
+    if (!job.v_img || ((opt_fa_fold_exc & HFOLD_EXC_QIMG) && !job.q_img)) return false;
     job.Sq = Sq; job.nh = nh; job.nkvh = nkvh; job.G = G; job.nbk = nbk; job.num_sb = num_sb; job.num_qb = (Sq + 31) / 32;
     job.br = kp->Br; job.qbh = qbh;
     job.n_stages = qbh ? n_qbt * nkvh : opt_fa_fold_stage_qb ? n_qbt : nkvh;
@@ -5530,6 +6036,8 @@ static bool ggml_hexagon_hfold_prepare(ggml_hexagon_session * sess, ggml_tensor 
 // Once per graph_compute with the nodes about to be queued, in execution order.
 static void ggml_hexagon_hfold_post(ggml_hexagon_session * sess, const std::vector<htp_opnode> & nodes) {
     ggml_hexagon_hfold * h = sess->hfold;
+    // the previous graph_compute flushed (opt_async 0): its tile-row ops have run
+    if (!opt_async) hfold_check_tile_rows(h);
     std::vector<ggml_hexagon_hfold_job> batch;
     {
         std::lock_guard<std::mutex> lk(h->mu);
@@ -5539,6 +6047,8 @@ static void ggml_hexagon_hfold_post(ggml_hexagon_session * sess, const std::vect
             if (it == h->jobs.end() || node.node->src[7] != h->ctrl) continue;
             ggml_hexagon_hfold_job job = it->second;
             job.want = ++h->seq;
+            const bool tr = opt_fa_fold_tile_rows && HTP_FA_FOLD_TILE_ROWS_OK(job.Sq, job.G);
+            h->n_tr_jobs += tr; h->n_tr_alloc += tr;
             batch.push_back(job);
         }
         if (batch.empty()) return;
@@ -5571,10 +6081,11 @@ static hfold_tab_offs hfold_tabs_of(ggml_hexagon_hfold * h, bool svm_tabs) {
 static void hfold_args_stage_k(ggml_hexagon_hfold * h, const ggml_hexagon_hfold_job & j, const hfold_tab_offs & to, cl_int n_stage, cl_uint want) {
     const cl_int k_off = (cl_int) j.k_off, k_nb1 = (cl_int) j.k_nb1, k_nb2 = (cl_int) j.k_nb2;
     const cl_int abs_stride = (cl_int) h->nbk_cap, kt_base_tex = (cl_int) (h->off_kt / 8);
+    const cl_mem kt_img = hfold_kt_image(h);
     int a = 0;
     clSetKernelArg(h->k_stage, a++, sizeof(cl_mem), &j.k);
     clSetKernelArg(h->k_stage, a++, sizeof(cl_int), &k_off); clSetKernelArg(h->k_stage, a++, sizeof(cl_int), &k_nb1); clSetKernelArg(h->k_stage, a++, sizeof(cl_int), &k_nb2);
-    clSetKernelArg(h->k_stage, a++, sizeof(cl_mem), &h->kt_img); clSetKernelArg(h->k_stage, a++, sizeof(cl_int), &kt_base_tex);
+    clSetKernelArg(h->k_stage, a++, sizeof(cl_mem), &kt_img); clSetKernelArg(h->k_stage, a++, sizeof(cl_int), &kt_base_tex);
     hfold_set_tabs(h, h->k_stage, a++);
     clSetKernelArg(h->k_stage, a++, sizeof(cl_int), &to.abs); clSetKernelArg(h->k_stage, a++, sizeof(cl_int), &to.cnt);
     clSetKernelArg(h->k_stage, a++, sizeof(cl_int), &abs_stride); clSetKernelArg(h->k_stage, a++, sizeof(cl_int), &n_stage);
@@ -5590,8 +6101,9 @@ static void hfold_args_fa(ggml_hexagon_hfold * h, const ggml_hexagon_hfold_job &
     const cl_int v_tok_tex = (cl_int) (j.v_nb1 / 8), v_head_tex = (cl_int) (j.v_nb2 / 8);
     const cl_int qbh = j.qbh ? 1 : 0, nkvh = (cl_int) j.nkvh, qb32ps = (cl_int) (j.br / 32);
     const cl_int done_off = (cl_int) h->off_done, stamp_off = (cl_int) h->off_stamp;
+    const cl_mem kt_img = hfold_kt_image(h);
     int a = 0;
-    clSetKernelArg(h->k_fa, a++, sizeof(cl_mem), &h->kt_img); clSetKernelArg(h->k_fa, a++, sizeof(cl_mem), &j.v_img);
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_mem), &kt_img); clSetKernelArg(h->k_fa, a++, sizeof(cl_mem), &j.v_img);
     if (opt_fa_fold_svmq) clSetKernelArgSVMPointer(h->k_fa, a++, h->svm_q); else clSetKernelArg(h->k_fa, a++, sizeof(cl_mem), &j.q);
     clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &q_off);
     clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &q_nb1); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &q_nb2);
@@ -5618,6 +6130,8 @@ static void hfold_args_fa(ggml_hexagon_hfold * h, const ggml_hexagon_hfold_job &
     clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &k_base_tex); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &k_tok_tex); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &k_head_tex);
     clSetKernelArg(h->k_fa, a++, sizeof(cl_mem), &j.em); clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &em_off);
     clSetKernelArg(h->k_fa, a++, sizeof(cl_int), &nbk);
+    // read only with HFOLD_EXC_QIMG; any image otherwise
+    clSetKernelArg(h->k_fa, a++, sizeof(cl_mem), j.q_img ? &j.q_img : &kt_img);
 }
 // one fa_exc launch per stage with the host's offsets (legacy mapping); events out
 static void hfold_launch_fa_stages(ggml_hexagon_hfold * h, const ggml_hexagon_hfold_job & j, std::vector<cl_event> & ev, bool full_qb) {
@@ -5693,7 +6207,8 @@ static void hfold_enqueue_chain(ggml_hexagon_hfold * h, const ggml_hexagon_hfold
         int a = 0;
         clSetKernelArg(h->k_stage_p, a++, sizeof(cl_mem), &j.k);
         clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &k_off); clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &k_nb1); clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &k_nb2);
-        clSetKernelArg(h->k_stage_p, a++, sizeof(cl_mem), &h->kt_img); clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &kt_base_tex);
+        const cl_mem kt_img = hfold_kt_image(h);
+        clSetKernelArg(h->k_stage_p, a++, sizeof(cl_mem), &kt_img); clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &kt_base_tex);
         clSetKernelArg(h->k_stage_p, a++, sizeof(cl_mem), &h->hbuf);
         clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &to.abs); clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &to.cnt);
         clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &abs_stride); clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &n_stage);
@@ -5818,7 +6333,8 @@ static void ggml_hexagon_hfold_relay_main(ggml_hexagon_hfold * h) {
         std::vector<cl_event> ev(j.n_stages, nullptr);
         if (n_stage_blk > 0) {
             hfold_args_stage_k(h, j, to, n_stage, 0u);
-            const size_t g_stage[3] = { (size_t) n_stage / 4, (size_t) h->D / 8, (size_t) j.nkvh };
+            // one work-item per 4 keys x 8 dims, or 8 keys x 8 dims with 16-byte K^T texels
+            const size_t g_stage[3] = { (size_t) n_stage / ((opt_fa_fold_exc & HFOLD_EXC_TEX128) ? 8 : 4), (size_t) h->D / 8, (size_t) j.nkvh };
             err = clEnqueueNDRangeKernel(h->q, h->k_stage, 3, nullptr, g_stage, nullptr, 0, nullptr, nullptr);
             if (err != CL_SUCCESS) { h->n_gpu_err++; GGML_LOG_ERROR("ggml-hex: fa-fold: enqueue stage_k failed (%d)\n", err); }
             hfold_args_fa(h, j, to, n_stage, 0u, 0, 0);
@@ -5874,7 +6390,7 @@ static void ggml_hexagon_hfold_relay_main(ggml_hexagon_hfold * h) {
                         const double pw = exp(sc[i] - m_ref); l_ref += pw;
                         for (uint32_t e = 0; e < h->D; ++e) acc[e] += pw * ggml_fp16_to_fp32(vr[e]);
                     }
-                    const size_t r = (size_t) bh * j.Sq + t;
+                    const size_t r = hfold_prow(j, bh, t);
                     const float m_g = ((const float *) (h->base + h->off_m))[r], l_g = ((const float *) (h->base + h->off_l))[r];
                     std::vector<float> a_g(h->D);
                     for (uint32_t e = 0; e < h->D; ++e) a_g[e] = opt_fa_fold_acc16 ? ggml_fp16_to_fp32(((const uint16_t *) (h->base + h->off_acc))[r * h->D + e]) : ((const float *) (h->base + h->off_acc))[r * h->D + e];
@@ -5972,7 +6488,7 @@ static void ggml_hexagon_hfold_relay_main(ggml_hexagon_hfold * h) {
                 const double pw = exp(sc[i] - m_ref); l_ref += pw;
                 for (uint32_t e = 0; e < h->D; ++e) acc[e] += pw * ggml_fp16_to_fp32(vr[e]);
             }
-            const size_t r = (size_t) p.bh * j.Sq + p.tok;
+            const size_t r = hfold_prow(j, p.bh, p.tok);
             hetero_dc_civac(h->base + h->off_m + r * 4, 4); hetero_dc_civac(h->base + h->off_l + r * 4, 4);
             const size_t acc_esz = opt_fa_fold_acc16 ? 2 : 4;
             hetero_dc_civac(h->base + h->off_acc + r * h->D * acc_esz, h->D * acc_esz);
@@ -6217,11 +6733,12 @@ static void ggml_hexagon_hfold_buffer_freed(ggml_hexagon_session * sess, ggml_ba
     ggml_hexagon_hfold * h = sess->hfold;
     if (!h || !buffer || buffer == h->buf) return;
     auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(buffer->context);
-    const bool had = h->aliases.count(sbuf->fd) || h->images.count(sbuf->fd);
+    const bool had = h->aliases.count(sbuf->fd) || h->images.count(sbuf->fd) || h->images_u32.count(sbuf->fd);
     if (!had) return;
     ggml_hexagon_hfold_wait_idle(h);
     clFinish(h->q);
     auto ii = h->images.find(sbuf->fd);  if (ii != h->images.end())  { clReleaseMemObject(ii->second); h->images.erase(ii); }
+    auto iu = h->images_u32.find(sbuf->fd); if (iu != h->images_u32.end()) { clReleaseMemObject(iu->second); h->images_u32.erase(iu); }
     auto ia = h->aliases.find(sbuf->fd); if (ia != h->aliases.end()) { clReleaseMemObject(ia->second); h->aliases.erase(ia); }
     // jobs that referenced this buffer are stale; the next graph build re-prepares them
     for (auto it = h->jobs.begin(); it != h->jobs.end();) {
@@ -6252,6 +6769,12 @@ static void ggml_hexagon_hfold_log_summary(ggml_hexagon_hfold * h) {
                       st[HTP_FA_FOLD_ST_BUDGET_OPS], st[HTP_FA_FOLD_ST_BUDGET_REJECTED],
                       h->n_jobs && !st[HTP_FA_FOLD_ST_BUDGET_OPS] ? " -- NOT APPLIED (skel without the in-kernel budget?)" : "");
     }
+    if (opt_fa_fold_tile_rows) {
+        // a skel without the flag reads the partial head-major: wrong rows, no error anywhere else
+        GGML_LOG_INFO("ggml-hex: fa-fold tile rows: %llu jobs written in tile row order, %u DSP ops read it so%s\n",
+                      (unsigned long long) h->n_tr_jobs, st[HTP_FA_FOLD_ST_TILE_ROWS],
+                      h->n_tr_jobs && !st[HTP_FA_FOLD_ST_TILE_ROWS] ? " -- NONE: the skel ignores HTP_FA_FOLD_F_TILE_ROWS and folds wrong rows" : "");
+    }
     if (h->n_chain) {
         const double n = (double) h->n_chain;
         GGML_LOG_INFO("ggml-hex: fa-fold chain: %llu jobs (preq %d, chain %d): pre-enqueued %llu, late %llu, gate timeouts %llu, fallbacks %llu; per job: enqueue lead %.0f us before ready, gate open %.0f us after ready, first done %.0f us, last done %.0f us; ION done already visible at the SVM word %llu of %llu stages, stamp visible %llu; gates opened by the DSP's own word %llu; kernel list errors %llu; check rows %llu bad %llu; period %.0f us\n",
@@ -6277,8 +6800,10 @@ static void ggml_hexagon_hfold_free(ggml_hexagon_session * sess) {
     if (h->k_keep) { clReleaseKernel(h->k_keep); clReleaseMemObject(h->keep_buf); clReleaseMemObject(h->keep_out); GGML_LOG_INFO("ggml-hex: fa-fold keep-alive: %llu launches\n", (unsigned long long) h->n_keep); }
     if (h->q) clFinish(h->q);
     ggml_hexagon_hfold_log_summary(h);
+    hfold_check_tile_rows(h);   // short runs (one graph) end before the next graph_compute could check
     if (h->ready_sub) clReleaseMemObject(h->ready_sub);
     for (auto & kv : h->images)  clReleaseMemObject(kv.second);
+    for (auto & kv : h->images_u32) clReleaseMemObject(kv.second);
     for (auto & kv : h->aliases) clReleaseMemObject(kv.second);
     if (h->svm_tabs) clSVMFree(h->ctx, h->svm_tabs);
     if (h->svm_q) clSVMFree(h->ctx, h->svm_q);
@@ -9315,9 +9840,48 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_fa_fold_qatomic = str_fa_fold_qatom   ? atoi(str_fa_fold_qatom)       : opt_fa_fold_qatomic;
     opt_fa_fold_wgfence = str_fa_fold_wgf     ? atoi(str_fa_fold_wgf)         : opt_fa_fold_wgfence;
     opt_fa_fold_acc16   = str_fa_fold_acc16   ? atoi(str_fa_fold_acc16)       : opt_fa_fold_acc16;
+    if (const char * tr = getenv("GGML_HEXAGON_FA_FOLD_TILE_ROWS")) opt_fa_fold_tile_rows = atoi(tr) != 0;
     opt_fa_fold_knat    = str_fa_fold_knat    ? atoi(str_fa_fold_knat)        : opt_fa_fold_knat;
     opt_fa_fold_preq_idle = str_fa_fold_pidle ? atoi(str_fa_fold_pidle)       : opt_fa_fold_preq_idle;
     opt_fa_fold_qmap    = str_fa_fold_qmap    ? atoi(str_fa_fold_qmap)        : opt_fa_fold_qmap;
+    if (const char * s = getenv("GGML_HEXAGON_FA_FOLD_EXC")) {
+        opt_fa_fold_exc = (int) strtol(s, nullptr, 0) & (HFOLD_EXC_TEX128 | HFOLD_EXC_FSM | HFOLD_EXC_QIMG | HFOLD_EXC_P16 | HFOLD_EXC_QK2B);
+        // the 16-byte K^T texels need the staged K^T read as an image; Q through the texture needs Q in the compute buffer
+        if ((opt_fa_fold_exc & HFOLD_EXC_TEX128) && (opt_fa_fold_knat || opt_fa_fold_ktbuf)) {
+            GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_FA_FOLD_EXC bit 1 ignored with KNAT / KTBUF\n");
+            opt_fa_fold_exc &= ~HFOLD_EXC_TEX128;
+        }
+        if ((opt_fa_fold_exc & HFOLD_EXC_QIMG) && (opt_fa_fold_svmq || opt_fa_fold_qatomic || opt_fa_fold_knat)) {
+            GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_FA_FOLD_EXC bit 4 ignored with SVMQ / QATOMIC / KNAT\n");
+            opt_fa_fold_exc &= ~HFOLD_EXC_QIMG;
+        }
+        if ((opt_fa_fold_exc & HFOLD_EXC_QK2B) && opt_fa_fold_knat) {
+            // the kernel compiles QK2B out under K_NAT (and P16 with it): say so instead of logging a variant that never runs
+            GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_FA_FOLD_EXC bit 16 ignored with KNAT\n");
+            opt_fa_fold_exc &= ~HFOLD_EXC_QK2B;
+        }
+        if (opt_fa_fold_exc) GGML_LOG_INFO("ggml-hex: fa-fold: fa_exc variant bits %d (1 TEX128, 2 FSM, 4 QIMG, 8 P16, 16 QK2B)\n", opt_fa_fold_exc);
+    }
+    if (const char * s = getenv("GGML_HEXAGON_FA_FOLD_CLOPTS")) {
+        // diagnostic options only: a define the host also acts on (views, staging sizes, arguments, the fold header)
+        // would build kernels that disagree with what the host binds -- dropped with a warning
+        static const char * owned[] = { "FA_EXC_TEX128", "FA_EXC_FSM", "FA_EXC_QIMG", "FA_EXC_P16", "FA_EXC_QK2B", "TILE_ROWS",
+                                        "ACC_F16", "K_NAT", "KT_BUF", "Q_ATOMIC", "ACQ_FENCE", "WG_FENCE", "FA_D" };
+        std::istringstream in(s);
+        std::string tok;
+        while (in >> tok) {
+            bool drop = false;
+            if (tok.rfind("-D", 0) == 0) {
+                std::string name = tok.substr(2);
+                if (name.empty() && in >> tok) name = tok;   // "-D NAME"
+                name = name.substr(0, name.find('='));
+                for (const char * o : owned) drop = drop || name == o;
+                if (drop) GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_FA_FOLD_CLOPTS: '-D%s' dropped (set by the host; use its own option)\n", name.c_str());
+                else      tok = "-D" + name + (tok.find('=') != std::string::npos ? tok.substr(tok.find('=')) : std::string());
+            }
+            if (!drop) opt_fa_fold_clopts += (opt_fa_fold_clopts.empty() ? "" : " ") + tok;
+        }
+    }
     if (opt_fa_fold_check == 1) opt_fa_fold_gpudone = 0;   // the check holds the done words until the reference ran (CHECK=2: post-hoc rows on the chain path)
 #ifndef GGML_HEXAGON_HETERO
     if (opt_hetero_frac > 0.0f) {
