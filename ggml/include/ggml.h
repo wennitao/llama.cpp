@@ -2449,6 +2449,14 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * exc);
 
+    // Optional per-sub-block mask over the shared selection of a heterogeneous sparse flash-attention op (src[9]):
+    // F32 0/1 [n_kv_blocks, R, NBq/R, n_kv_heads] in src[8]'s layout, nonzero where the 64-token sub-block attends to a
+    // block of src[5]. It lets the shared tile carry blocks that only some of its sub-blocks selected (the workload-aware
+    // partition's NPU share of the exceptions) without making the others attend to them.
+    GGML_API void ggml_flash_attn_ext_set_sparse_xmask(
+            struct ggml_tensor * a,
+            struct ggml_tensor * xmask);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

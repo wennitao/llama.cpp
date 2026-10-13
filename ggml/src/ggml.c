@@ -5542,6 +5542,21 @@ void ggml_flash_attn_ext_set_sparse_exc(
     a->src[8] = exc;
 }
 
+void ggml_flash_attn_ext_set_sparse_xmask(
+        struct ggml_tensor * a,
+        struct ggml_tensor * xmask) {
+    if (!xmask) {
+        a->src[9] = NULL;
+        return;
+    }
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] != NULL);   // the mask qualifies a selection
+    GGML_ASSERT(a->src[9] == NULL);
+    GGML_ASSERT(xmask->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(xmask));
+    a->src[9] = xmask;
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {

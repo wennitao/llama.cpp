@@ -142,6 +142,18 @@ static inline uint32_t llama_sparse_attn_exact_cstar() {
     return v >= 1 && v <= LLAMA_SPARSE_ATTN_BQ / LLAMA_SPARSE_ATTN_BS ? (uint32_t) v : 2;
 }
 
+// Workload-aware partition of the split's exceptions: LLAMA_SPARSE_ATTN_GPU_SHARE=<k>, 0 (the default) = off.
+// Each tile hands the GPU at most k exception pairs (64 queries x 64 keys) per (64-query sub-block, block) unit of its
+// shared NPU list -- the GPU's budget in proportion to the NPU's work on that tile, k about the NPU's per-unit time over
+// the GPU's -- filled with the exceptions only one sub-block wants first (on the NPU they would cost a whole tile block
+// for one pair), then those two want. Exceptions past the budget join the NPU tile masked to the sub-blocks that
+// selected them (src[9]), so every sub-block attends to exactly the same pairs as without the budget.
+static inline float llama_sparse_attn_gpu_share() {
+    const char * s = getenv("LLAMA_SPARSE_ATTN_GPU_SHARE");
+    const float k = s ? (float) atof(s) : 0.0f;
+    return k > 0.0f && k < 1000.0f ? k : 0.0f;
+}
+
 static inline uint32_t llama_sparse_attn_gpu_cap() {
     const char * s = getenv("LLAMA_SPARSE_ATTN_GPU_CAP");
     if (!s) {

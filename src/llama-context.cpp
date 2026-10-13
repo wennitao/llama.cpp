@@ -2334,6 +2334,10 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (llama_sparse_attn_cstar() != 0 || llama_sparse_attn_exact()) {
         res += 48u * model.hparams.n_layer();
     }
+    // The workload-aware partition (LLAMA_SPARSE_ATTN_GPU_SHARE) adds the per-tile budget, ranks and mask: ~45 per layer.
+    if (llama_sparse_attn_gpu_share() > 0.0f) {
+        res += 64u * model.hparams.n_layer();
+    }
     // The existing selectors (llama-selectors.h: LLAMA_SELECTOR) add a probe, halving sums, the skewed diagonal view,
     // block means, the rule and per-lane packing: ~100 nodes per layer.
     if (getenv("LLAMA_SELECTOR")) {

@@ -1197,7 +1197,10 @@ struct llm_graph_context {
             // membership for FLASH_ATTN_EXT src[8]; null otherwise.
             ggml_tensor ** exc_out = nullptr,
             // LLAMA_SPARSE_ATTN_SCORER=xattn: the antidiagonal row order, I32 [n_tokens, n_head].
-            ggml_tensor * xidx = nullptr) const;
+            ggml_tensor * xidx = nullptr,
+            // Workload-aware partition (LLAMA_SPARSE_ATTN_GPU_SHARE): receives the per-sub-block mask over the
+            // shared list for FLASH_ATTN_EXT src[9]; null otherwise.
+            ggml_tensor ** xmask_out = nullptr) const;
 
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
@@ -1216,7 +1219,8 @@ struct llm_graph_context {
             ggml_tensor * sparse_sel = nullptr,
                     int   sparse_bq  = 0,
             ggml_tensor * sparse_cnt = nullptr,
-            ggml_tensor * sparse_exc = nullptr) const;
+            ggml_tensor * sparse_exc = nullptr,
+            ggml_tensor * sparse_xmask = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
