@@ -2833,7 +2833,7 @@ static ggml_tensor * llama_sparse_reps4_reduce(ggml_context * ctx, ggml_tensor *
 // HMX product of the raw sums (256x the mean logit) reaches 1.1e5 and overflows F16 to inf.
 static ggml_tensor * llama_sparse_reps4_probs(ggml_context * ctx, ggml_tensor * q_cur, ggml_tensor * k_rows,
                                               ggml_tensor * m, int64_t Hkv, int64_t NBq, int64_t NBk, int64_t bq,
-                                              bool pooled, bool pooled_q) {
+                                              bool pooled, bool pooled_q, float scale) {
     const int64_t d   = q_cur->ne[0];
     const int64_t Hq  = q_cur->ne[1];
     const int64_t nqs = LLAMA_SPARSE_ATTN_QSUB;
@@ -2874,7 +2874,7 @@ static ggml_tensor * llama_sparse_reps4_probs(ggml_context * ctx, ggml_tensor * 
     ggml_tensor * s = ggml_mul_mat(ctx, k, q);                   // [nr*NBp, nqs*NBq, Hq]
     ggml_mul_mat_set_prec(s, GGML_PREC_F32);
 
-    return llama_sparse_reps4_reduce(ctx, s, m, 1.0f / sqrtf((float) d), Hkv, NBq, NBk);
+    return llama_sparse_reps4_reduce(ctx, s, m, scale, Hkv, NBq, NBk);
 }
 
 // XAttention's stride-16 antidiagonal (LLAMA_SPARSE_ATTN_SCORER=xattn) as a representative scorer, [NBk, NBq, Hkv].
@@ -2883,7 +2883,7 @@ static ggml_tensor * llama_sparse_reps4_probs(ggml_context * ctx, ggml_tensor * 
 // antidiagonal; with 1/16 in the scale it is the antidiagonal's mean logit. The mask, normalization and averages are
 // the pooled scorers' (causal at representative granularity, as XAttention's reduced mask).
 static ggml_tensor * llama_sparse_xattn_probs(ggml_context * ctx, ggml_tensor * q_cur, ggml_tensor * k_rows, ggml_tensor * xidx,
-                                              ggml_tensor * m, int64_t Hkv, int64_t NBq, int64_t NBk) {
+                                              ggml_tensor * m, int64_t Hkv, int64_t NBq, int64_t NBk, float scale) {
     const int64_t d   = q_cur->ne[0];
     const int64_t Hq  = q_cur->ne[1];
     const int64_t Lq  = q_cur->ne[2];
@@ -2907,7 +2907,7 @@ static ggml_tensor * llama_sparse_xattn_probs(ggml_context * ctx, ggml_tensor * 
     ggml_tensor * s = ggml_mul_mat(ctx, k, rq);                  // [4*NBp, 4*NBq, Hq]
     ggml_mul_mat_set_prec(s, GGML_PREC_F32);
 
-    return llama_sparse_reps4_reduce(ctx, s, m, 1.0f / (16.0f*sqrtf((float) d)), Hkv, NBq, NBk);
+    return llama_sparse_reps4_reduce(ctx, s, m, scale / 16.0f, Hkv, NBq, NBk);
 }
 
 // meanpool block scoring: mean(Q rows of a query block) . mean(K rows of a KV block).
@@ -2924,6 +2924,7 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
         ggml_tensor * bias,
         const llama_kv_cache_context * mctx_cur,
         int il,
+        float kq_scale,
         ggml_tensor ** cnt_out,
         ggml_tensor ** exc_out,
         ggml_tensor * xidx) const {
@@ -3002,7 +3003,7 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
         // Every mean's divisor folds here, with 1/sqrt(d). Only the RANKING matters, so the
         // scale is cosmetic -- but it keeps the scores on the same footing as real logits, which
         // is what makes the bias leaf's magnitudes meaningful.
-        qm = ggml_scale(ctx0, qm, 1.0f / ((float) qsub * (float) G * (float) ksub * sqrtf((float) d)));
+        qm = ggml_scale(ctx0, qm, kq_scale / ((float) qsub * (float) G * (float) ksub));
         cb(qm, "sparse_q_pool", il);
 
         sc = ggml_mul_mat(ctx0, km, qm);                         // [NBk, NBq, Hkv]
@@ -3045,9 +3046,9 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
                 sparse_reps4_bias = bias;
                 sparse_reps4_mask = llama_sparse_reps4_mask(ctx0, b3, NBq, NBk, pooled || xattn);
             }
-            pm = xattn ? llama_sparse_xattn_probs(ctx0, q_cur, k_src, xidx, sparse_reps4_mask, Hkv, NBq, NBk) :
+            pm = xattn ? llama_sparse_xattn_probs(ctx0, q_cur, k_src, xidx, sparse_reps4_mask, Hkv, NBq, NBk, kq_scale) :
                          llama_sparse_reps4_probs(ctx0, q_cur, pooled ? k_src : mctx_cur->get_k_pool_src(ctx0, il, bs, ksub),
-                                                  sparse_reps4_mask, Hkv, NBq, NBk, bq, pooled, pooled_q);
+                                                  sparse_reps4_mask, Hkv, NBq, NBk, bq, pooled, pooled_q, kq_scale);
             cb(pm, "sparse_reps4_prob", il);
         } else {
             pm = ggml_soft_max(ctx0, ggml_add(ctx0, sc, b3));
@@ -3611,7 +3612,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * sparse_cnt = nullptr;
     ggml_tensor * sparse_exc = nullptr;
     if (inp->get_sparse_sel()) {
-        sparse_sel = build_sparse_sel(q_cur, inp->get_sparse_sel(), mctx_cur, il, &sparse_cnt, &sparse_exc, inp->self_xattn_idx);
+        sparse_sel = build_sparse_sel(q_cur, inp->get_sparse_sel(), mctx_cur, il, kq_scale, &sparse_cnt, &sparse_exc, inp->self_xattn_idx);
 
         // The bias leaf existing does NOT mean the selection reached the op: build_sparse_sel
         // can decline on shape, and the backend can still reject src[5] and run dense.

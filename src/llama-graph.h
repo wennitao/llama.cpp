@@ -1187,6 +1187,9 @@ struct llm_graph_context {
             ggml_tensor * bias,
             const llama_kv_cache_context * mctx_cur,
             int il,
+            // the attention's own scale: the scorers use it in place of 1/sqrt(d), so a model that scales Q in its
+            // graph (Phi-3: Q * 1/sqrt(d) and kq_scale 1) is scored at the attention's temperature
+            float kq_scale,
             // Threshold mode only: receives the per-row length tensor for
             // FLASH_ATTN_EXT src[6]; set to null in fixed-u mode.
             ggml_tensor ** cnt_out = nullptr,
