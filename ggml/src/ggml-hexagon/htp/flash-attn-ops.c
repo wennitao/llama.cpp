@@ -318,7 +318,8 @@ struct hmx_fa_context {
     const uint32_t * fold_exc;          // [n_kv_heads][fold_num_sb] x (exc_nbk ? exc_nbk : 1), nonzero = exception
     uint32_t         fold_num_sb;
     uint32_t         fold_exc_nbk;      // 0: one flag per (head, sub-block); else membership row length
-    uint32_t         fold_budget_milli; // header budget_milli: the in-kernel GPU budget (fa_budget_apply); 0 = off
+    uint32_t         fold_budget_milli; // the in-kernel GPU budget (fa_budget_apply): kparams' per-op k, else header budget_milli; 0 = off
+    uint32_t         fold_budget_order; // header budget_order: FA_BUDGET_ORDER_* (fa-budget.h)
     uint32_t         fold_budget_state; // 0 = no budget, 1 = applied, 2 = rejected (the op ran the plain split)
     // Exact-mask mode (src[8] without a fold buffer): the FULL per-sub-block membership,
     // [n_kv_heads][num_sb] rows of xmask_nbk f32 (nonzero = the sub-block selected the block).
@@ -3165,11 +3166,12 @@ static bool fa_sel_repeats_blocks(const struct hmx_fa_context * factx, uint32_t 
 // Core HMX flash attention algorithm (GQA-merged)
 // ============================================================================
 
-// ---- In-kernel workload-aware budget (fold header budget_milli) ----
+// ---- In-kernel workload-aware budget (fold header budget_milli, or the op's own k in kparams flags) ----
 //
 // The rule of LLAMA_SPARSE_ATTN_GPU_SHARE (src/llama-graph.cpp) without its ~32 graph ops per layer: per (256-query
 // tile, KV head) the GPU keeps at most round(k * R * |shared list|) exception pairs, singles first (fa_budget_split), and
-// the other pairs run on the NPU. The GPU's share stays in src[8], whose NPU pairs are cleared here before the producer
+// the other pairs run on the NPU. The pairs are ranked in the header's budget_order; the graph mode ranks only in
+// FA_BUDGET_ORDER_SB. The GPU's share stays in src[8], whose NPU pairs are cleared here before the producer
 // is released (it reads src[8] after ready); the NPU's share extends the tile's block list -- DSP-built copies of src[5]
 // and src[6] -- and is masked to the sub-blocks that selected it through a DSP-built xmask. Everything downstream (lists,
 // counts, exception tiles, the masked softmax) reads those, so the op runs the graph mode's attention pattern exactly.
@@ -3209,7 +3211,7 @@ static void fa_budget_thread(unsigned int n, unsigned int ith, void * data) {
         uint32_t *     rows  = jb->em + ((size_t) h * num_sb + (size_t) t * R) * nbk;
         uint32_t       n_gpu = 0;
         const uint32_t n_npu = fa_budget_split(rows, nbk, R, nbk, fa_budget_pairs(factx->fold_budget_milli, R, n_sh),
-                                               pairs, &n_gpu);
+                                               factx->fold_budget_order, pairs, &n_gpu);
         int32_t * out = jb->tsel + ((size_t) h * T + t) * n_sel;
         float *   xr  = jb->txm + ((size_t) h * num_sb + (size_t) t * R) * nbk;   // the tile's R mask rows
         uint32_t  len = 0;
@@ -3631,6 +3633,14 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
             factx.fold_acc_bytes = (size_t) (rows * acc_stride);
             factx.fold_instore   = (fh->flags & HTP_FA_FOLD_F_INSTORE) != 0;
             factx.fold_budget_milli = fh->budget_milli;
+            factx.fold_budget_order = fh->budget_order;
+            {
+                // the host's per-layer k (GGML_HEXAGON_FA_FOLD_BUDGET_LAYERS) wins over the header's
+                const uint32_t kb = HTP_FA_HMX_F_BUDGET_GET(kparams->u.hmx.flags);
+                if (kb) {
+                    factx.fold_budget_milli = kb == HTP_FA_HMX_F_BUDGET_OFF ? 0u : kb;
+                }
+            }
             factx.fold_acc_f16   = acc_f16;
             if (acc_f16 && (!factx.fold_instore || (fh->flags & HTP_FA_FOLD_F_SPILL))) {
                 FARF(ERROR, "fa fold: ACC_F16 needs INSTORE and excludes SPILL (flags %u)", fh->flags);

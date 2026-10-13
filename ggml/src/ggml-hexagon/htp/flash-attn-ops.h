@@ -20,6 +20,12 @@ extern "C" {
 
 // htp_fa_kernel_params.u.hmx.flags
 #define HTP_FA_HMX_F_EXC_ONLY  1   // src[8] is the split's exception list (fold input only), never an exact-mask membership
+// bits 1..3: free. Bits 4..15: this op's in-kernel GPU budget k in thousandths (host GGML_HEXAGON_FA_FOLD_BUDGET_LAYERS);
+// 0 = the fold header's budget_milli, HTP_FA_HMX_F_BUDGET_OFF = no budget on this op (the GPU computes every exception)
+#define HTP_FA_HMX_F_BUDGET_SHIFT 4
+#define HTP_FA_HMX_F_BUDGET_OFF   0xfffu
+#define HTP_FA_HMX_F_BUDGET_MAX   0xffeu   // largest k the field holds: 4.094
+#define HTP_FA_HMX_F_BUDGET_GET(f) (((uint32_t) (f) >> HTP_FA_HMX_F_BUDGET_SHIFT) & HTP_FA_HMX_F_BUDGET_OFF)
 #define HMX_FP16_TILE_N_COLS   32
 #define HMX_FP16_TILE_N_ELMS   1024
 

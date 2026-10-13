@@ -321,6 +321,7 @@ struct htp_fa_fold_hdr {
     uint32_t budget_milli; // STAGED, src[8] membership: the GPU keeps at most round(k * R * |shared list|) exception pairs
                            // per (tile, KV head), k in thousandths (htp/fa-budget.h); the rest run on the NPU masked to
                            // their own sub-blocks. 0 = off (the GPU computes every exception)
+    uint32_t budget_order; // how the budget ranks a tile's pairs: FA_BUDGET_ORDER_* (htp/fa-budget.h); 0 = by sub-block
 };
 
 // Cluster-selected sparse decode attention (dev prototype; host env GGML_HEXAGON_CLUSTER_ATTN).

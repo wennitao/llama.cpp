@@ -134,6 +134,7 @@ static int    opt_fa_fold_qbh = 1;         // GGML_HEXAGON_FA_FOLD_STAGE_QBH=0: 
 static int    opt_fa_fold_gate_spins = 1000000;   // ~280 ms at ~0.28 us per SVM poll
 static int    opt_fa_fold_pwg = 32;        // CHAIN=2: persistent work-groups per op (each pulls stage-ordered units)
 static int    opt_fa_fold_pwg_stage = 64;  // persistent work-groups for the K^T staging kernel
+static int    opt_fa_fold_stage_tight = 1; // GGML_HEXAGON_FA_FOLD_STAGE_TIGHT=0: the staging kernel loops over the cache's capacity, not the op's blocks
 static int    opt_fa_fold_trace = 0;       // GGML_HEXAGON_FA_FOLD_TRACE=N: per-stage timeline of the first N jobs of every 16th batch
 static int    opt_fa_fold_ion_ready = 1;   // GGML_HEXAGON_FA_FOLD_ION_READY=0: the gate polls only the SVM mirror, not the DSP's word
 static int    opt_fa_fold_ktbuf = 0;       // GGML_HEXAGON_FA_FOLD_KTBUF=1: K^T through plain buffer loads/stores instead of the image
@@ -160,6 +161,96 @@ static int    opt_fa_fold_qmap = 0;        // GGML_HEXAGON_FA_FOLD_QMAP=1: enque
 static int    opt_fa_fold_gate_delay = 0;  // GGML_HEXAGON_FA_FOLD_GATE_DELAY=<polls>: diagnostic hold after ready (~30 us per poll)
 static int    opt_fa_fold_notag = 0;       // GGML_HEXAGON_FA_FOLD_NOTAG=1: init the sidecar (keep-alive) but tag no node: the NPU runs the pool alone (timing probe, output lacks the exceptions)
 static int    opt_fa_fold_budget_milli = 0; // GGML_HEXAGON_FA_FOLD_BUDGET=k: the GPU keeps at most round(k * R * |shared list|) exception pairs per tile, the rest run on the NPU masked (in the DSP op, no graph ops); 0 = off
+static int    opt_fa_fold_budget_order = 0; // GGML_HEXAGON_FA_FOLD_BUDGET_ORDER: how the budget ranks a tile's pairs (FA_BUDGET_ORDER_* in htp/fa-budget.h): 0 = by sub-block (the graph mode's order), 1 = by block, 2 = by block with the cut block on the NPU
+// GGML_HEXAGON_FA_FOLD_BUDGET_LAYERS="<k per layer>[/<kv_min>:<k per layer>]...": a budget per layer, from the last list
+// whose kv_min <= the op's KV length ('/' or ';' between lists). An entry is k, 0 or empty for GGML_HEXAGON_FA_FOLD_BUDGET's
+// k, or c3 / off for no budget (the GPU computes every exception). Carried per op in htp_fa_kernel_params.u.hmx.flags.
+struct hfold_budget_layers {
+    uint32_t              kv_min;
+    std::vector<uint16_t> k;   // flags field: 0 = the header's k, HTP_FA_HMX_F_BUDGET_OFF = none, else k in thousandths
+};
+static std::vector<hfold_budget_layers> opt_fa_fold_budget_layers;
+
+static bool hfold_parse_budget_layers(const char * str, std::vector<hfold_budget_layers> & out) {
+    out.clear();
+    std::string all(str);
+    std::replace(all.begin(), all.end(), ';', '/');
+    std::stringstream ss(all);
+    std::string seg;
+    while (std::getline(ss, seg, '/')) {
+        hfold_budget_layers t = { 0, {} };
+        const size_t colon = seg.find(':');
+        if (colon != std::string::npos) {
+            char * end = nullptr;
+            const long kv = strtol(seg.c_str(), &end, 10);
+            if (end != seg.c_str() + colon || kv < 0 || kv > INT32_MAX) {
+                return false;
+            }
+            t.kv_min = (uint32_t) kv;
+            seg = seg.substr(colon + 1);
+        } else if (!out.empty()) {
+            return false;   // only the first list may omit kv_min
+        }
+        if (!out.empty() && t.kv_min <= out.back().kv_min) {
+            return false;
+        }
+        std::stringstream ls(seg);
+        std::string tok;
+        while (std::getline(ls, tok, ',')) {
+            tok.erase(0, tok.find_first_not_of(" \t"));
+            tok.erase(tok.find_last_not_of(" \t") + 1);
+            if (tok == "c3" || tok == "off" || tok == "none") {
+                t.k.push_back((uint16_t) HTP_FA_HMX_F_BUDGET_OFF);
+                continue;
+            }
+            char * end = nullptr;
+            const double k = tok.empty() ? 0.0 : strtod(tok.c_str(), &end);
+            if ((!tok.empty() && *end != '\0') || !(k >= 0.0) || !std::isfinite(k)) {
+                return false;
+            }
+            if (k * 1000.0 > (double) HTP_FA_HMX_F_BUDGET_MAX + 0.5) {
+                GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_FA_FOLD_BUDGET_LAYERS: k = %s clamped to %.3f (use c3 for no budget)\n",
+                              tok.c_str(), HTP_FA_HMX_F_BUDGET_MAX / 1000.0);
+            }
+            // like GGML_HEXAGON_FA_FOLD_BUDGET: a positive k below 0.0005 still means "almost nothing to the GPU"
+            const long milli = k > 0.0 ? std::max(1L, lround(std::min(k * 1000.0, (double) HTP_FA_HMX_F_BUDGET_MAX))) : 0L;
+            t.k.push_back((uint16_t) milli);
+        }
+        out.push_back(std::move(t));
+    }
+    return !out.empty();
+}
+
+// The flags field for one FA node: its layer's entry in GGML_HEXAGON_FA_FOLD_BUDGET_LAYERS, 0 (the header's k) without one.
+// The layer comes from the split's inputs, named per layer by src/llama-graph.cpp (the FA node itself is unnamed).
+static uint32_t hfold_budget_field(const ggml_tensor * op) {
+    if (opt_fa_fold_budget_layers.empty()) {
+        return 0;
+    }
+    int il = -1;
+    if (!op->src[8] || sscanf(ggml_get_name(op->src[8]), "sparse_exc_mem-%d", &il) != 1) {
+        if (!op->src[6] || sscanf(ggml_get_name(op->src[6]), "sparse_cnt-%d", &il) != 1) {
+            il = -1;
+        }
+    }
+    const uint32_t              n_kv = (uint32_t) op->src[1]->ne[1];
+    const hfold_budget_layers * t    = nullptr;
+    for (const auto & e : opt_fa_fold_budget_layers) {
+        if (n_kv >= e.kv_min) {
+            t = &e;
+        }
+    }
+    if (il < 0 || !t || (size_t) il >= t->k.size()) {
+        static int warned = 0;
+        if (!warned++) {
+            GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_FA_FOLD_BUDGET_LAYERS has no entry for %s (layer %d, KV %u): it takes GGML_HEXAGON_FA_FOLD_BUDGET's k\n",
+                          op->name, il, n_kv);
+        }
+        return 0;
+    }
+    return t->k[il];
+}
+
 // Cluster-selected sparse decode attention prototype (GGML_HEXAGON_CLUSTER_ATTN=<density_permille>,<window>[,flags]).
 // The backend owns a cluster-ordered shadow of the KV cache (htp-ops.h, HTP_FA_CLUSTER_*) and tags decode
 // FLASH_ATTN_EXT nodes so the HVX kernel attends over selected 64-key pages plus a dense recent window.
@@ -2327,6 +2418,9 @@ static bool ggml_hexagon_precompute_flash_attn_params(
             // output. The graph names them apart; anything but the exact membership is an exception list.
             kparams->u.hmx.flags     = (op->src[8] && strncmp(ggml_get_name(op->src[8]), "sparse_exact_mem", 16) != 0)
                                        ? HTP_FA_HMX_F_EXC_ONLY : 0;
+            if (kparams->u.hmx.flags & HTP_FA_HMX_F_EXC_ONLY) {
+                kparams->u.hmx.flags |= (uint16_t) (hfold_budget_field(op) << HTP_FA_HMX_F_BUDGET_SHIFT);
+            }
             // The device still decides: it needs the VTCM the chosen (Br, Bc) left over,
             // and the selection itself, neither of which is known here.
             kparams->u.hmx.res_mode  = (uint16_t) opt_fa_kv_residency;
@@ -4662,7 +4756,7 @@ void stage_k_p(__global const uchar * kbuf, const int k_off, const int k_nb1, co
                const int abs_stride, const int n_stage, const int nkvh, const int scnt_off,
                __global const uint * svm, const uint want,
                __global uchar * embuf, const int em_off, const int nbk, const int num_sb,
-               const int idx_off, const int lcnt_off) {
+               const int idx_off, const int lcnt_off, const int kb_per_head_arg) {
     if (!gate_open(svm, want)) return;
     ENTRY_ACQUIRE();
     mark_start((__global uint *) svm, want, 4);
@@ -4670,7 +4764,9 @@ void stage_k_p(__global const uchar * kbuf, const int k_off, const int k_nb1, co
     __local int unit_sh, cur_head, cnt_l;
     __local int tc[STAGE_NBK_MAX], abs_l[STAGE_NBK_MAX];   // 2 KB: keeps the persistent work-groups resident
     if (t == 0) cur_head = -1;
-    const int kb_per_head = (n_stage / 4 + 7) / 8;
+    // units of 32 keys per head: the op's own blocks (a head never has more exception keys than nbk * 64), or the
+    // staging capacity n_stage; the K^T layout keeps the capacity stride either way
+    const int kb_per_head = kb_per_head_arg > 0 ? kb_per_head_arg : (n_stage / 4 + 7) / 8;
     const int n_units = nkvh * kb_per_head;
     for (;;) {
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -5350,6 +5446,7 @@ static bool ggml_hexagon_hfold_ensure_buffer(ggml_hexagon_hfold * h, uint32_t ro
     hdr.off_exc = 0; hdr.exc_nbk = 0;   // the membership is src[8]
     hdr.off_done = (uint32_t) h->off_done;
     hdr.budget_milli = (uint32_t) std::max(0, opt_fa_fold_budget_milli);
+    hdr.budget_order = (uint32_t) opt_fa_fold_budget_order;
     const struct htp_fa_fold_hdr * cur = (const struct htp_fa_fold_hdr *) h->base;
     if (memcmp(cur, &hdr, sizeof(hdr)) != 0) {
         ggml_hexagon_hfold_wait_idle(h);
@@ -5605,6 +5702,9 @@ static void hfold_enqueue_chain(ggml_hexagon_hfold * h, const ggml_hexagon_hfold
         clSetKernelArg(h->k_stage_p, a++, sizeof(cl_mem), &j.em); clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &em_off);
         clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &nbk); clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &num_sb);
         clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &to.idx); clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &to.lcnt);
+        // GGML_HEXAGON_FA_FOLD_STAGE_TIGHT (default 1): loop over the op's nbk blocks, not the cache capacity
+        const cl_int kb_per_head = opt_fa_fold_stage_tight ? nbk * 2 : 0;
+        clSetKernelArg(h->k_stage_p, a++, sizeof(cl_int), &kb_per_head);
         const size_t g = (size_t) std::max(1, opt_fa_fold_pwg_stage) * 128, l = 128;
         err = clEnqueueNDRangeKernel(h->q, h->k_stage_p, 1, nullptr, &g, &l, 0, nullptr, nullptr);
         if (err != CL_SUCCESS) { h->n_gpu_err++; GGML_LOG_ERROR("ggml-hex: fa-fold: enqueue stage_k_p failed (%d)\n", err); }
@@ -6145,10 +6245,11 @@ static void ggml_hexagon_hfold_log_summary(ggml_hexagon_hfold * h) {
                   st[HTP_FA_FOLD_ST_WAITS], st[HTP_FA_FOLD_ST_TILES_BLOCKED], st[HTP_FA_FOLD_ST_WAIT_US_MAX],
                   h->n_jobs ? (double) st[HTP_FA_FOLD_ST_WAIT_US_SUM] / (double) h->n_jobs : 0.0, st[HTP_FA_FOLD_ST_TIMEOUTS],
                   h->n_jobs ? h->us_ready / (double) h->n_jobs : 0.0, h->n_jobs ? h->us_gpu / (double) h->n_jobs : 0.0);
-    if (opt_fa_fold_budget_milli > 0) {
+    if (opt_fa_fold_budget_milli > 0 || !opt_fa_fold_budget_layers.empty()) {
         // a skel that predates the budget ignores the header field: zero applied ops with jobs run means the budget never ran
-        GGML_LOG_INFO("ggml-hex: fa-fold budget k = %.3f: applied in %u DSP ops, rejected (plain split) in %u%s\n",
-                      opt_fa_fold_budget_milli / 1000.0, st[HTP_FA_FOLD_ST_BUDGET_OPS], st[HTP_FA_FOLD_ST_BUDGET_REJECTED],
+        GGML_LOG_INFO("ggml-hex: fa-fold budget k = %.3f%s, order %d: applied in %u DSP ops, rejected (plain split) in %u%s\n",
+                      opt_fa_fold_budget_milli / 1000.0, opt_fa_fold_budget_layers.empty() ? "" : " + per layer", opt_fa_fold_budget_order,
+                      st[HTP_FA_FOLD_ST_BUDGET_OPS], st[HTP_FA_FOLD_ST_BUDGET_REJECTED],
                       h->n_jobs && !st[HTP_FA_FOLD_ST_BUDGET_OPS] ? " -- NOT APPLIED (skel without the in-kernel budget?)" : "");
     }
     if (h->n_chain) {
@@ -9027,6 +9128,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_fa_fold_flush  = getenv("GGML_HEXAGON_FA_FOLD_FLUSH");
     const char * str_fa_fold_stage  = getenv("GGML_HEXAGON_FA_FOLD_STAGE_QB");
     const char * str_fa_fold_budget = getenv("GGML_HEXAGON_FA_FOLD_BUDGET");
+    const char * str_fa_fold_border = getenv("GGML_HEXAGON_FA_FOLD_BUDGET_ORDER");
+    const char * str_fa_fold_blayers = getenv("GGML_HEXAGON_FA_FOLD_BUDGET_LAYERS");
     const char * str_fa_fold_keep   = getenv("GGML_HEXAGON_FA_FOLD_KEEPALIVE");
     const char * str_fa_fold_keepp  = getenv("GGML_HEXAGON_FA_FOLD_KEEPALIVE_PERIOD_US");
     const char * str_fa_fold_gpudone = getenv("GGML_HEXAGON_FA_FOLD_GPUDONE");
@@ -9166,6 +9269,30 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
                           opt_fa_fold_budget_milli / 1000.0);
         }
     }
+    if (str_fa_fold_border) {
+        const int o = atoi(str_fa_fold_border);
+        if (o < 0 || o > 2) {
+            GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_FA_FOLD_BUDGET_ORDER=%s is not 0, 1 or 2: ranking by sub-block\n", str_fa_fold_border);
+        }
+        opt_fa_fold_budget_order = o >= 0 && o <= 2 ? o : 0;
+        GGML_LOG_INFO("ggml-hex: in-kernel fold budget ranks a tile's pairs %s\n",
+                      opt_fa_fold_budget_order == 0 ? "by sub-block" : opt_fa_fold_budget_order == 1 ? "by block" : "by block, the cut block on the NPU");
+    }
+    if (str_fa_fold_blayers) {
+        if (!hfold_parse_budget_layers(str_fa_fold_blayers, opt_fa_fold_budget_layers)) {
+            GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_FA_FOLD_BUDGET_LAYERS=%s is not \"<k,...>[/<kv_min>:<k,...>]...\": no per-layer budget\n", str_fa_fold_blayers);
+            opt_fa_fold_budget_layers.clear();
+        }
+        for (const auto & t : opt_fa_fold_budget_layers) {
+            std::string ks;
+            for (uint16_t f : t.k) {
+                char b[16];
+                snprintf(b, sizeof(b), " %.3f", f / 1000.0);
+                ks += f == HTP_FA_HMX_F_BUDGET_OFF ? " c3" : f ? b : " k";
+            }
+            GGML_LOG_INFO("ggml-hex: in-kernel fold budget per layer, KV >= %u:%s\n", t.kv_min, ks.c_str());
+        }
+    }
     opt_fa_fold_keepalive = str_fa_fold_keep ? atoi(str_fa_fold_keep)        : opt_fa_fold_keepalive;
     opt_fa_fold_keepalive_period = str_fa_fold_keepp ? atoi(str_fa_fold_keepp) : opt_fa_fold_keepalive_period;
     opt_fa_fold_gpudone = str_fa_fold_gpudone ? atoi(str_fa_fold_gpudone)     : opt_fa_fold_gpudone;
@@ -9175,6 +9302,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_fa_fold_gate_spins = str_fa_fold_gspins ? atoi(str_fa_fold_gspins)    : opt_fa_fold_gate_spins;
     opt_fa_fold_pwg     = str_fa_fold_pwg     ? atoi(str_fa_fold_pwg)         : opt_fa_fold_pwg;
     opt_fa_fold_pwg_stage = str_fa_fold_pwgs  ? atoi(str_fa_fold_pwgs)        : opt_fa_fold_pwg_stage;
+    if (const char * st = getenv("GGML_HEXAGON_FA_FOLD_STAGE_TIGHT")) opt_fa_fold_stage_tight = atoi(st) != 0;
     opt_fa_fold_trace   = str_fa_fold_trace   ? atoi(str_fa_fold_trace)       : opt_fa_fold_trace;
     opt_fa_fold_ion_ready = str_fa_fold_ionr  ? atoi(str_fa_fold_ionr)        : opt_fa_fold_ion_ready;
     opt_fa_fold_ktbuf   = str_fa_fold_ktbuf   ? atoi(str_fa_fold_ktbuf)       : opt_fa_fold_ktbuf;
