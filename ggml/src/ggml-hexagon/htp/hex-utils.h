@@ -56,14 +56,45 @@ static inline void hex_l2fetch_rows(const void * addr, uint32_t row_bytes, uint3
     }
 }
 
+#define HEX_L1_LINE_SIZE           32
 #define HEX_L2_LINE_SIZE           128
 #define HEX_L2_BLOCK_SIZE          (HEX_L2_LINE_SIZE * 4) // flush granularity (lines per loop iteration)
 #define HEX_L2_FLUSH_WQ_THRESHOLD  (4 * 1024)
 #define HEX_L2_FLUSH_ALL_THRESHOLD (4 * 1024 * 1024)
 
+#define HEX_L1_FLUSH_MAX           (4 * 1024)  // ranges up to this size are flushed per L1 line
+
+// dccleaninva acts on the line holding the address at both levels: one 128-byte L2 line and one
+// 32-byte L1 line. One per L2 line left three of every four L1 lines alone, and the UDMA does not
+// snoop L1: a scalar store's dirty line (sum_rows writes its sums that way) was later written back
+// over what a DMA had put there since, and a clean line served the old bytes to scalar loads. With
+// in-place ops reusing such a buffer this corrupted the workload-aware budget's cap2 on the HTP.
+// HVX and scalar accesses are coherent with each other (HVX stores invalidate L1 lines they hit), so
+// the hazard is a scalar load of data a DMA wrote. Ranges up to HEX_L1_FLUSH_MAX -- the per-row sums,
+// budgets and counts that scalar code reads -- go per L1 line; ops that scalar-read larger inputs drop
+// those lines themselves (the FA op's selection inputs), because per L1 line everywhere cost ~13 ms of
+// selector time per 4k prefill. The bounds stay L2-aligned, which keeps every address inside the pages
+// of the range.
+static inline void hex_l1inval(const void * addr, size_t size) {
+    const uint32_t s = ((uint32_t) addr) & ~(HEX_L1_LINE_SIZE - 1);
+    const uint32_t e = ((uint32_t) addr) + size;
+    for (uint32_t i = s; i < e; i += HEX_L1_LINE_SIZE) {
+        Q6_dccleaninva_A((void *) i);
+    }
+}
+
 static inline void hex_l2flush(void * addr, size_t size) {
     const uint32_t s = ((uint32_t) addr) & ~(HEX_L2_LINE_SIZE - 1);
     const uint32_t e = (((uint32_t) addr) + size + HEX_L2_LINE_SIZE - 1) & ~(HEX_L2_LINE_SIZE - 1);
+    if (e - s <= HEX_L1_FLUSH_MAX) {
+        for (uint32_t i = s; i < e; i += HEX_L2_LINE_SIZE) {
+            Q6_dccleaninva_A((void *) i + HEX_L1_LINE_SIZE * 0);
+            Q6_dccleaninva_A((void *) i + HEX_L1_LINE_SIZE * 1);
+            Q6_dccleaninva_A((void *) i + HEX_L1_LINE_SIZE * 2);
+            Q6_dccleaninva_A((void *) i + HEX_L1_LINE_SIZE * 3);
+        }
+        return;
+    }
     for (uint32_t i = s; i < e; i += HEX_L2_BLOCK_SIZE) {
         Q6_dccleaninva_A((void *) i + HEX_L2_LINE_SIZE * 0);
         Q6_dccleaninva_A((void *) i + HEX_L2_LINE_SIZE * 1);
