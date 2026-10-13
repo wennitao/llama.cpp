@@ -2196,6 +2196,85 @@ Two silent faults were fixed along the way:
   per-tile counts read zero on 768-query microbatches with op batching on the HTP. It now clamps `us * hs`. Split
   timings taken with a head start before this fix are suspect.
 
+## 4o. Split attention: the budget in the kernel, a free fold and a faster GPU kernel (2026-10-11 to 10-12, units 57dd7911, 9aed338b and c13eb13b)
+
+Measured on the attention operator alone: profiled `FLASH_ATTN_EXT` ms per prefill, Llama-3.2-3B Q4_0, the first
+RULER vt prompt, two passes in opposite order, every run below 50 C. No change below alters the attention mask; each
+one moves pairs between the engines or makes one engine faster. On c13eb13b the split went from 401.7 to 374.2 ms at
+4k (-6.9%) and from 1348.2 to 1276.5 ms at 8k (-5.3%):
+
+| Attention per prefill (ms), unit c13eb13b | 4k | 8k |
+|---|---:|---:|
+| Split, in-kernel budget, order 2, per-layer table (start) | 401.7 | 1348.2 |
+| + tile-row fold (`GGML_HEXAGON_FA_FOLD_TILE_ROWS=1`) | 399.7 | 1371.4 |
+| + faster GPU kernel (`GGML_HEXAGON_FA_FOLD_EXC=7`) | 380.7 | 1303.1 |
+| + tables re-learned for the faster GPU (now) | 374.2 | 1276.5 |
+| NPU only, the split's own mask (`LLAMA_SPARSE_ATTN_EXACT=2`) | 496.9 | 1763.2 |
+| NPU-only union at the split's density (thr 0.6597, RULER 4k 85.12) | 425.9 | 1426.2 |
+| NPU-only union at equal accuracy (thr 0.4308, RULER 4k 86.01) | 518.6 | 1866.0 |
+
+The rows come from three sweeps; each sweep repeated the previous sweep's best arm within 0.1%. The split (RULER 4k
+86.10) is now 1.14x/1.12x faster than the same-density union. On 57dd7911 the plain c* = 3 split matched that
+union at 4k and trailed it at 8k (1.00x/0.96x). It is 1.39x/1.46x faster than the union at equal accuracy and
+1.33x/1.38x faster than its own mask on the NPU alone.
+
+### What changed
+
+- **Same-mask NPU baseline.** `LLAMA_SPARSE_ATTN_EXACT=2` runs the split's membership on the NPU alone: the shared
+  list at c(b) >= `LLAMA_SPARSE_ATTN_EXACT_CSTAR`, the head start's union, and each sub-block's own blocks. The two
+  arms differ only in where the pairs run.
+- **Budget.** A tile gives the GPU at most round(k x R x |shared list|) exception pairs, the pairs that only one
+  sub-block wants first. The rest join the NPU tile, masked to the sub-blocks that selected them, so no sub-block
+  sees a pair it did not select. `LLAMA_SPARSE_ATTN_GPU_SHARE=k` builds this in the graph (`src[9]` carries the
+  mask) and costs 10/22 ms of selector ops per 4k/8k prefill. `GGML_HEXAGON_FA_FOLD_BUDGET=k` does it inside the FA
+  kernel from the op's own inputs (`htp/fa-budget.h`) with no graph ops.
+- **Budget order and per-layer k.** `GGML_HEXAGON_FA_FOLD_BUDGET_ORDER=2` ranks a tile's pairs block-major and sends
+  a block that the cap cuts wholly to the NPU, which computes the whole 256x64 block anyway.
+  `GGML_HEXAGON_FA_FOLD_BUDGET_LAYERS=k0,...,k27[/kv_min:k0,...,k27]` sets k per layer and KV bucket (`c3` = no
+  budget). The kernel params carry it in bits 4..15 (thousandths, at most 4.094). The tables come from a per-op
+  timeline model of the split (DSP tiles, GPU work-groups, staged folds) on five dumped RULER prompts, scored
+  leave-one-prompt-out. The model predicted the measured 4k gains within 1-3 ms.
+- **Tile-row fold.** With `GGML_HEXAGON_FA_FOLD_TILE_ROWS=1` the GPU writes its partial (m, l, f16 acc) in the HMX
+  tile's row order, so the DSP's in-store merge reads m and l as vectors and the acc rows in order. This removes about
+  22 ms of DSP work per 4k prefill. On its own it only moves the wait: the DSP then blocks on the GPU (3 -> 21 ms per
+  4k prefill), and at 8k the split is 19 ms slower.
+- **Faster GPU kernel.** `GGML_HEXAGON_FA_FOLD_EXC=7` makes `fa_exc` read K^T and V as 16-byte texels (bit 1), take
+  the row max with qcom subgroup shuffles (bit 2) and read Q through an image (bit 4). The GPU job is 21% shorter
+  than with the tile-row fold alone (3607 -> 2840 us per op at 4k), and the DSP no longer waits.
+  `examples/fa-exc-bench` times the production kernel source alone on deployed-like lists (-19.7% per pair,
+  bit-exact). `examples/fa-fold-check` checks the tile-row merge against head-major order on the device.
+- **Re-learned tables.** With the fold free and the GPU faster, the GPU has slack. The global k rises from 0.5 to 1
+  at 4k and from 0.4 to 0.5 at 8k. Measured -6.9/-26.5 ms against the old tables. The model said -4.2/-12.9 ms; it
+  underestimates the kernel's gain on the long 8k lists.
+- **Fixed: every fold run segfaulted at exit.** The buffer-free hook read the job cache's graph nodes, which llama
+  frees before the scheduler's compute buffer. Jobs now record their source buffers.
+
+Correctness: c* = 3 with the tile-row fold and EXC=7 gives identical perplexity (12.2639 at 3840 tokens, 11.5015 at
+8192). The budgeted split with both gives the same KL statistics as a rerun of the split without them against its
+own logits. The re-learned tables stay inside the placement band (12.2578, 11.5010). `GGML_HEXAGON_FA_FOLD_CHECK=2`
+found no bad rows in 224 and 448 checked GPU partials.
+
+### Where it stops
+
+- At c* = 3 and head start 8 the split cannot go below the NPU's shared-list work: 378/1235 ms per prompt in the
+  model. A GPU about 1.4x faster than EXC=7 already reaches that. Both knobs change the mask (head-start tiles run
+  the union with fill-in, and EXACT=2 copies it), so moving them needs a new accuracy run.
+- The NPU attention kernel is bound by its HVX softmax, not by HMX. A `GGML_HEXAGON_PROFILE=3` trace at 2048 tokens
+  (1024 queries x 2048 keys): softmax 48% of the op for the split and 63% for EXACT=2, HMX 13-18%, the O store
+  12-16 us per 256-query tile.
+- The exact-mask softmax still computes exp on the 64-key vectors that it masks to -inf. About 20% of EXACT=2's NPU
+  work is on masked sub-blocks, against about 2% of the split's. Skipping them is exact and would make EXACT=2 about
+  12% faster, which takes the split's lead over it toward 1.2x at 8k. The unions have no masks and do not change.
+  Not implemented yet.
+
+Also in these commits: the ShadowAttn prefill baseline (`LLAMA_SHADOWATTN=r`); scorers scaled by the attention's
+own scale (Phi scales Q in the graph); odd GQA groups (Llama 3.2 3B, G = 3) in the selection and in the HMX tile
+search; `LLAMA_SPARSE_ATTN_EXC_THR` (the GPU's half from a lower threshold); `hex_l2flush` cleaning every 32-byte L1
+line of small ranges (the UDMA does not snoop L1); `hvx_arith_settle` (the software pipeliner rebuilt binary-op
+results in qf32, and 0 became a denormal); the batched HMX F16 matmul's second column chunk. Runners:
+docs/papers/heterogeneous-inference/data/accuracy-validation/sm8750/prefill-llama/ (run_p3.py, run_p5.py,
+run_union_cmp.py).
+
 ## 5. What would change the answer
 
 - **Events in both backends.** OpenCL already uses `cl_event` throughout (its `synchronize` is a
@@ -2208,6 +2287,9 @@ Two silent faults were fixed along the way:
 - **A faster GPU path.** The ratio in §1 is the whole story. A GPU kernel at ≥50% of the HMX
   rate would make a ~1.4× pipelined ceiling plausible; Adreno 830 through the current OpenCL
   backend is not that.
+- **A faster NPU softmax (prefill).** The split's attention is now the NPU's shared-list work (4o), and half or
+  more of the NPU kernel is HVX softmax. A faster softmax shortens the split and every NPU-only design by the same
+  absolute time.
 - **Something that is not attention or GEMM.** After the lm-head moves to the HTP (§4b) the
   non-device share of a decode token is ~5%; there is no host-side cost left for a GPU to absorb.
 - **A weight split for the GEMVs** has a measured raw ceiling of ~1.15x on the token (two masters
@@ -2239,6 +2321,11 @@ Two silent faults were fixed along the way:
   touches no memory makes HTP-only decode 5-10% faster (DSP batch 24.3 -> 22.2 ms/token at d0).
   Every HTP+GPU comparison in that configuration needs an HTP-only + `llama-gpu-keepalive` arm;
   with the lm-head on the CPU the token-level effect is ~1%. A busy CPU core does not do it.
+- llama tools route backend logs through common's logger: INFO lines (the fa-fold summaries) need `-lv 4`, DEBUG
+  lines (`GGML_HEXAGON_PROFILE=3` trace events) need `-lv 5`. The fa-fold summary prints every 8 graphs and at exit,
+  so a one-chunk perplexity run (4 graphs) shows it only at exit.
+- A `--kl-divergence-base` file stores log-probs in 16 bits over the top 16 nats, so identical logits score a
+  maximum KLD of about 6e-5. Compare a candidate with a rerun against the same file, not with 0.
 - `GGML_HEXAGON_VERBOSE=1` costs ~85 ms per pp4096 forward of host logging; never leave it on in a
   timed arm, and read the per-op DSP profile (`GGML_HEXAGON_PROFILE=1`) for op times instead.
 - Thermal drift between consecutive pp4096 runs on the QDC units is 10-20% (MUL_MAT 858 -> 1111 us
