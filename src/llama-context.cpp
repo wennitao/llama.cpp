@@ -2343,6 +2343,12 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (getenv("LLAMA_SELECTOR")) {
         res += 160u * model.hparams.n_layer();
     }
+    // XAttention (llama-xattention.h: LLAMA_XATTN_THRESHOLD) adds the antidiagonal scorer, the selection and one
+    // FlashAttention per GQA lane with its views: Llama-3.2-3B's three lanes overflow the 8 x n_tensors budget
+    // (GGML_ASSERT on the scheduler's hash set in graph_reserve).
+    if (getenv("LLAMA_XATTN_THRESHOLD")) {
+        res += 64u * model.hparams.n_layer();
+    }
 
     uint32_t n_sampling_nodes = 0;
     uint32_t n_sampling_nodes_max = 0;
