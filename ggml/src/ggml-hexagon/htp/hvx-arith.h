@@ -15,6 +15,15 @@
 
 #define UNUSED(x) (void)(x)
 
+// The software pipeliner carried a loop's ADD/SUB result across the loop edge by re-adding the converted
+// IEEE value to zero in qf32 (vadd(x.sf, 0)) and converting it again, and that round trip is not the
+// identity: 0 came out as 0x00000001 and 1.0 as 0x3f800001, in the remainder iterations of rows of 3 mod 4
+// vectors (Hexagon clang 19, v79), turning 0/1 masks into denormal members. An empty asm on the converted
+// vector pins it as an IEEE value inside the iteration, so there is no qf32 copy left to rebuild. Not
+// volatile: a volatile asm is a scheduling barrier and kept these loops from being software pipelined
+// (13 instead of 8 packets per 4 f32 vectors); the opaque output is all the fix needs.
+#define hvx_arith_settle(v) __asm__("" : "+v"(v))
+
 #define hvx_arith_loop_body(dst_type, src0_type, src1_type, elem_size, vec_store, vec_op) \
     do {                                                                       \
         dst_type * restrict vdst  = (dst_type *) dst;                          \
@@ -29,10 +38,13 @@
                                                                                \
         _Pragma("unroll(4)")                                                   \
         for (; i < nvec; i++) {                                                \
-            vdst[i] = vec_op(vsrc0[i], vsrc1[i]);                              \
+            HVX_Vector v = vec_op(vsrc0[i], vsrc1[i]);                         \
+            hvx_arith_settle(v);                                               \
+            vdst[i] = v;                                                       \
         }                                                                      \
         if (nloe) {                                                            \
             HVX_Vector v = vec_op(vsrc0[i], vsrc1[i]);                         \
+            hvx_arith_settle(v);                                               \
             vec_store((void *) &vdst[i], nloe * (elem_size), v);               \
         }                                                                      \
     } while(0)
