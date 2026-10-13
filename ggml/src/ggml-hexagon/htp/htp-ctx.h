@@ -106,6 +106,8 @@ struct htp_context {
     // Persistent DDR scratchpad for MUL_MAT_ID mappings
     void *                 ddr_spad_base;
     size_t                 ddr_spad_size;
+    void *                 fa_budget_buf;       // the FA op's in-kernel budget tables (flash-attn-ops.c), grow-only
+    size_t                 fa_budget_buf_size;
 
     struct htp_ops_context octx;
 

@@ -159,6 +159,7 @@ static int    opt_fa_fold_preq_idle = 0;   // GGML_HEXAGON_FA_FOLD_PREQ_IDLE_US:
 static int    opt_fa_fold_qmap = 0;        // GGML_HEXAGON_FA_FOLD_QMAP=1: enqueue a map/unmap of Q and the membership in the chain after the gate
 static int    opt_fa_fold_gate_delay = 0;  // GGML_HEXAGON_FA_FOLD_GATE_DELAY=<polls>: diagnostic hold after ready (~30 us per poll)
 static int    opt_fa_fold_notag = 0;       // GGML_HEXAGON_FA_FOLD_NOTAG=1: init the sidecar (keep-alive) but tag no node: the NPU runs the pool alone (timing probe, output lacks the exceptions)
+static int    opt_fa_fold_budget_milli = 0; // GGML_HEXAGON_FA_FOLD_BUDGET=k: the GPU keeps at most round(k * R * |shared list|) exception pairs per tile, the rest run on the NPU masked (in the DSP op, no graph ops); 0 = off
 // Cluster-selected sparse decode attention prototype (GGML_HEXAGON_CLUSTER_ATTN=<density_permille>,<window>[,flags]).
 // The backend owns a cluster-ordered shadow of the KV cache (htp-ops.h, HTP_FA_CLUSTER_*) and tags decode
 // FLASH_ATTN_EXT nodes so the HVX kernel attends over selected 64-key pages plus a dense recent window.
@@ -2289,9 +2290,8 @@ static bool ggml_hexagon_precompute_flash_attn_params(
                                          kparams->is_q_fp32 != 0, /*bc_step=*/bs, /*bc_cap=*/sel ? m_max * bs : 0,
                                          /*sel_blocks=*/(sel && !cnt) ? (size_t) sel->ne[0] : 0, br_align, mask_per_head);
         if (ret != 0 && br_align) {
-            // br_unit is ceil(32/G), so for G in {3,5,6,7} nothing divides a 64- or
-            // 128-wide query block. Fail-closed (the op drops to a dense backend), but
-            // it is a silent capability cliff, so name it.
+            // No Br divides the query block within VTCM. Fail-closed (the op drops to a
+            // dense backend), but it is a silent capability cliff, so name it.
             HEX_VERBOSE("ggml-hex: fa-params no (Br, Bc) with Br dividing bq %zu (G %u neq1 %u kv_eff %u)\n",
                         br_align, G, neq1, kv_effective);
         }
@@ -2322,6 +2322,11 @@ static bool ggml_hexagon_precompute_flash_attn_params(
             // so the device keeps taking row 0 for every query block, as before.
             kparams->u.hmx.sel_bq    = (uint16_t) br_align;
             kparams->u.hmx.dyn_sel   = cnt ? 1 : 0;
+            // src[8] is either LLAMA_SPARSE_ATTN_EXACT's full membership (the DSP masks with it) or the split's
+            // exception list, which only a fold may read: as a mask it would hide every shared block and zero the
+            // output. The graph names them apart; anything but the exact membership is an exception list.
+            kparams->u.hmx.flags     = (op->src[8] && strncmp(ggml_get_name(op->src[8]), "sparse_exact_mem", 16) != 0)
+                                       ? HTP_FA_HMX_F_EXC_ONLY : 0;
             // The device still decides: it needs the VTCM the chosen (Br, Bc) left over,
             // and the selection itself, neither of which is known here.
             kparams->u.hmx.res_mode  = (uint16_t) opt_fa_kv_residency;
@@ -5344,6 +5349,7 @@ static bool ggml_hexagon_hfold_ensure_buffer(ggml_hexagon_hfold * h, uint32_t ro
     hdr.slot = 0; hdr.off_ctl = (uint32_t) h->off_ctl; hdr.timeout_us = 2000000;
     hdr.off_exc = 0; hdr.exc_nbk = 0;   // the membership is src[8]
     hdr.off_done = (uint32_t) h->off_done;
+    hdr.budget_milli = (uint32_t) std::max(0, opt_fa_fold_budget_milli);
     const struct htp_fa_fold_hdr * cur = (const struct htp_fa_fold_hdr *) h->base;
     if (memcmp(cur, &hdr, sizeof(hdr)) != 0) {
         ggml_hexagon_hfold_wait_idle(h);
@@ -5353,12 +5359,19 @@ static bool ggml_hexagon_hfold_ensure_buffer(ggml_hexagon_hfold * h, uint32_t ro
     return true;
 }
 
+// LLAMA_SPARSE_ATTN_EXACT's membership (every selected pair, the DSP masks with it) has the split's exception layout; a
+// fold over it would compute every pair on both engines. The graph names the two apart (src/llama-graph.cpp).
+static bool hfold_exact_membership(const ggml_tensor * em) {
+    return strncmp(ggml_get_name(em), "sparse_exact_mem", 16) == 0;
+}
+
 static bool ggml_hexagon_hfold_prepare(ggml_hexagon_session * sess, ggml_tensor * n, const struct htp_fa_kernel_params * kp) {
     ggml_hexagon_hfold * h = sess->hfold;
     const ggml_tensor * q = n->src[0], * k = n->src[1], * v = n->src[2], * m = n->src[3];
     const ggml_tensor * sel = n->src[5], * cnt = n->src[6], * em = n->src[8];
     if (kp->kernel_type != HTP_FA_KERNEL_HMX) return false;
     if (!sel || !cnt || !em || !m) return false;                       // the graph did not build the split
+    if (hfold_exact_membership(em)) return false;                      // NPU-only exact mode: every pair stays on the DSP
     if (q->ne[1] < 2 || q->ne[3] != 1) return false;
     const int DK = (int) q->ne[0], DV = (int) v->ne[0];
     if (DK != 128 || DV != 128) return false;
@@ -5790,13 +5803,24 @@ static void ggml_hexagon_hfold_relay_main(ggml_hexagon_hfold * h) {
         const auto t0 = clock_t::now();
         for (;;) {
             hetero_dc_civac((const void *) ready, 4);
-            if (__atomic_load_n(ready, __ATOMIC_ACQUIRE) == want) return true;
+            // >= want, wrap-safe: an op with no GPU exception tile (the DSP's budget can leave one) never waits for its
+            // stages, so the DSP can publish the next op's ready before this relay, busy with the previous job, reads
+            // this one. Release the chain anyway: nobody folds its output, and the in-order queue must not stall
+            // behind a gate that would spin to its timeout.
+            if ((int32_t) (__atomic_load_n(ready, __ATOMIC_ACQUIRE) - want) >= 0) return true;
             const auto now = clock_t::now();
             const auto el  = now - t0;
             if (el > std::chrono::milliseconds(3000)) return false;
             if (poll_hook) poll_hook();
             if (el > std::chrono::microseconds(200) && now < t_tight) std::this_thread::sleep_for(std::chrono::microseconds(20));
         }
+    };
+
+    // The DSP is already past this job (it published a later op's ready): that op never waited for this chain, and the
+    // graph allocator is reusing this job's Q and membership, so CHECK must not snapshot them.
+    auto relay_late = [&](uint32_t want) {
+        hetero_dc_civac((const void *) ready, 4);
+        return (int32_t) (__atomic_load_n(ready, __ATOMIC_ACQUIRE) - want) > 0;
     };
 
     // CHECK=2 (chain path): at `ready`, snapshot the membership row and the Q row of a few
@@ -5898,7 +5922,7 @@ static void ggml_hexagon_hfold_relay_main(ggml_hexagon_hfold * h) {
                 h->us_ready += us_between(t0, t_ready);
                 b_ready += us_between(t0, t_ready);
                 if (!seen) { h->n_ready_timeouts++; continue; }   // the op times out on its own and fails loudly
-                if (opt_fa_fold_check == 2 && (h->n_jobs % 2) == 0) check_snapshot(j, 2);
+                if (opt_fa_fold_check == 2 && (h->n_jobs % 2) == 0 && !relay_late(j.want)) check_snapshot(j, 2);
                 legacy_gpu(j, b_tab, b_gpu, b_blk, t_ready);
                 if (opt_fa_fold_check == 2 && !picks.empty()) check_verify(j);
                 h->n_chain++;   // counts checked jobs for the summary line
@@ -5957,7 +5981,7 @@ static void ggml_hexagon_hfold_relay_main(ggml_hexagon_hfold * h) {
                     h->period_us = h->period_us > 0 ? 0.7 * h->period_us + 0.3 * p : p;
                 }
                 t_ready_prev = t_ready; have_prev = true;
-                if (opt_fa_fold_check == 2 && (h->n_chain % 2) == 0) check_snapshot(j, 2);
+                if (opt_fa_fold_check == 2 && (h->n_chain % 2) == 0 && !relay_late(j.want)) check_snapshot(j, 2);
                 if (opt_fa_fold_trig) {
                     // a submission that references the DSP-written inputs, after they were written
                     int a = 0;
@@ -6000,6 +6024,7 @@ static void ggml_hexagon_hfold_relay_main(ggml_hexagon_hfold * h) {
                     // the chain did nothing (every kernel behind the gate checks it): host path
                     h->n_gate_timeouts += gate_to; h->n_fallback++;
                     release_chain(c);
+                    picks.clear();   // a snapshot of this job is not checked on the host path
                     legacy_gpu(j, b_tab, b_gpu, b_blk, t_ready);
                     h->n_chain++;
                     continue;
@@ -6120,6 +6145,12 @@ static void ggml_hexagon_hfold_log_summary(ggml_hexagon_hfold * h) {
                   st[HTP_FA_FOLD_ST_WAITS], st[HTP_FA_FOLD_ST_TILES_BLOCKED], st[HTP_FA_FOLD_ST_WAIT_US_MAX],
                   h->n_jobs ? (double) st[HTP_FA_FOLD_ST_WAIT_US_SUM] / (double) h->n_jobs : 0.0, st[HTP_FA_FOLD_ST_TIMEOUTS],
                   h->n_jobs ? h->us_ready / (double) h->n_jobs : 0.0, h->n_jobs ? h->us_gpu / (double) h->n_jobs : 0.0);
+    if (opt_fa_fold_budget_milli > 0) {
+        // a skel that predates the budget ignores the header field: zero applied ops with jobs run means the budget never ran
+        GGML_LOG_INFO("ggml-hex: fa-fold budget k = %.3f: applied in %u DSP ops, rejected (plain split) in %u%s\n",
+                      opt_fa_fold_budget_milli / 1000.0, st[HTP_FA_FOLD_ST_BUDGET_OPS], st[HTP_FA_FOLD_ST_BUDGET_REJECTED],
+                      h->n_jobs && !st[HTP_FA_FOLD_ST_BUDGET_OPS] ? " -- NOT APPLIED (skel without the in-kernel budget?)" : "");
+    }
     if (h->n_chain) {
         const double n = (double) h->n_chain;
         GGML_LOG_INFO("ggml-hex: fa-fold chain: %llu jobs (preq %d, chain %d): pre-enqueued %llu, late %llu, gate timeouts %llu, fallbacks %llu; per job: enqueue lead %.0f us before ready, gate open %.0f us after ready, first done %.0f us, last done %.0f us; ION done already visible at the SVM word %llu of %llu stages, stamp visible %llu; gates opened by the DSP's own word %llu; kernel list errors %llu; check rows %llu bad %llu; period %.0f us\n",
@@ -8121,6 +8152,10 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                         hetero_slot++;
                     }
                 }
+                if (n->src[8] && !hfold_exact_membership(n->src[8]) && !(opt_fa_fold > 0 && opt_hetero_frac <= 0.0f)) {
+                    static int warned_nofold = 0;
+                    if (!warned_nofold++) GGML_LOG_WARN("ggml-hex: %s carries the split's exceptions but the GPU fold is off (GGML_HEXAGON_FA_FOLD): it runs the shared list alone\n", n->name);
+                }
                 if (opt_fa_fold > 0 && opt_hetero_frac <= 0.0f) {
                     // (init happens on the first FA node even if it is not tagged: the keep-alive control needs it)
                     if (!sess->hfold && !ggml_hexagon_hfold_init(sess)) {
@@ -8130,7 +8165,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                     if (sess->hfold && !opt_fa_fold_notag) {
                         // a node the graph built for the split (src[8] set) that the sidecar cannot
                         // take would run the pool alone and silently lose its exceptions: say so
-                        if (!ggml_hexagon_hfold_prepare(sess, n, (const struct htp_fa_kernel_params *) node.kernel_params) && n->src[8]) {
+                        if (!ggml_hexagon_hfold_prepare(sess, n, (const struct htp_fa_kernel_params *) node.kernel_params) && n->src[8] &&
+                            !hfold_exact_membership(n->src[8])) {
                             static int warned = 0;
                             if (!warned++) GGML_LOG_WARN("ggml-hex: fa-fold: %s has an exception membership but cannot be tagged (shape/alignment): its output lacks the exceptions\n", n->name);
                         }
@@ -8990,6 +9026,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_fa_fold_perf   = getenv("GGML_HEXAGON_FA_FOLD_PERF");
     const char * str_fa_fold_flush  = getenv("GGML_HEXAGON_FA_FOLD_FLUSH");
     const char * str_fa_fold_stage  = getenv("GGML_HEXAGON_FA_FOLD_STAGE_QB");
+    const char * str_fa_fold_budget = getenv("GGML_HEXAGON_FA_FOLD_BUDGET");
     const char * str_fa_fold_keep   = getenv("GGML_HEXAGON_FA_FOLD_KEEPALIVE");
     const char * str_fa_fold_keepp  = getenv("GGML_HEXAGON_FA_FOLD_KEEPALIVE_PERIOD_US");
     const char * str_fa_fold_gpudone = getenv("GGML_HEXAGON_FA_FOLD_GPUDONE");
@@ -9116,6 +9153,19 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_fa_fold_perf   = str_fa_fold_perf   ? atoi(str_fa_fold_perf)         : opt_fa_fold_perf;
     opt_fa_fold_flush  = str_fa_fold_flush  ? atoi(str_fa_fold_flush)        : opt_fa_fold_flush;
     opt_fa_fold_stage_qb = str_fa_fold_stage ? atoi(str_fa_fold_stage)       : opt_fa_fold_stage_qb;
+    if (str_fa_fold_budget) {
+        // thousandths on the wire; a positive k below 0.0005 still means "almost nothing to the GPU", not "off"
+        char *       end = nullptr;
+        const double k   = strtod(str_fa_fold_budget, &end);
+        if (end == str_fa_fold_budget || !(k >= 0.0)) {
+            GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_FA_FOLD_BUDGET=%s is not a non-negative number: budget off\n", str_fa_fold_budget);
+            opt_fa_fold_budget_milli = 0;
+        } else {
+            opt_fa_fold_budget_milli = k > 0.0 ? (int) std::max(1L, std::min(1000000L, lround(k * 1000.0))) : 0;
+            GGML_LOG_INFO("ggml-hex: in-kernel fold budget k = %.3f (the GPU keeps at most round(k * R * |shared|) exception pairs per tile)\n",
+                          opt_fa_fold_budget_milli / 1000.0);
+        }
+    }
     opt_fa_fold_keepalive = str_fa_fold_keep ? atoi(str_fa_fold_keep)        : opt_fa_fold_keepalive;
     opt_fa_fold_keepalive_period = str_fa_fold_keepp ? atoi(str_fa_fold_keepp) : opt_fa_fold_keepalive_period;
     opt_fa_fold_gpudone = str_fa_fold_gpudone ? atoi(str_fa_fold_gpudone)     : opt_fa_fold_gpudone;

@@ -17,6 +17,9 @@ extern "C" {
 #define HTP_FA_HMX_TILE_SIZE   2048
 #define HMX_FP16_TILE_SIZE     2048
 #define HMX_FP16_TILE_N_ROWS   32
+
+// htp_fa_kernel_params.u.hmx.flags
+#define HTP_FA_HMX_F_EXC_ONLY  1   // src[8] is the split's exception list (fold input only), never an exact-mask membership
 #define HMX_FP16_TILE_N_COLS   32
 #define HMX_FP16_TILE_N_ELMS   1024
 
@@ -97,7 +100,7 @@ struct htp_fa_kernel_params {
             // tensor. Chunk decomposition, the KV loop bound and the DMA FIFO all
             // become per-row; VTCM does not change -- it holds one Bc-wide chunk.
             uint16_t dyn_sel;
-            uint16_t reserved0;
+            uint16_t flags;              // HTP_FA_HMX_F_*
             int32_t  mask_broadcast;
             int32_t  pipeline;
             struct fastdiv_values div_G;

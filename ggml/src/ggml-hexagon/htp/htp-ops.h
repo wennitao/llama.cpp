@@ -286,6 +286,8 @@ enum htp_fa_fold_status_word {
     HTP_FA_FOLD_ST_WAIT_US_MAX,
     HTP_FA_FOLD_ST_TILES_BLOCKED,  // STAGED: stage waits that actually spun, summed over ops
     HTP_FA_FOLD_ST_WAIT_US_SUM,    // STAGED: blocked time summed over ops (mean = / ops)
+    HTP_FA_FOLD_ST_BUDGET_OPS,     // STAGED: ops that applied the in-kernel budget (header budget_milli)
+    HTP_FA_FOLD_ST_BUDGET_REJECTED,// STAGED: ops with a budget whose shapes it could not take (they ran the plain split)
     HTP_FA_FOLD_ST_N
 };
 
@@ -316,6 +318,9 @@ struct htp_fa_fold_hdr {
     uint32_t exc_nbk;    // STAGED only: 0 = one uint32 flag per (head, sub-block); else exc_nbk f32 per
                          // (head, sub-block), the graph's sparse_exc_mem rows, nonzero = member
     uint32_t off_done;   // STAGED only: done words (HTP_FA_FOLD_MAX_STAGES uint32, 128-aligned); 0 = slot line + 128
+    uint32_t budget_milli; // STAGED, src[8] membership: the GPU keeps at most round(k * R * |shared list|) exception pairs
+                           // per (tile, KV head), k in thousandths (htp/fa-budget.h); the rest run on the NPU masked to
+                           // their own sub-blocks. 0 = off (the GPU computes every exception)
 };
 
 // Cluster-selected sparse decode attention (dev prototype; host env GGML_HEXAGON_CLUSTER_ATTN).

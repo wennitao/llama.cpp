@@ -34,6 +34,9 @@
 #include "flash-attn-ops.h"
 #include "hvx-fa-kernels.h"
 #include "hmx-fa-kernels.h"
+#include "fa-budget.h"
+
+#include <stdlib.h>
 
 // Must be multiple of 32
 #define FLASH_ATTN_BLOCK_SIZE (32 * 2)
@@ -315,6 +318,8 @@ struct hmx_fa_context {
     const uint32_t * fold_exc;          // [n_kv_heads][fold_num_sb] x (exc_nbk ? exc_nbk : 1), nonzero = exception
     uint32_t         fold_num_sb;
     uint32_t         fold_exc_nbk;      // 0: one flag per (head, sub-block); else membership row length
+    uint32_t         fold_budget_milli; // header budget_milli: the in-kernel GPU budget (fa_budget_apply); 0 = off
+    uint32_t         fold_budget_state; // 0 = no budget, 1 = applied, 2 = rejected (the op ran the plain split)
     // Exact-mask mode (src[8] without a fold buffer): the FULL per-sub-block membership,
     // [n_kv_heads][num_sb] rows of xmask_nbk f32 (nonzero = the sub-block selected the block).
     // The softmax sets every (32-row group, KV block) the group's sub-block did not select to -inf,
@@ -322,6 +327,10 @@ struct hmx_fa_context {
     const float *    xmask;
     uint32_t         xmask_nbk;
     uint32_t         xmask_num_sb;
+    // In-kernel budget only: per (KV head, tile) [xmask_nsh_T per head], the number of leading list entries that every
+    // sub-block attends (the shared list); chunks entirely inside it skip the mask lookups. NULL = look up every chunk.
+    const uint16_t * xmask_nsh;
+    uint32_t         xmask_nsh_T;
     uint64_t         fold_stage_seen;   // bit k: done word k confirmed and its rows invalidated
     uint32_t         fold_wait_us_acc;  // this op's blocked time over all stages
     uint32_t         fold_tiles_blocked;
@@ -1651,7 +1660,10 @@ static inline void fa_softmax_impl(
     uint32_t xm_nblk = 0;
     if (factx->xmask) {
         const uint32_t qb = fa_sel_row(factx, args->q_start);
-        for (size_t c = 0; c < kv_rows && xm_nblk < 16; c += 64) {
+        // the in-kernel budget's lists start with the shared blocks, which no sub-block masks
+        const bool shared_only = factx->xmask_nsh &&
+            (args->kv_blk + 1) * factx->m <= factx->xmask_nsh[(size_t) args->kv_head * factx->xmask_nsh_T + qb];
+        for (size_t c = 0; !shared_only && c < kv_rows && xm_nblk < 16; c += 64) {
             xm_blk[xm_nblk] = fa_chunk_block_idx(factx, args->kv_blk, xm_nblk, qb, args->kv_head, args->ib3);
             xm_nblk++;
         }
@@ -1665,7 +1677,7 @@ static inline void fa_softmax_impl(
         // exact-mask mode: the group's 32 rows are 32/G tokens of one 64-token sub-block; one bit
         // per 64-key vector says the sub-block did not select that block
         uint32_t xm_bits = 0;
-        if (factx->xmask) {
+        if (xm_nblk) {
             const uint32_t tok = args->q_start + (uint32_t) fastdiv(r_vec_idx * 32, &factx->div_G);
             const uint32_t sb  = tok / HTP_FA_FOLD_EXC_SB;
             const float *  row = factx->xmask + ((size_t) args->kv_head * factx->xmask_num_sb + sb) * factx->xmask_nbk;
@@ -2403,6 +2415,8 @@ static void fa_fold_staged_status(struct hmx_fa_context * factx) {
     st[HTP_FA_FOLD_ST_SLOT]          = factx->fold_slot;
     st[HTP_FA_FOLD_ST_WAIT_US]       = factx->fold_wait_us_acc;
     st[HTP_FA_FOLD_ST_WAIT_US_SUM]  += factx->fold_wait_us_acc;
+    st[HTP_FA_FOLD_ST_BUDGET_OPS]      += factx->fold_budget_state == 1 ? 1u : 0u;
+    st[HTP_FA_FOLD_ST_BUDGET_REJECTED] += factx->fold_budget_state == 2 ? 1u : 0u;
     if (factx->fold_wait_us_acc > st[HTP_FA_FOLD_ST_WAIT_US_MAX]) {
         st[HTP_FA_FOLD_ST_WAIT_US_MAX] = factx->fold_wait_us_acc;
     }
@@ -3151,7 +3165,202 @@ static bool fa_sel_repeats_blocks(const struct hmx_fa_context * factx, uint32_t 
 // Core HMX flash attention algorithm (GQA-merged)
 // ============================================================================
 
+// ---- In-kernel workload-aware budget (fold header budget_milli) ----
+//
+// The rule of LLAMA_SPARSE_ATTN_GPU_SHARE (src/llama-graph.cpp) without its ~32 graph ops per layer: per (256-query
+// tile, KV head) the GPU keeps at most round(k * R * |shared list|) exception pairs, singles first (fa_budget_split), and
+// the other pairs run on the NPU. The GPU's share stays in src[8], whose NPU pairs are cleared here before the producer
+// is released (it reads src[8] after ready); the NPU's share extends the tile's block list -- DSP-built copies of src[5]
+// and src[6] -- and is masked to the sub-blocks that selected it through a DSP-built xmask. Everything downstream (lists,
+// counts, exception tiles, the masked softmax) reads those, so the op runs the graph mode's attention pattern exactly.
+// The tables live in a grow-only buffer of the HTP context.
+#define FA_BUDGET_SHARED   1
+#define FA_BUDGET_ADDED    2
+#define FA_BUDGET_KEEP_GPU 3
+
+typedef struct {
+    const struct hmx_fa_context * factx;
+    uint32_t *       em;      // src[8]
+    int32_t *        tsel;    // [H][T][n_sel] lists
+    float *          tcnt;    // [H][T] lengths
+    uint16_t *       tnsh;    // [H][T] shared entries at the head of each list (unmasked for every sub-block)
+    float *          txm;     // [H][num_sb][nbk] masks
+    fa_budget_pair * pairs;   // n_threads slices of R * nbk
+    uint32_t         R, T, H, num_sb, nbk, n_sel;
+    uint8_t          touched[HTP_MAX_NTHREADS];
+} fa_budget_job_t;
+
+// One (tile, KV head) per iteration, tiles striped over the threads: each writes only its own tiles' em rows, lists,
+// lengths and mask rows, so the threads never share a line they write.
+static void fa_budget_thread(unsigned int n, unsigned int ith, void * data) {
+    fa_budget_job_t *             jb    = (fa_budget_job_t *) data;
+    const struct hmx_fa_context * factx = jb->factx;
+    const uint32_t R = jb->R, T = jb->T, num_sb = jb->num_sb, nbk = jb->nbk, n_sel = jb->n_sel;
+    fa_budget_pair * pairs = jb->pairs + (size_t) ith * R * nbk;
+    uint8_t          seen[FA_BUDGET_MAX_NBK];   // per block: 0, FA_BUDGET_SHARED, FA_BUDGET_ADDED, FA_BUDGET_KEEP_GPU
+    bool             touched = false;
+    for (uint32_t tile = ith; tile < jb->H * T; tile += n) {
+        const uint32_t h = tile / T, t = tile % T;
+        // the shared list and its length exactly as the kernel reads them (truncated, clamped to n_sel)
+        const float    c    = *(const float *) ((const uint8_t *) factx->cnt + t * factx->cnt_nb_qb + h * factx->cnt_nb_head);
+        uint32_t       n_sh = c > 0.0f ? (uint32_t) c : 0u;
+        n_sh = n_sh > n_sel ? n_sel : n_sh;
+        const int32_t * list = (const int32_t *) ((const uint8_t *) factx->sel + t * factx->sel_nb1 + h * factx->sel_nb2);
+        uint32_t *     rows  = jb->em + ((size_t) h * num_sb + (size_t) t * R) * nbk;
+        uint32_t       n_gpu = 0;
+        const uint32_t n_npu = fa_budget_split(rows, nbk, R, nbk, fa_budget_pairs(factx->fold_budget_milli, R, n_sh),
+                                               pairs, &n_gpu);
+        int32_t * out = jb->tsel + ((size_t) h * T + t) * n_sel;
+        float *   xr  = jb->txm + ((size_t) h * num_sb + (size_t) t * R) * nbk;   // the tile's R mask rows
+        uint32_t  len = 0;
+        memset(seen, 0, nbk);
+        for (uint32_t i = 0; i < n_sh; ++i) {   // shared blocks: every sub-block attends them
+            const int32_t b = list[i];
+            out[len++] = b;
+            if ((uint32_t) b < nbk) {
+                seen[b] = FA_BUDGET_SHARED;
+                for (uint32_t j = 0; j < R; ++j) {
+                    xr[(size_t) j * nbk + b] = 1.0f;
+                }
+            }
+        }
+        if (len == 0) {
+            out[0] = list[0];   // the kernel clamps a zero count to one entry: keep it src[5]'s, unmasked as without the budget
+            if ((uint32_t) list[0] < nbk) {
+                for (uint32_t j = 0; j < R; ++j) {
+                    xr[(size_t) j * nbk + (uint32_t) list[0]] = 1.0f;
+                }
+            }
+        }
+        jb->tnsh[(size_t) h * T + t] = (uint16_t) n_sh;
+        bool tile_touched = false;
+        if (n_npu) {
+            for (uint32_t i = 0; i < n_npu; ++i) {   // each NPU block joins the list once, masked for every sub-block
+                const uint32_t b = pairs[i].b;
+                if (seen[b] == 0) {
+                    if (len < n_sel) {
+                        seen[b]    = FA_BUDGET_ADDED;
+                        out[len++] = (int32_t) b;
+                        for (uint32_t j = 0; j < R; ++j) {
+                            xr[(size_t) j * nbk + b] = 0.0f;
+                        }
+                    } else {
+                        seen[b] = FA_BUDGET_KEEP_GPU;   // no room in the list: the GPU keeps these pairs
+                    }
+                }
+            }
+            for (uint32_t i = 0; i < n_npu; ++i) {
+                const uint32_t b = pairs[i].b, j = pairs[i].j;
+                if (seen[b] == FA_BUDGET_KEEP_GPU) {
+                    continue;
+                }
+                if (seen[b] == FA_BUDGET_ADDED) {
+                    xr[(size_t) j * nbk + b] = 1.0f;   // unmasked for the sub-blocks that selected it
+                }
+                rows[(size_t) j * nbk + b] = 0u;       // off the GPU's membership (a shared block's pair would be counted twice)
+                tile_touched = true;
+            }
+        }
+        // The producer reads src[8] through DDR once ready goes up: push this tile's cleared pairs out per 32-byte L1
+        // line (a cleared pair left in L1 would be computed by both engines and shift its logit by +ln2, with no error
+        // anywhere). A line shared with a neighbouring tile is cleaned again by that tile's thread after its own writes.
+        if (tile_touched) {
+            hex_l1inval(rows, (size_t) R * nbk * sizeof(uint32_t));
+            touched = true;
+        }
+        jb->tcnt[(size_t) h * T + t] = (float) len;
+    }
+    jb->touched[ith] = touched;
+}
+
+static bool fa_budget_apply(struct hmx_fa_context * factx, const struct htp_tensor * em_t, uint32_t sel_bq) {
+    const uint32_t R      = sel_bq / HTP_FA_FOLD_EXC_SB;
+    const uint32_t T      = factx->sel_nq;
+    const uint32_t H      = factx->n_kv_heads;
+    const uint32_t num_sb = factx->fold_num_sb;
+    const uint32_t nbk    = factx->fold_exc_nbk;
+    const uint32_t n_sel  = factx->n_sel;
+    // One 64-key block per mask entry (the softmax's xm path), one membership row per 64-query sub-block, every block
+    // index addressable in the mask, and every list able to hold every block.
+    if (!em_t || !em_t->data || R == 0 || R > FA_BUDGET_MAX_R || em_t->ne[1] != R || T * R != num_sb ||
+        factx->sparse_bs != HTP_FA_FOLD_EXC_SB || nbk == 0 || nbk > FA_BUDGET_MAX_NBK || nbk != factx->n_blk_total ||
+        n_sel < nbk || !factx->sel || !factx->cnt || factx->fold_exc != (const uint32_t *) (uintptr_t) em_t->data) {
+        FARF(ERROR, "fa budget: unusable shapes (R %u T %u heads %u num_sb %u nbk %u blocks %u n_sel %u bs %u)", R, T, H,
+             num_sb, nbk, factx->n_blk_total, n_sel, factx->sparse_bs);
+        return false;
+    }
+    const uint32_t nth    = factx->n_threads > 0 && factx->n_threads <= HTP_MAX_NTHREADS ? factx->n_threads : 1u;
+    const size_t   sz_sel = hex_round_up((size_t) H * T * n_sel * sizeof(int32_t), 128);
+    const size_t   sz_cnt = hex_round_up((size_t) H * T * sizeof(float), 128);
+    const size_t   sz_nsh = hex_round_up((size_t) H * T * sizeof(uint16_t), 128);
+    const size_t   sz_xm  = hex_round_up((size_t) H * num_sb * nbk * sizeof(float), 128);
+    const size_t   sz_pr  = hex_round_up((size_t) nth * R * nbk * sizeof(fa_budget_pair), 128);
+    const size_t   need   = sz_sel + sz_cnt + sz_nsh + sz_xm + sz_pr;
+    struct htp_context * hctx = factx->octx->ctx;
+    if (need > hctx->fa_budget_buf_size) {
+        free(hctx->fa_budget_buf);
+        hctx->fa_budget_buf      = memalign(128, need);
+        hctx->fa_budget_buf_size = hctx->fa_budget_buf ? need : 0;
+        if (!hctx->fa_budget_buf) {
+            FARF(ERROR, "fa budget: no memory for %u bytes of tables", (unsigned) need);
+            return false;
+        }
+    }
+    uint8_t * const fa_budget_buf = (uint8_t *) hctx->fa_budget_buf;
+    fa_budget_job_t jb;
+    memset(&jb, 0, sizeof(jb));
+    jb.factx  = factx;
+    jb.em     = (uint32_t *) (uintptr_t) em_t->data;   // src[8]: this op is its last reader on the DSP
+    jb.tsel   = (int32_t *) fa_budget_buf;
+    jb.tcnt   = (float *) (fa_budget_buf + sz_sel);
+    jb.tnsh   = (uint16_t *) (fa_budget_buf + sz_sel + sz_cnt);
+    jb.txm    = (float *) (fa_budget_buf + sz_sel + sz_cnt + sz_nsh);
+    jb.pairs  = (fa_budget_pair *) (fa_budget_buf + sz_sel + sz_cnt + sz_nsh + sz_xm);
+    jb.R = R; jb.T = T; jb.H = H; jb.num_sb = num_sb; jb.nbk = nbk; jb.n_sel = n_sel;
+    if (nth > 1) {
+        work_queue_run(factx->octx->ctx->work_queue, fa_budget_thread, &jb, nth);
+    } else {
+        fa_budget_thread(1, 0, &jb);
+    }
+    bool touched = false;
+    for (uint32_t i = 0; i < nth; ++i) {
+        touched |= jb.touched[i] != 0;
+    }
+    if (!touched) {
+        return true;   // no pair moved: the tables equal src[5] / src[6], and nothing needs a mask
+    }
+    factx->sel          = jb.tsel;
+    factx->sel_nb1      = T > 1 ? n_sel * (uint32_t) sizeof(int32_t) : 0u;
+    factx->sel_nb2      = H > 1 ? T * n_sel * (uint32_t) sizeof(int32_t) : 0u;
+    factx->sel_nb3      = 0;
+    factx->cnt          = jb.tcnt;
+    factx->cnt_nb_qb    = T > 1 ? (uint32_t) sizeof(float) : 0u;
+    factx->cnt_nb_head  = H > 1 ? T * (uint32_t) sizeof(float) : 0u;
+    factx->cnt_nb_seq   = 0;
+    factx->xmask        = jb.txm;
+    factx->xmask_nbk    = nbk;
+    factx->xmask_num_sb = num_sb;
+    factx->xmask_nsh    = jb.tnsh;
+    factx->xmask_nsh_T  = T;
+    return true;
+}
+
+// The selection inputs -- src[5] lists, src[6] counts, src[8] membership, src[9] mask -- are read
+// below with SCALAR loads, and an op earlier in the batch wrote them by DMA, which does not invalidate
+// L1: a line an earlier scalar reader left at the address serves old bytes. The op-start flush drops
+// L1 lines only for small ranges (hex_l2flush), so drop these per L1 line before the op reads them.
+static void fa_scalar_inputs_inval(const struct htp_ops_context * octx) {
+    static const uint8_t idx[] = { 5, 6, 8, 9 };
+    for (size_t i = 0; i < sizeof(idx); ++i) {
+        const struct htp_tensor * t = octx->src[idx[i]];
+        if (t && t->data && t->size) {
+            hex_l1inval((const void *) (uintptr_t) t->data, t->size);
+        }
+    }
+}
+
 int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+    fa_scalar_inputs_inval(octx);
     struct htp_thread_trace * tr_hvx = &octx->ctx->trace[0];
     struct htp_thread_trace * tr_hmx = &octx->ctx->trace[HTP_MAX_NTHREADS];
     const struct htp_tensor * q    = octx->src[0];
@@ -3363,6 +3572,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     factx.xmask          = NULL;
     factx.xmask_nbk      = 0;
     factx.xmask_num_sb   = 0;
+    factx.xmask_nsh      = NULL;
+    factx.xmask_nsh_T    = 0;
+    factx.fold_budget_state = 0;
     factx.fold_n_kv_heads = 0;
     factx.fold_instore   = false;
     factx.fold_probe     = 0;
@@ -3378,8 +3590,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
         uint8_t * const fb = (uint8_t *) (uintptr_t) octx->src[7]->data;
         // The host writes this header from the CPU. A line left over from an earlier op on the
         // same buffer would hand us the previous graph's offsets.
-        Q6_dcinva_A(fb);
-        Q6_dcinva_A(fb + HEX_L2_LINE_SIZE);
+        for (uint32_t off = 0; off < 2 * HEX_L2_LINE_SIZE; off += HEX_L1_LINE_SIZE) {
+            Q6_dcinva_A(fb + off);   // every L1 line of the two header lines (see hex_l2flush)
+        }
         const struct htp_fa_fold_hdr * fh = (const struct htp_fa_fold_hdr *) fb;
         if (fh->magic == HTP_FA_FOLD_MAGIC) {
             const uint64_t rows       = (uint64_t) neq1 * neq2 * neq3;
@@ -3417,6 +3630,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
             factx.fold_l_bytes   = (size_t) ml_bytes;
             factx.fold_acc_bytes = (size_t) (rows * acc_stride);
             factx.fold_instore   = (fh->flags & HTP_FA_FOLD_F_INSTORE) != 0;
+            factx.fold_budget_milli = fh->budget_milli;
             factx.fold_acc_f16   = acc_f16;
             if (acc_f16 && (!factx.fold_instore || (fh->flags & HTP_FA_FOLD_F_SPILL))) {
                 FARF(ERROR, "fa fold: ACC_F16 needs INSTORE and excludes SPILL (flags %u)", fh->flags);
@@ -3595,6 +3809,15 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
         return HTP_STATUS_OK;
     }
 
+    // ======== In-kernel workload-aware budget ========
+    // Before ready (the producer reads the rewritten src[8]) and before anything reads the lists. Not with the graph's own
+    // budget (src[9]); without usable shapes the op runs the plain split (every exception on the GPU).
+    if (factx.fold_budget_milli && factx.fold_staged) {
+        const bool applied = factx.fold_exc_nbk && !(octx->src[9] && octx->src[9]->data) &&
+                             fa_budget_apply(&factx, octx->src[8], kparams->u.hmx.sel_bq ? kparams->u.hmx.sel_bq : factx.sparse_bs);
+        factx.fold_budget_state = applied ? 1u : 2u;   // counted in the fold status words, so the host can tell
+    }
+
     // ======== Start the live producer ========
     // As early as the op can: it reads Q, not anything the KV loop below produces, so this is
     // pure overlap. The matching wait is at the first fold, at the bottom of the first tile.
@@ -3662,7 +3885,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     // Exact-mask mode: a membership in src[8] with NO fold buffer. Same tensor shape as the
     // split's exception membership (F32 [NBk, R, NBq/R, n_kv_heads]) but carrying every selected
     // (sub-block, block) pair; the tile's list is the union and the softmax masks the rest.
-    if (!factx.het_m && octx->src[8] && octx->src[8]->data) {
+    // An exception list without its fold (an untagged split node: FOLD off, NOTAG, or a shape the sidecar declined) is
+    // not a mask: it is zero on every shared block. Such a node runs the shared list alone.
+    if (!factx.het_m && octx->src[8] && octx->src[8]->data && !(kparams->u.hmx.flags & HTP_FA_HMX_F_EXC_ONLY)) {
         const struct htp_tensor * em     = octx->src[8];
         const uint32_t            num_sb = (neq1 + HTP_FA_FOLD_EXC_SB - 1) / HTP_FA_FOLD_EXC_SB;
         const uint32_t            nkvh   = k->ne[2];
@@ -3674,6 +3899,23 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
         }
         factx.xmask        = (const float *) (uintptr_t) em->data;   // this DSP wrote it: coherent
         factx.xmask_nbk    = em->ne[0];
+        factx.xmask_num_sb = num_sb;
+    }
+    // Workload-aware partition: the per-sub-block mask over the shared list arrives in src[9], with or without a fold
+    // buffer (the fold's exceptions stay in src[8]). Same layout and the same masking as the exact-mask mode: the tile's
+    // list carries the shared blocks for every sub-block plus each sub-block's NPU share of its exceptions.
+    if (octx->src[9] && octx->src[9]->data) {
+        const struct htp_tensor * xm     = octx->src[9];
+        const uint32_t            num_sb = (neq1 + HTP_FA_FOLD_EXC_SB - 1) / HTP_FA_FOLD_EXC_SB;
+        const uint32_t            nkvh   = k->ne[2];
+        if (!factx.sel || xm->type != HTP_TYPE_F32 || xm->nb[0] != sizeof(float) ||
+            (uint64_t) xm->ne[1] * xm->ne[2] != num_sb || xm->ne[3] != nkvh) {
+            FARF(ERROR, "fa xmask (src[9]): unusable (sel %d type %u ne %u %u %u %u, want num_sb %u heads %u)",
+                 factx.sel != NULL, xm->type, xm->ne[0], xm->ne[1], xm->ne[2], xm->ne[3], num_sb, nkvh);
+            return HTP_STATUS_INVAL_PARAMS;
+        }
+        factx.xmask        = (const float *) (uintptr_t) xm->data;   // this DSP wrote it: coherent
+        factx.xmask_nbk    = xm->ne[0];
         factx.xmask_num_sb = num_sb;
     }
 
@@ -4865,9 +5107,10 @@ struct hvx_fa_cl_setup {
 };
 
 static inline void hvx_fa_cl_inval(const void * p, size_t n) {
-    uintptr_t a = (uintptr_t) p & ~(uintptr_t) (HEX_L2_LINE_SIZE - 1);
+    // every L1 line (see hex_l2flush): one dcinva per L2 line left three of four L1 lines stale
+    uintptr_t a = (uintptr_t) p & ~(uintptr_t) (HEX_L1_LINE_SIZE - 1);
     const uintptr_t e = (uintptr_t) p + n;
-    for (; a < e; a += HEX_L2_LINE_SIZE) {
+    for (; a < e; a += HEX_L1_LINE_SIZE) {
         Q6_dcinva_A((void *) a);
     }
 }

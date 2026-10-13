@@ -606,6 +606,11 @@ AEEResult htp_iface_stop(remote_handle64 handle) {
 
     vtcm_free(ctx);
 
+    if (ctx->fa_budget_buf) {
+        free(ctx->fa_budget_buf);
+        ctx->fa_budget_buf      = NULL;
+        ctx->fa_budget_buf_size = 0;
+    }
     if (ctx->ddr_spad_base) {
         free(ctx->ddr_spad_base);
         ctx->ddr_spad_base = NULL;
