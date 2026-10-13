@@ -3094,8 +3094,12 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
         // at c_star - 0.5: us is an f32 sum of terms that a 1e-9 wide band of the clamp
         // above can leave just off 0 or 1, and a midpoint keeps the compare away from
         // every value the sum can take.
+        // The split-mask exact mode (LLAMA_SPARSE_ATTN_EXACT=2) reads the counts again below, so its union clamps a
+        // copy: ggml_clamp works in place.
+        const bool exact_split = !c_star && llama_sparse_attn_exact_mode() == 2;
         ggml_tensor * um = c_star ?
             ggml_clamp(ctx0, ggml_scale_bias(ctx0, us, BIGF, -((float) c_star - 0.5f) * BIGF), 0.0f, 1.0f) :
+            exact_split ? ggml_clamp(ctx0, ggml_scale(ctx0, us, 1.0f), 0.0f, 1.0f) :
             ggml_clamp(ctx0, us, 0.0f, 1.0f);
 
         // Head start (LLAMA_SPARSE_ATTN_HEADSTART=K): the first K tiles in the NPU's staged order
@@ -3206,6 +3210,24 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
             // per-64-block policy. Same layout as sparse_exc_mem: (b, j, t, h).
             ggml_tensor * pmb = ggml_clamp(ctx0, ggml_scale_bias(ctx0, pm, BIGF, -0.5f * BIGF), 0.0f, 1.0f);
             ggml_tensor * xm  = ggml_reshape_4d(ctx0, pmb, NBk, R, NBq / R, Hkv);
+            if (exact_split) {
+                // The split's shared list, cut from the same counts as the split's: c(b) >= c*, and the whole union in the
+                // first K tiles of the staged order (the head start). Every sub-block attends to it and to its own
+                // selection, sl OR pmb = 1 - (1 - sl)(1 - pmb), with ggml_mul broadcasting sl over the R sub-blocks
+                // (MUL and SCALE run on the HTP; ADD/SUB of a broadcast operand might not).
+                const uint32_t xc = llama_sparse_attn_exact_cstar();
+                ggml_tensor * sl = ggml_clamp(ctx0, ggml_scale_bias(ctx0, us, BIGF, -((float) xc - 0.5f) * BIGF), 0.0f, 1.0f);
+                if (const uint32_t xhs = llama_sparse_attn_headstart()) {
+                    ggml_tensor * ones = ggml_scale_bias(ctx0, ggml_sum_rows(ctx0, us), 0.0f, 1.0f);            // [1, NBq/R, Hkv]
+                    ggml_tensor * tid  = ggml_cumsum(ctx0, ggml_reshape_1d(ctx0, ones, (NBq / R) * Hkv));        // 1..N
+                    ggml_tensor * xhm  = ggml_clamp(ctx0, ggml_scale_bias(ctx0, tid, -BIGF, ((float) xhs + 0.5f) * BIGF), 0.0f, 1.0f);
+                    xhm = ggml_reshape_3d(ctx0, xhm, 1, NBq / R, Hkv);
+                    sl  = ggml_clamp(ctx0, ggml_add(ctx0, sl, ggml_clamp(ctx0, ggml_mul(ctx0, us, xhm), 0.0f, 1.0f)), 0.0f, 1.0f);
+                }
+                ggml_tensor * keep_out = ggml_mul(ctx0, ggml_scale_bias(ctx0, xm, -1.0f, 1.0f),
+                                                  ggml_reshape_4d(ctx0, ggml_scale_bias(ctx0, sl, -1.0f, 1.0f), NBk, 1, NBq / R, Hkv));
+                xm = ggml_scale_bias(ctx0, keep_out, -1.0f, 1.0f);
+            }
             ggml_format_name(xm, "sparse_exact_mem-%d", il);
             *exc_out = xm;
         }

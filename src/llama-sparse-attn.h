@@ -118,6 +118,21 @@ static inline bool llama_sparse_attn_exact() {
     return s && atoi(s) > 0;
 }
 
+// LLAMA_SPARSE_ATTN_EXACT=2 masks the union tile to the SPLIT's effective membership instead: every sub-block attends
+// to the shared list the split would run (c(b) >= LLAMA_SPARSE_ATTN_EXACT_CSTAR, default 2, plus the union of the first
+// LLAMA_SPARSE_ATTN_HEADSTART tiles) and to its own selection, with no GPU work. The NPU-only arm with the same mask
+// as the split (CSTAR unset), so the two differ only in where the pairs run.
+static inline int llama_sparse_attn_exact_mode() {
+    const char * s = getenv("LLAMA_SPARSE_ATTN_EXACT");
+    return s ? atoi(s) : 0;
+}
+
+static inline uint32_t llama_sparse_attn_exact_cstar() {
+    const char * s = getenv("LLAMA_SPARSE_ATTN_EXACT_CSTAR");
+    const int v = s ? atoi(s) : 2;
+    return v >= 1 && v <= LLAMA_SPARSE_ATTN_BQ / LLAMA_SPARSE_ATTN_BS ? (uint32_t) v : 2;
+}
+
 static inline uint32_t llama_sparse_attn_gpu_cap() {
     const char * s = getenv("LLAMA_SPARSE_ATTN_GPU_CAP");
     if (!s) {
