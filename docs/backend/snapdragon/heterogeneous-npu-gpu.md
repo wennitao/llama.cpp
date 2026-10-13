@@ -2265,7 +2265,7 @@ found no bad rows in 224 and 448 checked GPU partials.
 - The exact-mask softmax still computes exp on the 64-key vectors that it masks to -inf. About 20% of EXACT=2's NPU
   work is on masked sub-blocks, against about 2% of the split's. Skipping them is exact and would make EXACT=2 about
   12% faster, which takes the split's lead over it toward 1.2x at 8k. The unions have no masks and do not change.
-  Not implemented yet.
+  Implemented in 4p: the skip is worth less than this estimate.
 
 Also in these commits: the ShadowAttn prefill baseline (`LLAMA_SHADOWATTN=r`); scorers scaled by the attention's
 own scale (Phi scales Q in the graph); odd GQA groups (Llama 3.2 3B, G = 3) in the selection and in the HMX tile
@@ -2274,6 +2274,39 @@ line of small ranges (the UDMA does not snoop L1); `hvx_arith_settle` (the softw
 results in qf32, and 0 became a denormal); the batched HMX F16 matmul's second column chunk. Runners:
 docs/papers/heterogeneous-inference/data/accuracy-validation/sm8750/prefill-llama/ (run_p3.py, run_p5.py,
 run_union_cmp.py).
+
+## 4p. Masked-softmax skip and specialized softmax instances (2026-10-12, unit 9aed338b; not for the paper)
+
+The code is on branch `hexagon-softmax-skip`, not on `hexagon-sparse-fa`, whose kernel the paper's numbers use.
+
+The mask is per (64-query sub-block, 64-key block). A 256-query NPU tile runs the union of its four sub-blocks' blocks,
+and a block that only some sub-blocks selected cannot leave the loop: the matrix unit computes Q.K^T and P.V for all
+768 rows of the tile, and the mask zeroes the rows of the other sub-blocks. Under EXACT=2 19.5% of the (sub-block,
+block) units are masked, under the fine mask about a third, in the split about 2% (only the budget-returned blocks).
+For each masked (32-row group, 64-key vector) the softmax now skips the S decode, the causal mask, the row max, exp2
+and the row sum, and writes P = 0, which is what the full path produced (`hvx_vec_exp2_f16` underflows to exactly 0).
+The matrix unit, the K/V DMA and the per-row m/l/O updates still run. Perplexity: KL statistics identical to the old
+build's rerun on the union, EXACT=2, EXACT=1 and the split.
+
+Two first attempts were bit-exact but slower (+2 to +7% on the masked arms): `fa_softmax_impl` had never been inlined
+into its constant-flag wrappers, so its flags, and the new per-vector skip tests, were runtime branches in every row's
+loops (v79 mask pass 46 -> 52 packets per vector). What works: `always_inline`, so each wrapper is a specialized
+instance; separate instances for chunks that can mask a vector; and, in those, a row group's live vectors decoded into
+consecutive buffer slots so the mask, max and exp loops stay dense and paired.
+
+| Attention per prefill (ms), unit 9aed338b | 4k before | 4k after | 8k before | 8k after |
+|---|---:|---:|---:|---:|
+| Union at equal accuracy (no mask) | 518.4 | 498.4 (-3.9%) | 1866.4 | 1796.4 (-3.7%) |
+| NPU only, the split's mask (EXACT=2) | 497.1 | 469.2 (-5.6%) | 1764.6 | 1638.6 (-7.1%) |
+| Masked tile (EXACT=1) | 541.8 | 497.5 (-8.2%) | 1972.9 | 1778.5 (-9.9%) |
+| Split | 374.1 | 363.2 (-2.9%) | 1277.3 | 1229.1 (-3.8%) |
+
+Specialization alone is worth 3.7-3.9% for every arm; the skip adds 1.7/3.4 points for EXACT=2 and 4.3/6.2 for
+EXACT=1 at 4k/8k. With every arm on the new kernel the split leads EXACT=2 by 1.29x/1.33x (1.33x/1.38x before), the
+union at equal accuracy by 1.37x/1.46x (unchanged) and the masked tile by 1.37x/1.45x (1.45x/1.54x). The NPU clock is the
+same in every run (2112 MHz per op: the skel turns DCVS off and votes the maximum core and bus corners). A masked unit
+is exactly 6 row tiles x 2 key tiles of the matrix unit, so its Q.K^T and P.V tiles could be skipped too, for at most
+3-4% more on EXACT=2.
 
 ## 5. What would change the answer
 
