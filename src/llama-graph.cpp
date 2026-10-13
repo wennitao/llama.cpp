@@ -2730,6 +2730,12 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
 // no step is permuted -- which is what keeps the whole reduction off the CPU.
 static ggml_tensor * llama_sparse_halve1(ggml_context * ctx, ggml_tensor * a, int64_t n) {
     for (; n > 1; n /= 2) {
+        if (n % 2) {
+            // an odd count (the mean scorer's GQA group of 3): pad one zero row, as llama_sparse_halve1_views does;
+            // halving the odd count directly would drop its last head
+            a = ggml_pad(ctx, a, 0, 1, 0, 0);
+            n += 1;
+        }
         ggml_tensor * lo = ggml_view_4d(ctx, a, a->ne[0], n/2, a->ne[2], a->ne[3],
                                         a->nb[1], a->nb[2], a->nb[3], 0);
         ggml_tensor * hi = ggml_view_4d(ctx, a, a->ne[0], n/2, a->ne[2], a->ne[3],
@@ -2741,7 +2747,14 @@ static ggml_tensor * llama_sparse_halve1(ggml_context * ctx, ggml_tensor * a, in
 
 // Sum over ne[1] by halving, without the copy: the add of two strided views is already contiguous.
 static ggml_tensor * llama_sparse_halve1_views(ggml_context * ctx, ggml_tensor * a, int64_t n) {
+    GGML_ASSERT(a->ne[1] == n);
     for (; n > 1; n /= 2) {
+        if (n % 2) {
+            // an odd count (Llama 3.2 3B's GQA group of 3): one zero row makes it even and adds nothing; halving the
+            // odd count directly would drop its last row
+            a = ggml_pad(ctx, a, 0, 1, 0, 0);
+            n += 1;
+        }
         ggml_tensor * lo = ggml_view_4d(ctx, a, a->ne[0], n/2, a->ne[2], a->ne[3],
                                         a->nb[1], a->nb[2], a->nb[3], 0);
         ggml_tensor * hi = ggml_view_4d(ctx, a, a->ne[0], n/2, a->ne[2], a->ne[3],
@@ -2967,7 +2980,8 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
 
     // halve1 needs powers of two, a query block must not straddle the ubatch, and the
     // threshold union needs whole groups of BQ/bs fine rows.
-    if (Lq % LLAMA_SPARSE_ATTN_BQ != 0 || (G & (G - 1)) != 0 || Hq % Hkv != 0) {
+    // any GQA group size: llama_sparse_halve1_views pads odd counts (Llama 3.2 3B: G = 3)
+    if (Lq % LLAMA_SPARSE_ATTN_BQ != 0 || Hq % Hkv != 0) {
         return nullptr;
     }
 

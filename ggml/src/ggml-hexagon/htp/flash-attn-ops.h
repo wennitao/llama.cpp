@@ -399,8 +399,14 @@ static inline int hmx_fa_find_chunk_size(size_t * Br_out,
     // Br_max: largest Br aligned to br_unit that does not exceed qo_len.
     const size_t Br_max = qo_len >= br_unit ? hex_align_down(qo_len, br_unit) : br_unit;
     // With a query-block axis, Br | br_align implies Br <= br_align, so start the walk
-    // there instead of scanning candidates that can only be rejected below.
-    const size_t Br_start = br_align ? hex_smin(Br_max, hex_align_down(br_align, br_unit)) : Br_max;
+    // there instead of scanning candidates that can only be rejected below. The candidates
+    // are then the divisors of br_align whose G*Br rows fill whole 32-row HMX tiles or that
+    // are br_unit multiples: for G dividing 32 that is exactly the br_unit multiples in the
+    // same order, and for G in {3,5,6,7}, where no br_unit = ceil(32/G) multiple divides a
+    // power-of-two query block, it admits Br = 32, 64, ... (G = 3: 96, 192, ... rows, no pad).
+    const size_t Br_start = br_align ? hex_smin(Br_max, br_align) : Br_max;
+    const size_t Br_step  = br_align ? 1 : br_unit;
+    const size_t Br_low   = br_align ? 1 : br_unit;
 
     // Pipeline constraint: cap Bc so n_kv_blocks >= FA_MIN_KV_BLOCKS. The exact bound
     // is ceil(kv_len/Bc) >= N  <=>  Bc < kv_len/(N-1), so take the largest bc_unit
@@ -437,12 +443,11 @@ static inline int hmx_fa_find_chunk_size(size_t * Br_out,
     size_t best_cost = SIZE_MAX, best_mn = 0, best_padded = SIZE_MAX;
     size_t best_Br = 0, best_Bc = 0;
 
-    for (size_t Br = Br_start; Br >= br_unit; Br -= br_unit) {
-        // A query tile must lie inside one scorer query block. br_unit is ceil(32/G),
-        // so for G in {3,5,6,7} nothing divides a 64- or 128-wide query block and the
-        // search legitimately finds no candidate at all -- the caller then rejects the
-        // op, which is the fail-closed outcome.
-        const bool br_ok = (br_align == 0) || ((br_align % Br) == 0);
+    for (size_t Br = Br_start; Br >= Br_low; Br -= Br_step) {
+        // A query tile must lie inside one scorer query block (Br | br_align), and its G*Br
+        // rows must be a br_unit multiple's or fill whole 32-row tiles (see Br_start).
+        const bool br_ok = (br_align == 0) ||
+                           ((br_align % Br) == 0 && ((Br % br_unit) == 0 || ((Br * gqa_factor) % T) == 0));
 
         // Try all Bc candidates from Bc_limit down to Bc_floor
         for (size_t Bc = Bc_limit; br_ok && Bc >= Bc_floor; Bc -= step) {
@@ -491,7 +496,7 @@ static inline int hmx_fa_find_chunk_size(size_t * Br_out,
             }
         }
 
-        if (Br == br_unit) {
+        if (Br == Br_low) {
             break;
         }
     }
