@@ -2308,6 +2308,56 @@ same in every run (2112 MHz per op: the skel turns DCVS off and votes the maximu
 is exactly 6 row tiles x 2 key tiles of the matrix unit, so its Q.K^T and P.V tiles could be skipped too, for at most
 3-4% more on EXACT=2.
 
+## 4r. One threshold at every length: the GQA group's maximum (2026-10-16 to 10-17, units 57dd7911, e8b7f0c8, c13eb13b; RTX 4080)
+
+Every phone timing runs XAttention at 0.9268, its RULER 4k density calibration, but the accuracy tables had re-bisected
+it to our density at 8k and 16k (0.9336, 0.9414). With both methods frozen at one threshold, ours (pooled keys, 0.4277,
+c* = 2) trailed XAttention at 16k by 1.04 points (69.04 against 70.08, 6500 prompts). niah_multikey_2 held 58% of
+that gap (51 prompts lost, 12 won). A screen on its 500 prompts swapped one part of ours at a time: XAttention's scorer
+(43.6) and a cumulative 0.9 rule (46.0) did not help; per-query-head lists did (50.2). The cause is the GQA mean: one
+list per K/V head from its query heads' mean probability halves a block that only one of Qwen3's two heads wants.
+
+`LLAMA_SPARSE_ATTN_GQA=max` takes the group's maximum instead: a block is kept when any query head of the group
+selects it, so the per-head selections are OR-ed into the one list per K/V head that the HMX kernel already runs.
+Hexagon has SUB, CLAMP and ADD but no RELU, so `llama_sparse_max1_views` computes max(lo, hi) = lo + clamp(hi - lo, 0,
+inf). On the board the graph keeps its 3 splits, the fold's check (`GGML_HEXAGON_FA_FOLD_CHECK=2`) passes on all 224
+checked rows, and the first 16k vt prompt keeps 46.3% of its blocks (CUDA 46.9%). The threshold stays at 0.4277 (phone
+0.4308). Keeping it, rather than re-calibrating the max rule by 4k density (0.5567), was decided after seeing 16k
+accuracy on the four tasks of the gap. The rest of the table below did not inform that choice.
+
+| RULER, every arm on the RTX 4080 | 1k | 2k | 4k | 8k | 16k |
+|---|---:|---:|---:|---:|---:|
+| dense | 97.30 | 91.13 | 87.12 | 79.48 | 70.86 |
+| ours, GQA mean | 97.02 | 90.11 | 86.42 | 76.93 | 69.04 |
+| ours, GQA max | 97.13 | 90.90 | 86.49 | 77.34 | 70.50 |
+| XAttention 0.9268 | 96.88 | 90.73 | 86.31 | 77.16 | 70.08 |
+
+| Attention replay, ms (57dd7911, gated at 45 C) | 1k | 2k | 4k | 8k | 16k |
+|---|---:|---:|---:|---:|---:|
+| dense | 83.2 | 222.2 | 779.1 | 2753.1 | 9960.1 |
+| ours, GQA mean | 89.5 | 209.3 | 531.1 | 1409.5 | 4441.4 |
+| ours, GQA max | 91.0 | 217.7 | 573.7 | 1584.9 | 5120.4 |
+| XAttention 0.9268 | 226.1 | 672.1 | 2023.8 | 6210.0 | 21469.2 |
+
+| Prefill, ms (1k-8k e8b7f0c8, 16k c13eb13b; gated at 45 C) | 1k | 2k | 4k | 8k | 16k |
+|---|---:|---:|---:|---:|---:|
+| dense | 440 | 918 | 2152 | 5437 | 15368 |
+| ours, GQA mean | 442 | 884 | 1856 | 3994 | 9698 |
+| ours, GQA max | 441 | 890 | 1907 | 4182 | 10363 |
+| XAttention 0.9268 | 580 | 1370 | 3403 | 8903 | 26936 |
+
+The max rule keeps more blocks: at 16k, 46.9% of pairs against 39.6% for the mean. That costs 8-15% attention time and
+3-7% prefill at 4k-16k against the mean, and leaves 1.13x / 1.30x / 1.48x prefill over dense at 4k / 8k / 16k. On
+WikiText-2, recall (each query row's exact attention mass inside its selected blocks) at a fixed threshold is flat
+across lengths for our rule (max 0.4277: 98.0% at 1k, 96.5% at 16k). It falls for XAttention's (0.9268: 98.7% to
+95.0%). Head-averaged recall does not rank GQA rules: the mean rule has XAttention's 16k recall and still lost 1.04
+points there.
+
+Sources, runners and reports: `/mnt/raid0_ssd/wentao/heterogeneous-accuracy-20260917/ctx16k-20261015/unified/`
+(README, `queue.txt`, `report_unified.py`, `report_mk2.py`, `recall_calibration.py`) and
+`.../sm8850-20261013/` (`run_attn_replay.py`, `run_prefill_sm8850.py`, `run_e2e_max.sh`, `run_e2e_max_16k.sh`,
+`report_e2e_max.py`, `count_density.py`).
+
 ## 5. What would change the answer
 
 - **Events in both backends.** OpenCL already uses `cl_event` throughout (its `synchronize` is a
