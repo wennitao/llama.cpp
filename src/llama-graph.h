@@ -1429,3 +1429,20 @@ struct llm_graph_context {
 
 // TODO: better name
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional);
+
+// Attention replay, a timing harness (LLAMA_ATTN_REPLAY, read at every graph build): "capture" builds the model's graph
+// and also copies every layer's attention query into a persistent store on the first device; "replay" builds a graph of
+// the attention blocks alone (selection and FlashAttention for every layer, reading the stored queries and the K/V the
+// capture pass left in the cache cells), with no KV write and no output projection. A caller times a chunk by decoding
+// it with "capture", removing it from the cache (llama_memory_seq_rm frees the cells but keeps their data, and the
+// replay's tokens take the same cells), then decoding it again with "replay". Graph reuse must be off
+// (LLAMA_GRAPH_REUSE_DISABLE=1): the two modes build different graphs for the same ubatch.
+enum llama_attn_replay_mode {
+    LLAMA_ATTN_REPLAY_OFF,
+    LLAMA_ATTN_REPLAY_CAPTURE,
+    LLAMA_ATTN_REPLAY_RUN,
+};
+
+llama_attn_replay_mode llama_attn_replay();
+
+std::unique_ptr<llm_graph_context> llama_build_attn_replay_graph(const llm_graph_params & params);

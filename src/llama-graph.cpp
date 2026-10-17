@@ -29,6 +29,50 @@
 #include "llama-selectors.h"
 #include "llama-shadowattn.h"
 
+llama_attn_replay_mode llama_attn_replay() {
+    const char * env = getenv("LLAMA_ATTN_REPLAY");
+    if (env && strcmp(env, "capture") == 0) {
+        return LLAMA_ATTN_REPLAY_CAPTURE;
+    }
+    if (env && strcmp(env, "replay") == 0) {
+        return LLAMA_ATTN_REPLAY_RUN;
+    }
+    return LLAMA_ATTN_REPLAY_OFF;
+}
+
+// The replay's query store: one [d, n_head, n_ubatch] tensor per layer in a buffer of the first (highest-priority)
+// backend, made on first use and kept for the process (the backend frees nothing it does not own at exit).
+struct llama_attn_replay_store {
+    ggml_context              * ctx = nullptr;
+    ggml_backend_buffer_t       buf = nullptr;
+    std::vector<ggml_tensor *>  q;
+};
+
+// a [ne0, ne1, n_tokens] view of layer il's stored query (q_like gives the type and the first two dims)
+static ggml_tensor * llama_attn_replay_q(ggml_context * ctx, ggml_backend_sched_t sched, const ggml_tensor * q_like,
+                                         int64_t n_layer, uint32_t n_ubatch, int il) {
+    static llama_attn_replay_store store;
+    GGML_ASSERT(q_like->ne[3] == 1 && "attention replay: 3-D queries only");
+    if (!store.ctx) {
+        ggml_init_params ip = { ggml_tensor_overhead() * (size_t) n_layer, nullptr, true };
+        store.ctx = ggml_init(ip);
+        for (int64_t i = 0; i < n_layer; ++i) {
+            ggml_tensor * t = ggml_new_tensor_3d(store.ctx, q_like->type, q_like->ne[0], q_like->ne[1], n_ubatch);
+            ggml_format_name(t, "attn_replay_q-%d", (int) i);
+            store.q.push_back(t);
+        }
+        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, 0);
+        store.buf = ggml_backend_alloc_ctx_tensors_from_buft(store.ctx, ggml_backend_get_default_buffer_type(backend));
+        GGML_ASSERT(store.buf && "attention replay: query store allocation failed");
+        LLAMA_LOG_INFO("attn-replay: query store %.1f MiB on %s\n", ggml_backend_buffer_get_size(store.buf) / 1048576.0,
+                       ggml_backend_name(backend));
+    }
+    GGML_ASSERT(il < (int) store.q.size());
+    ggml_tensor * t = store.q[il];
+    GGML_ASSERT(t->type == q_like->type && t->ne[0] == q_like->ne[0] && t->ne[1] == q_like->ne[1] && q_like->ne[2] <= t->ne[2]);
+    return ggml_view_3d(ctx, t, t->ne[0], t->ne[1], q_like->ne[2], t->nb[1], t->nb[2], 0);
+}
+
 // dedup helpers
 
 static ggml_tensor * build_attn_inp_kq_mask(
@@ -585,8 +629,13 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
-    mctx->set_input_k_idxs(self_k_idxs, ubatch);
-    mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    // an attention replay graph (LLAMA_ATTN_REPLAY=replay) writes no K/V: its index leaves are not in the graph
+    if (self_k_idxs && self_k_idxs->buffer) {
+        mctx->set_input_k_idxs(self_k_idxs, ubatch);
+    }
+    if (self_v_idxs && self_v_idxs->buffer) {
+        mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    }
 
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
@@ -3681,17 +3730,24 @@ ggml_tensor * llm_graph_context::build_attn(
         v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
     }
 
+    const llama_attn_replay_mode replay = llama_attn_replay();
+
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     // expand k later to enable rope fusion which directly writes into k-v cache
     ggml_build_forward_expand(gf, q_cur);
-    ggml_build_forward_expand(gf, v_cur);
-    ggml_build_forward_expand(gf, k_cur);
+    if (replay != LLAMA_ATTN_REPLAY_RUN) {
+        ggml_build_forward_expand(gf, v_cur);
+        ggml_build_forward_expand(gf, k_cur);
+    }
+    if (replay == LLAMA_ATTN_REPLAY_CAPTURE) {
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, q_cur, llama_attn_replay_q(ctx0, sched, q_cur, n_layer, cparams.n_ubatch, il)));
+    }
 
     const auto * mctx_cur = inp->mctx;
 
-    // store to KV cache
-    {
+    // store to KV cache (a replay reads the K/V its capture pass stored)
+    if (replay != LLAMA_ATTN_REPLAY_RUN) {
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
@@ -4752,4 +4808,41 @@ int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buck
     relative_bucket += (relative_position < max_exact ? relative_position : relative_position_if_large);
 
     return relative_bucket;
+}
+
+// LLAMA_ATTN_REPLAY=replay: every layer's attention block alone, on the stored queries (see llama_attn_replay_mode)
+struct llm_build_attn_replay : public llm_graph_context {
+    llm_build_attn_replay(const llm_graph_params & params) : llm_graph_context(params) {
+        auto * inp_attn = build_attn_inp_kv();
+
+        const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head_k)) : hparams.f_attention_scale;
+
+        // the shape the model hands build_attn: [n_embd_head_k, n_head, n_tokens], F32
+        ggml_tensor * q_like = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd_head_k, n_head, n_tokens);
+
+        for (int il = 0; il < n_layer; ++il) {
+            ggml_tensor * q   = llama_attn_replay_q(ctx0, sched, q_like, n_layer, cparams.n_ubatch, il);
+            ggml_tensor * cur = build_attn(inp_attn, nullptr, nullptr, nullptr, q, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                           kq_scale, il);
+            ggml_build_forward_expand(gf, cur);
+        }
+
+        // The scheduler places ops next to the weights they read and spreads from there; a graph without weights would
+        // fall back to the CPU. Pin every op the first backend takes to it, as the model graph's attention runs.
+        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, 0);
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * t = ggml_graph_node(gf, i);
+            if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE ||
+                t->op == GGML_OP_NONE) {
+                continue;
+            }
+            if (ggml_backend_supports_op(backend, t)) {
+                ggml_backend_sched_set_tensor_backend(sched, t, backend);
+            }
+        }
+    }
+};
+
+std::unique_ptr<llm_graph_context> llama_build_attn_replay_graph(const llm_graph_params & params) {
+    return std::make_unique<llm_build_attn_replay>(params);
 }

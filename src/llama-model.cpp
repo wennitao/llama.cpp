@@ -2516,7 +2516,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 }
 
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
-    std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
+    // LLAMA_ATTN_REPLAY=replay times the attention blocks alone (llama_attn_replay_mode)
+    std::unique_ptr<llm_graph_context> llm = llama_attn_replay() == LLAMA_ATTN_REPLAY_RUN && params.gtype != LLM_GRAPH_TYPE_ENCODER ?
+        llama_build_attn_replay_graph(params) : build_arch_graph(params);
 
     // add on pooling layer
     llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);
