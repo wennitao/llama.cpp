@@ -1047,6 +1047,14 @@ struct llm_graph_context {
     mutable ggml_tensor * sparse_reps4_bias = nullptr;
     mutable ggml_tensor * sparse_reps4_mask = nullptr;
 
+    // views of the bias input (reach bias, avail column, forced blocks), made once per graph and shared by every layer:
+    // the input lives on the CPU, and each distinct view is its own copy into the NPU's split, so per-layer views filled
+    // the scheduler's 30-input splits and cut the NPU graph in three
+    mutable ggml_tensor * sparse_view_bias = nullptr;
+    mutable ggml_tensor * sparse_view_b3   = nullptr;
+    mutable ggml_tensor * sparse_view_av   = nullptr;
+    mutable ggml_tensor * sparse_view_fr   = nullptr;
+
     // XAttention's reversed-row indices and reduced causal mask, built once per graph for this mask
     mutable ggml_tensor * xattn_mask    = nullptr;
     mutable ggml_tensor * xattn_indices = nullptr;

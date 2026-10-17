@@ -2997,7 +2997,13 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
         }
     }
 
-    ggml_tensor * b3 = ggml_view_3d(ctx0, bias, NBk, NBq, 1, bias->nb[1], bias->nb[2], 0);
+    if (sparse_view_bias != bias) {
+        sparse_view_bias = bias;
+        sparse_view_b3   = ggml_view_3d(ctx0, bias, NBk, NBq, 1, bias->nb[1], bias->nb[2], 0);
+        sparse_view_av   = thr ? ggml_view_3d(ctx0, bias, 1, NBq, 1, bias->nb[1], bias->nb[2], (size_t) NBk * bias->nb[0]) : nullptr;
+        sparse_view_fr   = thr ? ggml_view_3d(ctx0, bias, NBk, NBq, 1, bias->nb[1], bias->nb[2], bias->nb[3]) : nullptr;
+    }
+    ggml_tensor * b3 = sparse_view_b3;
 
     ggml_tensor * sc = nullptr;
     if (!(reps4 && thr)) {
@@ -3068,11 +3074,8 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
         } else {
             pm = ggml_soft_max(ctx0, ggml_add(ctx0, sc, b3));
         }
-        ggml_tensor * av = ggml_view_3d(ctx0, bias, 1, NBq, 1, bias->nb[1], bias->nb[2],
-                                        (size_t) NBk * bias->nb[0]);
-        pm = ggml_mul(ctx0, pm, av);
-        ggml_tensor * fr = ggml_view_3d(ctx0, bias, NBk, NBq, 1, bias->nb[1], bias->nb[2],
-                                        bias->nb[3]);
+        pm = ggml_mul(ctx0, pm, sparse_view_av);
+        ggml_tensor * fr = sparse_view_fr;
         // The split's own-exception selection (LLAMA_SPARSE_ATTN_EXC_THR): the same p * avail cut at the lower threshold,
         // forced blocks included; only the GPU's half reads it. scale_bias makes a new tensor, so pm is read twice safely.
         const float c_lo = llama_sparse_attn_exc_thr();
