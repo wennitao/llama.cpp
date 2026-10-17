@@ -2343,6 +2343,10 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (llama_sparse_attn_thr() != 0.0f) {
         res += 8u * model.hparams.n_layer();
     }
+    // The GQA group's maximum (LLAMA_SPARSE_ATTN_GQA=max) adds a difference and its clamp per halving level.
+    if (llama_sparse_attn_gqa_max()) {
+        res += 8u * model.hparams.n_layer();
+    }
     // The workload-aware partition (LLAMA_SPARSE_ATTN_GPU_SHARE) adds the per-tile budget, ranks and mask: ~45 per layer.
     if (llama_sparse_attn_gpu_share() > 0.0f) {
         res += 64u * model.hparams.n_layer();

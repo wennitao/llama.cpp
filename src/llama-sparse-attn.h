@@ -206,6 +206,16 @@ static inline bool llama_sparse_attn_reps4() {
     return s && (strcmp(s, "reps4") == 0 || llama_sparse_attn_pooled() || llama_sparse_attn_xattn());
 }
 
+// How a GQA group's query heads share one K/V head's list (representative scorers). The default averages the group's
+// probabilities, which halves (Qwen3, G = 2) a block only one head wants. LLAMA_SPARSE_ATTN_GQA=max takes the group's
+// maximum instead: with the relative rule a block is kept when any query head of the group wants it, the per-head
+// selections OR-ed into one list per K/V head. RULER 16k niah_multikey_2 on CUDA (ctx16k-20261015/unified): mean 44.0,
+// max 51.0, per-head lists 50.2, XAttention 51.8; the scorer and the budget rule changed nothing.
+static inline bool llama_sparse_attn_gqa_max() {
+    const char * s = getenv("LLAMA_SPARSE_ATTN_GQA");
+    return s && strcmp(s, "max") == 0;
+}
+
 // n_kv_blocks the HMX kernel will choose for a given u. Transcribed from
 // hmx_fa_find_chunk_size (ggml/src/ggml-hexagon/htp/flash-attn-ops.h:370+) and checked
 // against the device's own fa-params line at 20 values of u: 20/20 exact.

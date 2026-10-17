@@ -2813,6 +2813,25 @@ static ggml_tensor * llama_sparse_halve1_views(ggml_context * ctx, ggml_tensor *
     return a;
 }
 
+// The maximum over dim 1 by halving views, as llama_sparse_halve1_views sums: max(lo, hi) = lo + clamp(hi - lo, 0, inf),
+// the ops Hexagon runs (it has no RELU). Only for non-negative values: an odd count's zero row then never wins.
+static ggml_tensor * llama_sparse_max1_views(ggml_context * ctx, ggml_tensor * a, int64_t n) {
+    GGML_ASSERT(a->ne[1] == n);
+    for (; n > 1; n /= 2) {
+        if (n % 2) {
+            a = ggml_pad(ctx, a, 0, 1, 0, 0);
+            n += 1;
+        }
+        ggml_tensor * lo = ggml_view_4d(ctx, a, a->ne[0], n/2, a->ne[2], a->ne[3],
+                                        a->nb[1], a->nb[2], a->nb[3], 0);
+        ggml_tensor * hi = ggml_view_4d(ctx, a, a->ne[0], n/2, a->ne[2], a->ne[3],
+                                        a->nb[1], a->nb[2], a->nb[3], (size_t)(n/2)*a->nb[1]);
+        // ggml_clamp works in place: on the fresh difference only
+        a = ggml_add(ctx, lo, ggml_clamp(ctx, ggml_sub(ctx, hi, lo), 0.0f, INFINITY));
+    }
+    return a;
+}
+
 // The pooled scorer's representatives of the blocks a ubatch stored, written into the cache (llama_kv_cache::has_k_reps):
 // the same ops as llama_sparse_reps4_probs's pooled branch on just those blocks' 64 rows (sums of 16 rows by halving,
 // F32 means, F16 in the product layout), so a cached representative equals a fresh one bit for bit. Blocks the ubatch
@@ -2901,8 +2920,11 @@ static ggml_tensor * llama_sparse_reps4_reduce(ggml_context * ctx, ggml_tensor *
         p = ggml_cont(ctx, ggml_view_2d(ctx, p, NBk, nqs*NBq*Hq, p->nb[1], 0));
     }
     p = llama_sparse_halve1_views(ctx, ggml_reshape_4d(ctx, p, NBk, nqs, NBq, Hq), nqs);     // [NBk, 1, NBq, Hq]
-    p = llama_sparse_halve1_views(ctx, ggml_reshape_3d(ctx, p, NBk*NBq, G, Hkv), G);        // [NBk*NBq, 1, Hkv]
-    return ggml_scale(ctx, ggml_reshape_3d(ctx, p, NBk, NBq, Hkv), 1.0f / (float) (nqs*G));
+    // the group: its mean, or its maximum (LLAMA_SPARSE_ATTN_GQA=max); the 1/nqs of the sampled rows' mean commutes
+    const bool gqa_max = llama_sparse_attn_gqa_max();
+    p = gqa_max ? llama_sparse_max1_views (ctx, ggml_reshape_3d(ctx, p, NBk*NBq, G, Hkv), G)
+                : llama_sparse_halve1_views(ctx, ggml_reshape_3d(ctx, p, NBk*NBq, G, Hkv), G);  // [NBk*NBq, 1, Hkv]
+    return ggml_scale(ctx, ggml_reshape_3d(ctx, p, NBk, NBq, Hkv), 1.0f / (float) (gqa_max ? nqs : nqs*G));
 }
 
 // Four-representative block probabilities, [NBk, NBq, Hkv], one row per fine query block.
