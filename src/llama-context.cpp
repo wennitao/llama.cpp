@@ -2334,6 +2334,15 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (llama_sparse_attn_cstar() != 0 || llama_sparse_attn_exact()) {
         res += 48u * model.hparams.n_layer();
     }
+    // The pooled scorer's representative cache (LLAMA_SPARSE_ATTN_KREPS_CACHE) adds the update of the stored blocks'
+    // representatives (row views, four halving levels, casts, the permute and the copy: ~20 per layer), and an attention
+    // replay's capture (LLAMA_ATTN_REPLAY) one query copy per layer.
+    if (getenv("LLAMA_SPARSE_ATTN_KREPS_CACHE") && atoi(getenv("LLAMA_SPARSE_ATTN_KREPS_CACHE")) != 0) {
+        res += 32u * model.hparams.n_layer();
+    }
+    if (llama_sparse_attn_thr() != 0.0f) {
+        res += 8u * model.hparams.n_layer();
+    }
     // The workload-aware partition (LLAMA_SPARSE_ATTN_GPU_SHARE) adds the per-tile budget, ranks and mask: ~45 per layer.
     if (llama_sparse_attn_gpu_share() > 0.0f) {
         res += 64u * model.hparams.n_layer();

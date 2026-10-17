@@ -113,7 +113,7 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream) + 1u)*n_layer*ggml_tensor_overhead()),  // + k_reps (has_k_reps)
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -243,9 +243,19 @@ llama_kv_cache::llama_kv_cache(
             v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
         }
 
+        // the pooled-key scorer's representative cache (has_k_reps): 4 per 64-row block, blocks padded to 8 as the scorer pads
+        ggml_tensor * k_reps = nullptr;
+        if (has_k && n_stream == 1 && type_k == GGML_TYPE_F16 && kv_size % 64 == 0 && getenv("LLAMA_SPARSE_ATTN") &&
+            getenv("LLAMA_SPARSE_ATTN_KREPS_CACHE") && atoi(getenv("LLAMA_SPARSE_ATTN_KREPS_CACHE")) != 0) {
+            const uint32_t n_head_kv = hparams.n_head_kv(il);
+            GGML_ASSERT(n_head_kv > 0 && n_embd_k_gqa % n_head_kv == 0);
+            k_reps = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_embd_k_gqa / n_head_kv, 4 * GGML_PAD(kv_size / 64, 8), n_head_kv);
+            ggml_format_name(k_reps, "cache_k_reps_l%d", il);
+        }
+
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({ il, k, v, k_stream, v_stream, k_reps });
     }
 
     if (reuse) {
@@ -1287,6 +1297,22 @@ ggml_tensor * llama_kv_cache::get_k_pool_src(ggml_context * ctx, int32_t il, uin
             k->nb[1]*step,
             k->nb[1]*bs,
             0);
+}
+
+bool llama_kv_cache::has_k_reps() const {
+    return !layers.empty() && layers[0].k_reps != nullptr;
+}
+
+ggml_tensor * llama_kv_cache::get_k_reps(ggml_context * ctx, int32_t il, uint32_t n_reps, uint32_t rep0) const {
+    ggml_tensor * t = layers[map_layer_ids.at(il)].k_reps;
+    GGML_ASSERT(t && rep0 + n_reps <= t->ne[1]);
+    return ggml_view_3d(ctx, t, t->ne[0], n_reps, t->ne[2], t->nb[1], t->nb[2], (size_t) rep0 * t->nb[1]);
+}
+
+ggml_tensor * llama_kv_cache::get_k_rows(ggml_context * ctx, int32_t il, uint32_t cell0, uint32_t n_cells) const {
+    ggml_tensor * k = layers[map_layer_ids.at(il)].k;
+    GGML_ASSERT(cell0 + n_cells <= k->ne[1]);
+    return ggml_view_2d(ctx, k, k->ne[0], n_cells, k->nb[1], (size_t) cell0 * k->nb[1]);
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -2818,6 +2844,37 @@ void llama_kv_cache_context::set_input_sparse_bias(ggml_tensor * dst, const llam
 ggml_tensor * llama_kv_cache_context::get_k_pool_src(ggml_context * ctx, int32_t il,
                                                      uint32_t bs, uint32_t ksub) const {
     return kv->get_k_pool_src(ctx, il, n_kv, bs, ksub);
+}
+
+bool llama_kv_cache_context::has_k_reps() const {
+    return kv->has_k_reps();
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_reps(ggml_context * ctx, int32_t il, uint32_t n_reps, uint32_t rep0) const {
+    return kv->get_k_reps(ctx, il, n_reps, rep0);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_rows(ggml_context * ctx, int32_t il, uint32_t cell0, uint32_t n_cells) const {
+    return kv->get_k_rows(ctx, il, cell0, n_cells);
+}
+
+int llama_kv_cache_context::ubatch_cell_run(uint32_t & c0, uint32_t & n) const {
+    if (sinfos.empty() || sinfos[i_cur].idxs.empty() || sinfos[i_cur].idxs[0].empty()) {
+        return 0;
+    }
+    const auto & sinfo = sinfos[i_cur];
+    if (sinfo.idxs.size() != 1) {
+        return -1;
+    }
+    const auto & idxs = sinfo.idxs[0];
+    for (size_t i = 1; i < idxs.size(); ++i) {
+        if (idxs[i] != idxs[0] + i) {
+            return -1;
+        }
+    }
+    c0 = idxs[0];
+    n  = (uint32_t) idxs.size();
+    return 1;
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

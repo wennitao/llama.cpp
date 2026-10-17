@@ -181,6 +181,14 @@ public:
     // reduction op falls off the NPU. Here the head index stays inside the row, the strides
     // are strictly increasing, and all heads pool together.
     ggml_tensor * get_k_pool_src(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t bs, uint32_t ksub) const;
+
+    // The pooled-key scorer's representative cache (LLAMA_SPARSE_ATTN_KREPS_CACHE=1, an F16 cache with one stream): per
+    // layer the scorer's F16 key representatives, the means of each 16-row group in its product layout
+    // [n_embd_head_k, kv_size/16 (padded), n_head_kv]. build_attn writes the groups of the blocks a ubatch stores and the
+    // scorer reads them instead of pooling every block of the cache again (llama_sparse_reps4_probs).
+    bool          has_k_reps() const;
+    ggml_tensor * get_k_reps(ggml_context * ctx, int32_t il, uint32_t n_reps, uint32_t rep0) const;  // [d, n_reps, Hkv] view
+    ggml_tensor * get_k_rows(ggml_context * ctx, int32_t il, uint32_t cell0, uint32_t n_cells) const; // [n_embd_k_gqa, n_cells]
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
@@ -243,6 +251,8 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        ggml_tensor * k_reps = nullptr;  // see has_k_reps
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -385,6 +395,15 @@ public:
 
     // See llama_kv_cache::get_k_pool_src.
     ggml_tensor * get_k_pool_src(ggml_context * ctx, int32_t il, uint32_t bs, uint32_t ksub) const;
+
+    // See llama_kv_cache::has_k_reps.
+    bool          has_k_reps() const;
+    ggml_tensor * get_k_reps(ggml_context * ctx, int32_t il, uint32_t n_reps, uint32_t rep0) const;
+    ggml_tensor * get_k_rows(ggml_context * ctx, int32_t il, uint32_t cell0, uint32_t n_cells) const;
+
+    // the current ubatch's cells: 1 and [c0, c0 + n) when they are one ascending run in one stream, 0 when there is no
+    // slot data (the reserve graph's dummy slot), -1 otherwise
+    int           ubatch_cell_run(uint32_t & c0, uint32_t & n) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory

@@ -2813,6 +2813,32 @@ static ggml_tensor * llama_sparse_halve1_views(ggml_context * ctx, ggml_tensor *
     return a;
 }
 
+// The pooled scorer's representatives of the blocks a ubatch stored, written into the cache (llama_kv_cache::has_k_reps):
+// the same ops as llama_sparse_reps4_probs's pooled branch on just those blocks' 64 rows (sums of 16 rows by halving,
+// F32 means, F16 in the product layout), so a cached representative equals a fresh one bit for bit. Blocks the ubatch
+// covers partly are pooled with the rows the cache holds now, as a fresh pass would.
+static ggml_tensor * llama_sparse_k_reps_update(ggml_context * ctx, const llama_kv_cache_context * mctx, int il, int64_t n_tokens) {
+    const int64_t bs  = LLAMA_SPARSE_ATTN_BS;
+    const int64_t nr  = 4;
+    const int64_t nks = bs;
+    uint32_t c0 = 0;
+    uint32_t n  = (uint32_t) n_tokens;  // the reserve graph's dummy slot: any run of this size sizes the buffers right
+    const int run = mctx->ubatch_cell_run(c0, n);
+    GGML_ASSERT(run >= 0 && "LLAMA_SPARSE_ATTN_KREPS_CACHE: a ubatch's cells must be one ascending run in one stream");
+    const uint32_t b0 = c0 / bs;
+    const uint32_t nb = (uint32_t) ((c0 + n + bs - 1) / bs) - b0;
+    ggml_tensor * rows = mctx->get_k_rows(ctx, il, b0 * bs, nb * bs);            // [d*Hkv, nb*bs] F16
+    ggml_tensor * dst  = mctx->get_k_reps(ctx, il, nr * nb, nr * b0);              // [d, nr*nb, Hkv]
+    const int64_t d   = dst->ne[0];
+    const int64_t Hkv = dst->ne[2];
+    GGML_ASSERT(rows->ne[0] == d*Hkv);
+    ggml_tensor * k = ggml_view_3d(ctx, rows, d*Hkv, nks/nr, nr*nb, rows->nb[1], (size_t)(nks/nr)*rows->nb[1], 0);
+    k = ggml_cast(ctx, llama_sparse_halve1_views(ctx, k, nks/nr), GGML_TYPE_F32);   // sums of 16 rows
+    k = ggml_scale(ctx, k, (float) nr / (float) nks);                                 // means
+    k = ggml_cast(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, k, d, Hkv, nr*nb), 0, 2, 1, 3), GGML_TYPE_F16);
+    return ggml_cpy(ctx, k, dst);
+}
+
 // The block reach bias b3 [NBk, NBq] repeated over the representatives of a block and the sampled rows of
 // a query block: [nr*NBk, nqs*NBq]. It depends only on positions, so the caller shares it across layers.
 // Blocks padded so the 4*NBk representative axis fills whole 32-lane rows: Hexagon's HMX batched
@@ -2895,7 +2921,7 @@ static ggml_tensor * llama_sparse_reps4_reduce(ggml_context * ctx, ggml_tensor *
 // HMX product of the raw sums (256x the mean logit) reaches 1.1e5 and overflows F16 to inf.
 static ggml_tensor * llama_sparse_reps4_probs(ggml_context * ctx, ggml_tensor * q_cur, ggml_tensor * k_rows,
                                               ggml_tensor * m, int64_t Hkv, int64_t NBq, int64_t NBk, int64_t bq,
-                                              bool pooled, bool pooled_q, float scale) {
+                                              bool pooled, bool pooled_q, float scale, ggml_tensor * k_reps = nullptr) {
     const int64_t d   = q_cur->ne[0];
     const int64_t Hq  = q_cur->ne[1];
     const int64_t nqs = LLAMA_SPARSE_ATTN_QSUB;
@@ -2907,7 +2933,12 @@ static ggml_tensor * llama_sparse_reps4_probs(ggml_context * ctx, ggml_tensor * 
     // F16 src0, and its F32 fallback does not fit VTCM with the strided Q view.
     const int64_t NBp = llama_sparse_reps4_padded(NBk);
     ggml_tensor * k;
-    if (pooled) {
+    if (pooled && k_reps) {
+        // the cached representatives (llama_sparse_k_reps_update), [d, nr*NBp, Hkv]: past the reachable blocks they hold
+        // stale or zero means where a fresh pass pads zeros, and m gives both -1e9, so the probabilities are the same
+        GGML_ASSERT(k_reps->type == GGML_TYPE_F16 && k_reps->ne[0] == d && k_reps->ne[1] == nr*NBp && k_reps->ne[2] == Hkv);
+        k = k_reps;
+    } else if (pooled) {
         GGML_ASSERT(k_rows->ne[0] == d*Hkv && k_rows->ne[1] == nks && k_rows->ne[2] == NBk);
         k = ggml_view_3d(ctx, k_rows, d*Hkv, nks/nr, nr*NBk, k_rows->nb[1], (size_t)(nks/nr)*k_rows->nb[1], 0);
         k = ggml_cast(ctx, llama_sparse_halve1_views(ctx, k, nks/nr), GGML_TYPE_F32);   // sums of 16 rows
@@ -2916,10 +2947,12 @@ static ggml_tensor * llama_sparse_reps4_probs(ggml_context * ctx, ggml_tensor * 
         k = ggml_reshape_3d(ctx, ggml_cast(ctx, k_rows, GGML_TYPE_F32), d*Hkv, nks/nr, nr*NBk);
         k = ggml_scale(ctx, llama_sparse_halve1_views(ctx, k, nks/nr), (float) nr / (float) nks);
     }
-    if (NBp != NBk) {
-        k = ggml_pad(ctx, ggml_reshape_2d(ctx, k, d*Hkv, nr*NBk), 0, (int) (nr*(NBp - NBk)), 0, 0);  // zero, masked in m
+    if (!(pooled && k_reps)) {
+        if (NBp != NBk) {
+            k = ggml_pad(ctx, ggml_reshape_2d(ctx, k, d*Hkv, nr*NBk), 0, (int) (nr*(NBp - NBk)), 0, 0);  // zero, masked in m
+        }
+        k = ggml_cast(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, k, d, Hkv, nr*NBp), 0, 2, 1, 3), GGML_TYPE_F16);
     }
-    k = ggml_cast(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, k, d, Hkv, nr*NBp), 0, 2, 1, 3), GGML_TYPE_F16);
 
     // Q: [d, nqs*NBq, Hq], row index nqs*block + s. Sampled (reps4, pooledk): rows 0, bq/nqs, ... of every fine
     // block, a strided view. Pooled: the means of rows s*bq/nqs .. (s+1)*bq/nqs - 1, all heads of a token halved
@@ -3116,9 +3149,11 @@ ggml_tensor * llm_graph_context::build_sparse_sel(
                 sparse_reps4_bias = bias;
                 sparse_reps4_mask = llama_sparse_reps4_mask(ctx0, b3, NBq, NBk, pooled || xattn);
             }
+            ggml_tensor * k_reps = pooled && !xattn && mctx_cur->has_k_reps() ?
+                mctx_cur->get_k_reps(ctx0, il, (uint32_t) (4*llama_sparse_reps4_padded(NBk)), 0) : nullptr;
             pm = xattn ? llama_sparse_xattn_probs(ctx0, q_cur, k_src, xidx, sparse_reps4_mask, Hkv, NBq, NBk, kq_scale) :
                          llama_sparse_reps4_probs(ctx0, q_cur, pooled ? k_src : mctx_cur->get_k_pool_src(ctx0, il, bs, ksub),
-                                                  sparse_reps4_mask, Hkv, NBq, NBk, bq, pooled, pooled_q, kq_scale);
+                                                  sparse_reps4_mask, Hkv, NBq, NBk, bq, pooled, pooled_q, kq_scale, k_reps);
             cb(pm, "sparse_reps4_prob", il);
         } else {
             pm = ggml_soft_max(ctx0, ggml_add(ctx0, sc, b3));
@@ -3753,6 +3788,12 @@ ggml_tensor * llm_graph_context::build_attn(
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+
+        // the pooled scorer's cached representatives of the blocks just stored (every ubatch, the dense ones too, so a
+        // later sparse ubatch never reads a stale block); built after the store, so it reads the rows written here
+        if (mctx_cur->has_k_reps()) {
+            ggml_build_forward_expand(gf, llama_sparse_k_reps_update(ctx0, mctx_cur, il, k_cur->ne[2]));
+        }
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
