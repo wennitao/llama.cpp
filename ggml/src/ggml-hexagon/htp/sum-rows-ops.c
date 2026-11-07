@@ -81,7 +81,20 @@ static void sum_rows_thread_f32(unsigned int nth, unsigned int ith, void *data) 
     struct htp_thread_trace * tr = &smctx->octx->ctx->trace[ith];
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
 
-    for (uint32_t ir = 0; ir < n_rows; ir++) {
+    uint32_t ir = 0;
+    if (ne00 == 4 && src_stride == 4 * sizeof(float) && dst_stride == sizeof(float)) {
+        for (; ir + VLEN_FP32 <= n_rows; ir += VLEN_FP32) {
+            const float * src = src_th + ir * 4;
+            const HVX_VectorPair ab = Q6_W_vdeal_VVR(hvx_vmemu(src + VLEN_FP32), hvx_vmemu(src), -4);
+            const HVX_VectorPair cd = Q6_W_vdeal_VVR(hvx_vmemu(src + 3 * VLEN_FP32), hvx_vmemu(src + 2 * VLEN_FP32), -4);
+            const HVX_Vector pairs_ab = hvx_vec_add_f32_f32(Q6_V_lo_W(ab), Q6_V_hi_W(ab));
+            const HVX_Vector pairs_cd = hvx_vec_add_f32_f32(Q6_V_lo_W(cd), Q6_V_hi_W(cd));
+            const HVX_VectorPair pairs = Q6_W_vdeal_VVR(pairs_cd, pairs_ab, -4);
+            hvx_vec_store_u(dst_th + ir, VLEN, hvx_vec_add_f32_f32(Q6_V_lo_W(pairs), Q6_V_hi_W(pairs)));
+        }
+    }
+
+    for (; ir < n_rows; ir++) {
         const float * restrict src_local = (const float *) ((const uint8_t *) src_th + ir * src_stride);
         float       * restrict dst_local = (float *)       ((uint8_t *)       dst_th + ir * dst_stride);
 
