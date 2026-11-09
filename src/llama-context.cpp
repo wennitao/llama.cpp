@@ -1997,6 +1997,17 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// LLAMA_EARLY_LAYER_INP_EVENT=1: record the layer input event of each ubatch before its outputs are read,
+// so the fence goes to the device with the compute work instead of in a separate batch after the read
+static bool llama_early_layer_inp_event() {
+    static const bool on = []() {
+        const char * env = getenv("LLAMA_EARLY_LAYER_INP_EVENT");
+        return env && atoi(env) > 0;
+    }();
+
+    return on;
+}
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -2240,6 +2251,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
 
+        // the queue of the backend is FIFO, so the last record after the last ubatch marks all layer inputs
+        if (llama_early_layer_inp_event() && layer_inp_dev && ev_layer_inp_written) {
+            ggml_backend_event_record(ev_layer_inp_written.get(), layer_inp_backend);
+        }
+
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
@@ -2367,7 +2383,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
 
-    if (layer_inp_dev && ev_layer_inp_written) {
+    if (!llama_early_layer_inp_event() && layer_inp_dev && ev_layer_inp_written) {
         ggml_backend_event_record(ev_layer_inp_written.get(), layer_inp_backend);
     }
     if (inject_src) {
