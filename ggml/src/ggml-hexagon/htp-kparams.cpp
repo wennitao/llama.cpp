@@ -1430,7 +1430,7 @@ static bool htp_kparams_solve_binary(
 }
 
 // collapse contiguous dims of elementwise ops so that rows fill at least one HVX vector
-static void htp_collapse_dims(struct ggml_tensor ** tensors, size_t n_tensors, size_t elem_size, uint32_t n_threads) {
+static void htp_collapse_dims(struct ggml_tensor ** tensors, size_t n_tensors, size_t elem_size, uint32_t n_threads, size_t glu_vtcm_size = 0) {
     if (n_tensors == 0 || !tensors[0]) {
         return;
     }
@@ -1520,6 +1520,30 @@ static void htp_collapse_dims(struct ggml_tensor ** tensors, size_t n_tensors, s
             k--;
         }
         if (k > 1) {
+            for (size_t t = 0; t < n_tensors; t++) {
+                tensors[t]->ne[0] /= k;
+                tensors[t]->ne[1] *= k;
+                tensors[t]->nb[1]  = tensors[t]->ne[0] * elem_size;
+                tensors[t]->nb[2]  = tensors[t]->nb[1] * tensors[t]->ne[1];
+                tensors[t]->nb[3]  = tensors[t]->nb[2] * tensors[t]->ne[2];
+            }
+        }
+    } else if (glu_vtcm_size > 0 && nrows < 4 * n_threads && rows_contig && row_size_curr >= 4096 &&
+               6 * (size_t) n_threads * hex_round_up(row_size_curr, 128) <= glu_vtcm_size) {
+        // GLU rows do not fill the threads: split ne0 into k rows. Only when 2 rows x 3 buffers per thread fit VTCM
+        // before the split, so op support does not change. A row is whole groups of 4 HVX vectors, so no row has a tail.
+        for (size_t t = 0; t < n_tensors; t++) {
+            if (!ggml_is_contiguous(tensors[t])) {
+                return;
+            }
+        }
+        const int64_t vec_elems = (int64_t) (128 / elem_size);
+        const int64_t k_max     = (int64_t) (row_size_curr / 2048);
+        int64_t k = (n_threads * 4 + nrows - 1) / nrows;
+        while (k <= k_max && t0->ne[0] % (k * vec_elems * 4) != 0) {
+            k++;
+        }
+        if (k <= k_max) {
             for (size_t t = 0; t < n_tensors; t++) {
                 tensors[t]->ne[0] /= k;
                 tensors[t]->ne[1] *= k;
@@ -5246,7 +5270,13 @@ void htp_opnode_collapse(const struct ggml_hexagon_session * sess, htp_opnode & 
         struct ggml_tensor src1_c = *node.inputs[1];
         struct ggml_tensor dst_c  = *node.outputs[0];
         struct ggml_tensor * tensors[3] = { &src0_c, &src1_c, &dst_c };
-        htp_collapse_dims(tensors, 3, elem_size, n_threads);
+        // not GLU_SIGMOID: its f32 loop gives the last vector of a row other bits, so its rows must not change
+        static const bool glu_retile = [] {
+            const char * e = getenv("GGML_HEXAGON_GLU_RETILE");
+            return e && strcmp(e, "1") == 0;
+        }();
+        const bool retile = glu_retile && node.opcode != HTP_OP_GLU_SIGMOID;
+        htp_collapse_dims(tensors, 3, elem_size, n_threads, retile ? htp_session_vtcm_size(sess) : 0);
         if (src0_c.ne[0] != node.inputs[0]->ne[0] || src0_c.ne[1] != node.inputs[0]->ne[1]) {
             node.inputs[0]  = node.add_dummy(src0_c);
             node.inputs[1]  = node.add_dummy(src1_c);
