@@ -714,6 +714,16 @@ static bool htp_kparams_solve_hmx_mm(
         const char * e = getenv("GGML_HEXAGON_MM_HMX_PIPE_SMALL");
         return e && strcmp(e, "1") == 0;
     }();
+    // max floats of an HMX chunk store that runs on the calling thread (0 = off, 1 = 4096)
+    static const uint32_t inline_store = [] {
+        const char * e = getenv("GGML_HEXAGON_MM_INLINE_STORE");
+        const long v = e ? strtol(e, nullptr, 10) : 0;
+        return v <= 0 ? 0u : v == 1 ? 4096u : (uint32_t) std::min<long>(v, INT32_MAX);
+    }();
+    static const bool async_bias = [] {
+        const char * e = getenv("GGML_HEXAGON_MM_ASYNC_BIAS");
+        return e && strcmp(e, "1") == 0;
+    }();
     const bool pipeline       = is_matmul_id ? false : (htp_mm_hmx_pipeline(m_for_solver) || pipe_small);
     static const bool dma_contig = [] {
         const char * e = getenv("GGML_HEXAGON_MM_DMA_CONTIG");
@@ -766,6 +776,8 @@ static bool htp_kparams_solve_hmx_mm(
     kparams->vtcm_bias_size     = (int32_t) src2_size;
     kparams->kernel_type        = (is_batched && !is_matmul_id) ? HTP_MM_KERNEL_HMX_BATCHED : HTP_MM_KERNEL_HMX_2D;
     kparams->dma_contig         = (dma_contig && is_tiled) ? 1 : 0;
+    kparams->inline_store_max   = inline_store;
+    kparams->async_bias         = async_bias ? 1 : 0;
     return true;
 }
 

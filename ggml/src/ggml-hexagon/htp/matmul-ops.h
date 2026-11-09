@@ -87,6 +87,9 @@ struct htp_mm_kernel_params {
     struct fastdiv_values div_ne00_padded;
 
     uint32_t dma_contig;         // 1 = HMX 2D/NX: Q4_0/IQ4_NL/Q8_0 weight chunk as one contiguous DMA, tiles packed at tile_size
+
+    uint32_t inline_store_max;   // HMX: store a chunk on the calling thread when rows * cols <= this (0 = off)
+    uint32_t async_bias;         // HMX: 1 = bias DMA goes behind the first weight chunks, pop before the first store
 };
 
 #if defined(__cplusplus)
