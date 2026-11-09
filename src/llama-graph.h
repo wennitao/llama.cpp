@@ -310,6 +310,10 @@ public:
     ggml_tensor * s_copy_main; // I32 [n_seqs]
     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
 
+    // rollback slot order {K-1, ..., 0} with K = n_rs_seq + 1 (LLAMA_RS_SLOT_INPUT=1)
+    // the first conv layer that stores slots makes it, all conv layers share it
+    ggml_tensor * s_slot_rev = nullptr; // I32 [K]
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse

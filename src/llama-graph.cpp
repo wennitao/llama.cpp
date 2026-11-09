@@ -25,6 +25,32 @@
 #include <string>
 #include <unordered_set>
 
+// LLAMA_RS_SLOT_INPUT=1: the conv-state rollback slot order is one graph input
+// instead of a per-layer arange (a backend without ARANGE then needs no CPU split per layer)
+static bool llama_rs_slot_input() {
+    static const bool on = []() {
+        const char * env = getenv("LLAMA_RS_SLOT_INPUT");
+        return env && atoi(env) > 0;
+    }();
+
+    return on;
+}
+
+// write the slot order {K-1, ..., 0}; skip the tensor if no node uses it (then it has no buffer)
+static void llm_graph_set_slot_rev(ggml_tensor * t) {
+    if (t == nullptr || t->buffer == nullptr) {
+        return;
+    }
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(t->buffer));
+    int32_t * data = (int32_t *) t->data;
+
+    const int64_t K = t->ne[0];
+    for (int64_t i = 0; i < K; ++i) {
+        data[i] = (int32_t) (K - 1 - i);
+    }
+}
+
 // dedup helpers
 
 static ggml_tensor * build_attn_inp_kq_mask(
@@ -495,6 +521,8 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->s_copy(i);
         }
     }
+
+    llm_graph_set_slot_rev(s_slot_rev);
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -1209,6 +1237,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    llm_graph_set_slot_rev(inp_rs->s_slot_rev);
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1255,6 +1285,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    llm_graph_set_slot_rev(inp_rs->s_slot_rev);
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
@@ -1312,6 +1344,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    llm_graph_set_slot_rev(inp_rs->s_slot_rev);
 }
 
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
@@ -4076,10 +4110,22 @@ void llm_graph_context::build_conv_state_store(
 
     // each conv layer builds its own slot order {K-1, ..., 0}, on the device of the layer, and takes its tail
     // {Kw-1, ..., 0}; the size K never depends on the ubatch, so the reserved graph covers them all
-    ggml_tensor * s_slot_rev = ggml_arange(ctx0, 0.0f, (float) K, 1.0f);
-    s_slot_rev = ggml_scale_bias(ctx0, s_slot_rev, -1.0f, (float) (K - 1));
-    s_slot_rev = ggml_cast(ctx0, s_slot_rev, GGML_TYPE_I32);
-    cb(s_slot_rev, "s_slot_rev", -1);
+    ggml_tensor * s_slot_rev = nullptr;
+    if (llama_rs_slot_input()) {
+        // one I32 input with the same values, shared by all conv layers of the graph
+        if (inp->s_slot_rev == nullptr) {
+            inp->s_slot_rev = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, K);
+            ggml_set_input(inp->s_slot_rev);
+            ggml_set_name(inp->s_slot_rev, "s_slot_rev");
+        }
+        GGML_ASSERT(inp->s_slot_rev->ne[0] == K);
+        s_slot_rev = inp->s_slot_rev;
+    } else {
+        s_slot_rev = ggml_arange(ctx0, 0.0f, (float) K, 1.0f);
+        s_slot_rev = ggml_scale_bias(ctx0, s_slot_rev, -1.0f, (float) (K - 1));
+        s_slot_rev = ggml_cast(ctx0, s_slot_rev, GGML_TYPE_I32);
+        cb(s_slot_rev, "s_slot_rev", -1);
+    }
 
     ggml_tensor * slot_order = ggml_view_1d(ctx0, s_slot_rev, Kw, ggml_row_size(GGML_TYPE_I32, K - Kw));
 
