@@ -260,6 +260,42 @@ static uint32_t fa_scan_active_blocks(
     return n_active;
 }
 
+// True when mask rows [0, n_rows) x columns [0, n_cols) in VTCM are all 0x0000 (+0.0).
+static bool fa_mask_block_is_zero(const __fp16 * mask, size_t row_stride, uint32_t n_rows, uint32_t n_cols) {
+    HVX_Vector v_any = Q6_V_vzero();
+    for (uint32_t r = 0; r < n_rows; ++r) {
+        const __fp16 * row_ptr = mask + r * row_stride;
+        uint32_t c = 0;
+        for (; c + 64 <= n_cols; c += 64) {
+            v_any = Q6_V_vor_VV(v_any, *(const HVX_Vector *) (row_ptr + c));
+        }
+        if (c < n_cols) {
+            const HVX_VectorPred q_rem = Q6_Q_vsetq2_R((n_cols - c) * sizeof(__fp16));
+            v_any = Q6_V_vor_VV(v_any, Q6_V_vand_QV(q_rem, *(const HVX_Vector *) (row_ptr + c)));
+        }
+    }
+    v_any = Q6_V_vor_VV(v_any, Q6_V_vror_VR(v_any, 64));
+    v_any = Q6_V_vor_VV(v_any, Q6_V_vror_VR(v_any, 32));
+    v_any = Q6_V_vor_VV(v_any, Q6_V_vror_VR(v_any, 16));
+    v_any = Q6_V_vor_VV(v_any, Q6_V_vror_VR(v_any, 8));
+    v_any = Q6_V_vor_VV(v_any, Q6_V_vror_VR(v_any, 4));
+    return Q6_R_vextract_VR(v_any, 0) == 0;
+}
+
+// Zero-mask flag of the block at this step: found on the first KV head, reused by the others (broadcast mask).
+static inline bool fa_zmask_step(uint32_t * bits, uint32_t step, bool first_head, const __fp16 * mask, size_t row_stride,
+                                 uint32_t n_rows, uint32_t n_cols) {
+    const uint32_t bit = 1u << (step % 32);
+    if (first_head) {
+        if (fa_mask_block_is_zero(mask, row_stride, n_rows, n_cols)) {
+            bits[step / 32] |= bit;
+        } else {
+            bits[step / 32] &= ~bit;
+        }
+    }
+    return (bits[step / 32] & bit) != 0;
+}
+
 static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void * data) {
     struct htp_fa_context * factx = (struct htp_fa_context *) data;
     const struct htp_ops_context * octx = factx->octx;
@@ -1226,6 +1262,7 @@ typedef struct {
     const __fp16 *            mask_vtcm;             // VTCM mask buffer base (NULL = DDR fallback)
     size_t                    mask_vtcm_row_stride;  // elements (__fp16) per row in VTCM mask buffer
     struct fastdiv_values     thread_div;
+    bool                      zmask;                 // mask of this block is +0.0 for all valid rows
 } fa_softmax_args_t;
 
 static inline void fa_softmax_impl(
@@ -1355,7 +1392,31 @@ static inline void fa_softmax_impl(
 
             HVX_Vector v_s_rowmax0 = v_neg_inf;
             HVX_Vector v_s_rowmax1 = v_neg_inf;
-            if (has_mask) {
+            if (has_mask && !has_alibi && args->zmask && r + 1 < n_rows_g) {
+                // Both mask rows are +0.0: same add as the mask path below, with a +0.0 mask vector.
+                // The keep predicate (+0.0 > -16.0) has all lanes set in a full chunk, so the vmux is a no-op there.
+                const HVX_Vector v_mask        = Q6_V_vzero();
+                const HVX_Vector v_mask_scaled = hvx_vec_mul_f16_f16(v_mask, hvx_vec_splat_f16(EXP_LOG2E_F));
+                size_t c = 0;
+                for (; c + 64 <= kv_rows; c += 64) {
+                    size_t           ci = c / 64;
+                    const HVX_Vector v0 = hvx_vec_add_f16_f16(my_row_buf0[ci], v_mask_scaled);
+                    const HVX_Vector v1 = hvx_vec_add_f16_f16(my_row_buf1[ci], v_mask_scaled);
+                    my_row_buf0[ci] = v0;
+                    my_row_buf1[ci] = v1;
+                    v_s_rowmax0 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax0, v0);
+                    v_s_rowmax1 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax1, v1);
+                }
+                if (c < kv_rows) {
+                    size_t         ci          = c / 64;
+                    HVX_VectorPred q_tail_keep = Q6_Q_vsetq2_R((kv_rows - c) * sizeof(__fp16));
+                    HVX_VectorPred q_keep      = Q6_Q_and_QQ(Q6_Q_vcmp_gt_VhfVhf(v_mask, v_threshold), q_tail_keep);
+                    my_row_buf0[ci] = Q6_V_vmux_QVV(q_keep, hvx_vec_add_f16_f16(my_row_buf0[ci], v_mask_scaled), v_neg_inf);
+                    my_row_buf1[ci] = Q6_V_vmux_QVV(q_keep, hvx_vec_add_f16_f16(my_row_buf1[ci], v_mask_scaled), v_neg_inf);
+                    v_s_rowmax0 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax0, my_row_buf0[ci]);
+                    v_s_rowmax1 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax1, my_row_buf1[ci]);
+                }
+            } else if (has_mask) {
                 for (size_t c = 0; c < kv_rows; c += 64) {
                     size_t         ci          = c / 64;
                     const size_t   ne          = hex_smin(kv_rows - c, 64);
@@ -2251,6 +2312,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     hmx_fa_o_update_job_t ou_job;
     hmx_fa_o_norm_job_t   on_job;
 
+    const bool zmask = (kparams->flags & HTP_FA_FLAG_ZMASK) && mask && factx.mask_broadcast;
+    uint32_t   zmask_bits[FA_MAX_KV_BLOCKS / 32];  // per step of the current q tile
+
     // ======== Main loop ========
     for (uint32_t ib3 = 0; ib3 < neq3; ++ib3) {
         const uint32_t im3 = mask ? fastmodulo(ib3, mask->ne[3], &factx.src3_div3) : 0;
@@ -2376,6 +2440,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                                 current_mask_vtcm = factx.vtcm_mask_buf;
                             }
                         }
+                        const bool zmask_blk = zmask && fa_zmask_step(zmask_bits, step, kv_head == kv_head_min, current_mask_vtcm,
+                                                                      factx.mask_buf_row_stride, n_rows_q, kv_rows);
 
                         // ---- 3. Start HMX O update for step - 1 (reads P[1 - buf_idx], V[1 - buf_idx], D) ----
                         // O update relies on the previous block's P and V tiles.
@@ -2447,6 +2513,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         sargs.mask_vtcm            = current_mask_vtcm;
                         sargs.mask_vtcm_row_stride = factx.mask_buf_row_stride;
                         sargs.slopes               = factx.vtcm_slopes;
+                        sargs.zmask                = zmask_blk;
 
                         // Run Softmax on HVX (blocking call)
                         fa_phase_softmax_and_build_d(&factx, &sargs, n_row_tiles, n_row_tiles_g_br);
@@ -2552,6 +2619,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                                 current_mask_vtcm = factx.vtcm_mask_buf;
                             }
                         }
+                        const bool zmask_blk = zmask && fa_zmask_step(zmask_bits, step, kv_head == kv_head_min, current_mask_vtcm,
+                                                                      factx.mask_buf_row_stride, n_rows_q, kv_rows);
 
                         fa_softmax_args_t sargs;
                         memset(&sargs, 0, sizeof(sargs));
@@ -2573,6 +2642,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         sargs.mask_vtcm            = current_mask_vtcm;
                         sargs.mask_vtcm_row_stride = factx.mask_buf_row_stride;
                         sargs.slopes               = factx.vtcm_slopes;
+                        sargs.zmask                = zmask_blk;
                         fa_phase_softmax_and_build_d(&factx, &sargs, n_row_tiles, n_row_tiles_g_br);
 
                         {

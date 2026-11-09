@@ -430,6 +430,11 @@ static bool htp_kparams_solve_flash_attn(
     kparams->m0 = std::pow(2.0f, -(max_bias) / kparams->n_head_log2);
     kparams->m1 = std::pow(2.0f, -(max_bias / 2.0f) / kparams->n_head_log2);
 
+    static const bool fa_zmask = [] {
+        const char * e = getenv("GGML_HEXAGON_FA_ZMASK");
+        return e && strcmp(e, "1") == 0;
+    }();
+
     if (htp_flash_attn_is_hmx_eligible(sess, q, k, v, sinks)) {
         const uint32_t DK_pad = hex_round_up(DK, 64);
         const uint32_t DV_pad = hex_round_up(DV, 64);
@@ -463,6 +468,9 @@ static bool htp_kparams_solve_flash_attn(
             kparams->vtcm_size           = hmx_fa_compute_vtcm_usage(G, DK_pad, DV_pad, Br, Bc, kparams->n_threads, kparams->u.hmx.pipeline != 0, (q->type == GGML_TYPE_F32), sinks != nullptr, n_head);
             kparams->u.hmx.mask_broadcast = (mask != nullptr && mask->ne[2] == 1) ? 1 : 0;
             kparams->u.hmx.div_G         = init_fastdiv_values(G);
+            if (fa_zmask && kparams->u.hmx.mask_broadcast && max_bias == 0.0f) {
+                kparams->flags |= HTP_FA_FLAG_ZMASK;
+            }
             if (mask) {
                 kparams->src3_div2 = init_fastdiv_values(mask->ne[2]);
                 kparams->src3_div3 = init_fastdiv_values(mask->ne[3]);

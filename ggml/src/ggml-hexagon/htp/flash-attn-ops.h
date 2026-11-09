@@ -34,6 +34,8 @@ enum htp_fa_kernel_type {
 
 // Multicore: gcd(n_kv_heads, N) teams own the KV heads, team members share the Q-blocks
 #define HTP_FA_FLAG_TEAM_SPLIT 0x01
+// HMX: skip the mask path for KV blocks whose broadcast mask is all +0.0 (same arithmetic)
+#define HTP_FA_FLAG_ZMASK      0x02
 
 static inline void htp_fa_mdev_teams(uint32_t n_kv_heads, uint32_t mdev_count, bool head_split,
                                      uint32_t * n_teams, uint32_t * team_size) {
