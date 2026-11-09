@@ -1798,6 +1798,58 @@ static bool htp_kparams_solve_get_rows(
     return htp_kparams_solve_repeat_get_rows(sess, op->src[0], op->src[1], op, kparams);
 }
 
+// f32 windows path: src0 row w of a channel starts w floats after row 0 (rollback slots of a conv state)
+static bool htp_kparams_solve_set_rows_win(
+    const struct ggml_hexagon_session * sess,
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * src1,
+    const struct ggml_tensor * dst,
+    struct htp_set_rows_kernel_params * kparams
+) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_HEXAGON_SET_ROWS_WIN");
+        return e && strcmp(e, "1") == 0;
+    }();
+
+    const int64_t ne00 = src0->ne[0];
+    const int64_t nw   = src0->ne[1];
+    const int64_t nc   = src0->ne[2];
+
+    if (!enabled || htp_session_mdev_count(sess) != 1 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if ((ne00 != 1 && ne00 != 2 && ne00 != 4) || nw < 1 || nw > HTP_SET_ROWS_WIN_MAX_ROWS || nc < 1 ||
+        src0->ne[3] != 1 || src1->ne[1] != 1 || src1->ne[2] != 1) {
+        return false;
+    }
+    // the channel spans do not overlap, the dst rows are packed channels and do not overlap
+    if (src0->nb[0] != sizeof(float) || src0->nb[1] != sizeof(float) || src0->nb[2] % sizeof(float) != 0 ||
+        src0->nb[2] < (size_t) (nw - 1 + ne00) * sizeof(float) ||
+        dst->nb[0] != sizeof(float) || dst->nb[2] != (size_t) ne00 * sizeof(float) || dst->nb[1] < (size_t) (ne00 * nc) * sizeof(float)) {
+        return false;
+    }
+    // the load reads whole channel spans; keep it at most 4x the window span, so long prompt ubatches keep the old path
+    if (src0->nb[2] > (size_t) 4 * (nw - 1 + ne00) * sizeof(float)) {
+        return false;
+    }
+
+    const uint32_t ch_per_vec    = (uint32_t) (32 / ne00);
+    const uint32_t n_threads     = (std::min)(htp_session_n_threads(sess), (uint32_t) ((nc + ch_per_vec - 1) / ch_per_vec));
+    const uint32_t ch_per_thread = hex_round_up((uint32_t) ((nc + n_threads - 1) / n_threads), ch_per_vec);
+
+    struct htp_set_rows_win_layout layout;
+    htp_set_rows_win_layout_build(&layout, (size_t) ne00, (size_t) nw, src0->nb[1], src0->nb[2], ch_per_thread, n_threads);
+    if (layout.total_bytes > htp_session_vtcm_size(sess)) {
+        return false;
+    }
+
+    kparams->n_threads         = n_threads;
+    kparams->vtcm_size         = layout.total_bytes;
+    kparams->win               = 1;
+    kparams->win_ch_per_thread = ch_per_thread;
+    return true;
+}
+
 static bool htp_kparams_solve_set_rows(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * op,
@@ -1827,6 +1879,10 @@ static bool htp_kparams_solve_set_rows(
     kparams->n_threads   = (std::min)(htp_session_n_threads(sess), nr);
     kparams->total_tasks = nr;
     kparams->packed_channels = 1;
+
+    if (htp_kparams_solve_set_rows_win(sess, src0, src1, dst, kparams)) {
+        return true;
+    }
 
     struct htp_set_rows_vtcm_layout vtcm_layout;
     const char * pack_channels = getenv("GGML_HEXAGON_SET_ROWS_PACK");
