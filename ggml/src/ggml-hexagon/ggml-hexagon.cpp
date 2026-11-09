@@ -303,6 +303,16 @@ struct ggml_hexagon_event {
     uint32_t               seq          = 0;
 };
 
+// solved ops of one graph, keyed by graph uid (GGML_HEXAGON_GRAPH_CACHE)
+struct ggml_hexagon_graph_entry {
+    uint64_t                uid    = 0;
+    uint64_t                tick   = 0;     // last use, for LRU eviction
+    std::vector<uint64_t>   sig;            // graph fields that the ops depend on
+    std::vector<htp_opnode> nodes;          // solved ops before fusion
+    std::vector<htp_opnode> ops;            // ops after fusion, valid when ops_ok
+    bool                    ops_ok = false;
+};
+
 struct ggml_hexagon_session {
     std::string      name;
     remote_handle64  handle;
@@ -338,6 +348,9 @@ struct ggml_hexagon_session {
     uint64_t                cached_uid = 0;
     std::vector<htp_opnode> cached_nodes;
 
+    std::vector<ggml_hexagon_graph_entry> graph_cache;
+    uint64_t                              graph_tick = 0;
+
     ggml_hexagon_mdev_group                mdev;
     ggml_backend_dev_t                     dev       = nullptr;
     ggml_backend_hexagon_device_context *  dev_ctx   = nullptr;
@@ -363,7 +376,7 @@ struct ggml_hexagon_session {
     std::unordered_map<uint64_t, volatile uint32_t *> cpy_fence_slots;
 
     void enqueue_mdev_group();
-    void enqueue_op(const htp_opnode & node);
+    void enqueue_op(const htp_opnode & node, bool fuse = true);
     void enqueue_cpy(const ggml_tensor * src, ggml_tensor * dst, const ggml_tensor * sync_tensor = nullptr, uint32_t fence_seq = 0);
     void enqueue_fence(const ggml_tensor * sync_tensor, uint32_t fence_seq = 0, bool wait = true);
     void enqueue_allreduce(const ggml_tensor * dst, const std::vector<const ggml_tensor *> & src_tensors,
@@ -1822,7 +1835,7 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
     op_batch->reset();
 }
 
-void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
+void ggml_hexagon_session::enqueue_op(const htp_opnode & node, bool fuse) {
     auto clone_tensor_buffer = [this](const ggml_tensor * t) {
         auto sbuf = this->mmap_tensor(t);
         if (!sbuf) return;
@@ -1842,7 +1855,7 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
     }
 
     const bool fits_tensors = op_batch->fit_tensors(node);
-    if (opt_opfusion && fits_tensors && op_batch->try_fuse(node)) {
+    if (fuse && opt_opfusion && fits_tensors && op_batch->try_fuse(node)) {
         return;
     }
 
@@ -2398,6 +2411,159 @@ static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_se
     }
 }
 
+static void ggml_hexagon_graph_solve(ggml_cgraph * graph, ggml_hexagon_session * sess, std::vector<htp_opnode> & nodes) {
+    ggml_hexagon_graph_repack(graph, sess);
+
+    htp_fusion_tag_graph(graph);
+
+    nodes.reserve(graph->n_nodes);
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * n = graph->nodes[i];
+        if (!ggml_hexagon_op_is_compute(n)) {
+            continue;
+        }
+
+        const htp_op_code opcode = htp_op_remap(n);
+        if (opcode == HTP_OP_INVALID) {
+            GGML_ABORT("\nggml-hex: graph-compute %s is not supported\n", ggml_op_desc(n));
+        }
+
+        htp_opnode node(opcode, n);
+        GGML_ASSERT(htp_kparams_solve(sess, node));
+
+        nodes.push_back(std::move(node));
+    }
+}
+
+// graph fields that the solved and fused ops depend on
+template <typename F>
+static void ggml_hexagon_graph_fields(const ggml_cgraph * graph, F && put) {
+    auto put_tensor = [&put](const ggml_tensor * t) {
+        put((uint64_t) t->type | ((uint64_t) t->op << 32));
+        for (int i = 0; i < GGML_MAX_DIMS; i++) {
+            put((uint64_t) t->ne[i]);
+            put((uint64_t) t->nb[i]);
+        }
+        put((uint64_t) (uintptr_t) t->data);
+        put((uint64_t) (uintptr_t) t->buffer);
+        put(t->buffer ? (uint64_t) t->buffer->usage : UINT64_MAX);
+        put((uint64_t) (uintptr_t) t->extra);
+        put((uint64_t) (uintptr_t) t->view_src);
+        put((uint64_t) t->view_offs);
+        put((uint64_t) (uint32_t) t->flags);
+    };
+
+    put((uint64_t) graph->n_nodes);
+    for (int i = 0; i < graph->n_nodes; i++) {
+        const ggml_tensor * n = graph->nodes[i];
+        put((uint64_t) (uintptr_t) n);
+        if (!ggml_hexagon_op_is_compute(n)) {
+            put(0);
+            continue;
+        }
+        put(1);
+        put_tensor(n);
+        for (int j = 0; j + 1 < GGML_MAX_OP_PARAMS / (int) sizeof(int32_t); j += 2) {
+            put((uint64_t) (uint32_t) n->op_params[j] | ((uint64_t) (uint32_t) n->op_params[j + 1] << 32));
+        }
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            const ggml_tensor * s = n->src[j];
+            put((uint64_t) (uintptr_t) s);
+            if (s) {
+                put_tensor(s);
+            }
+        }
+    }
+}
+
+// enqueue a graph through the multi-entry graph cache (GGML_HEXAGON_GRAPH_CACHE=<n entries>)
+static void ggml_hexagon_graph_enqueue_cached(ggml_cgraph * graph, ggml_hexagon_session * sess, size_t n_entries) {
+    auto & cache = sess->graph_cache;
+
+    ggml_hexagon_graph_entry * e = nullptr;
+    for (auto & c : cache) {
+        if (c.uid == graph->uid) {
+            e = &c;
+            break;
+        }
+    }
+
+    // a uid hit needs the same fields too: e.g. another graph can tile a weight that this graph reads
+    bool hit = false;
+    if (e) {
+        size_t i = 0;
+        hit = true;
+        ggml_hexagon_graph_fields(graph, [&](uint64_t v) {
+            hit = hit && i < e->sig.size() && e->sig[i] == v;
+            i++;
+        });
+        hit = hit && i == e->sig.size();
+    } else if (cache.size() < n_entries) {
+        e = &cache.emplace_back();
+    } else {
+        e = &*std::min_element(cache.begin(), cache.end(),
+                [](const ggml_hexagon_graph_entry & a, const ggml_hexagon_graph_entry & b) { return a.tick < b.tick; });
+    }
+
+    e->uid  = graph->uid;
+    e->tick = ++sess->graph_tick;
+
+    if (!hit) {
+        e->nodes.clear();
+        e->ops.clear();
+        e->ops_ok = false;
+
+        ggml_hexagon_graph_solve(graph, sess, e->nodes);
+
+        e->sig.clear();
+        ggml_hexagon_graph_fields(graph, [e](uint64_t v) { e->sig.push_back(v); });
+    }
+
+    // replay the fused ops only into an empty batch: there no op can fuse with an op of an earlier graph
+    const bool empty  = sess->op_batch->empty();
+    const bool replay = e->ops_ok && empty;
+
+    HEX_VERBOSE("ggml-hex: %s graph-cache uid %llu %s%s\n", sess->c_name(), (unsigned long long) graph->uid,
+                hit ? "hit" : "miss", replay ? " replay" : "");
+
+    if (replay) {
+        for (const auto & op : e->ops) {
+            sess->enqueue_op(op, false);
+        }
+        return;
+    }
+
+    const uint64_t seq = sess->batch_req_seq;
+    for (const auto & node : e->nodes) {
+        sess->enqueue_op(node);
+    }
+
+    // keep the fused ops of a reused graph that went into one batch from empty
+    if (hit && empty && sess->batch_req_seq == seq && sess->mdev.count == 1) {
+        const auto & ops = sess->op_batch->ops;
+        e->ops.assign(ops.begin(), ops.begin() + sess->op_batch->n_ops);
+        e->ops_ok = true;
+    }
+}
+
+static ggml_status ggml_hexagon_graph_compute_done(ggml_hexagon_session * sess) {
+    // send the batch now: a graph without outputs (e.g. DSpark feature injection) has no get_tensor to send it
+    static const bool eager_flush = [] {
+        const char * e = getenv("GGML_HEXAGON_EAGER_FLUSH");
+        return e && strcmp(e, "1") == 0;
+    }();
+    if (eager_flush) {
+        sess->flush_async();
+    }
+
+    if (sess->last_error > HTP_STATUS_OK) {
+        return GGML_STATUS_FAILED;
+    }
+
+    return GGML_STATUS_SUCCESS;
+}
+
 static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
 
@@ -2407,6 +2573,15 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
 
     HEX_VERBOSE("ggml-hex: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
 
+    static const size_t graph_cache_size = [] {
+        const char * e = getenv("GGML_HEXAGON_GRAPH_CACHE");
+        return e ? (size_t) std::clamp(atoi(e), 0, 256) : 0;
+    }();
+    if (graph_cache_size > 0 && graph->uid != 0) {
+        ggml_hexagon_graph_enqueue_cached(graph, sess, graph_cache_size);
+        return ggml_hexagon_graph_compute_done(sess);
+    }
+
     const std::vector<htp_opnode> * nodes_ptr = nullptr;
     std::vector<htp_opnode> computed_nodes;
 
@@ -2414,28 +2589,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     if (cache_hit) {
         nodes_ptr = &sess->cached_nodes;
     } else {
-        ggml_hexagon_graph_repack(graph, sess);
-
-        htp_fusion_tag_graph(graph);
-
-        computed_nodes.reserve(graph->n_nodes);
-
-        for (int i = 0; i < graph->n_nodes; ++i) {
-            ggml_tensor * n = graph->nodes[i];
-            if (!ggml_hexagon_op_is_compute(n)) {
-                continue;
-            }
-
-            const htp_op_code opcode = htp_op_remap(n);
-            if (opcode == HTP_OP_INVALID) {
-                GGML_ABORT("\nggml-hex: graph-compute %s is not supported\n", ggml_op_desc(n));
-            }
-
-            htp_opnode node(opcode, n);
-            GGML_ASSERT(htp_kparams_solve(sess, node));
-
-            computed_nodes.push_back(std::move(node));
-        }
+        ggml_hexagon_graph_solve(graph, sess, computed_nodes);
 
         if (graph->uid != 0) {
             sess->cached_uid   = graph->uid;
@@ -2450,11 +2604,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         sess->enqueue_op(node);
     }
 
-    if (sess->last_error > HTP_STATUS_OK) {
-        return GGML_STATUS_FAILED;
-    }
-
-    return GGML_STATUS_SUCCESS;
+    return ggml_hexagon_graph_compute_done(sess);
 }
 
 static void ggml_backend_hexagon_synchronize(ggml_backend_t backend) {
