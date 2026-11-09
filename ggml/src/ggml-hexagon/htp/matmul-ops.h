@@ -85,6 +85,8 @@ struct htp_mm_kernel_params {
     struct fastdiv_values div_ne12;
     struct fastdiv_values div_n_act_threads;
     struct fastdiv_values div_ne00_padded;
+
+    uint32_t dma_contig;         // 1 = HMX 2D/NX: Q4_0/IQ4_NL/Q8_0 weight chunk as one contiguous DMA, tiles packed at tile_size
 };
 
 #if defined(__cplusplus)

@@ -2335,6 +2335,16 @@ static inline tiled_dequant_task_fn_t hmx_get_dequant_worker_fn(int weight_type,
     }
 }
 
+// Dequant for tiles packed at tile_size (contiguous weight DMA). NULL: type keeps the padded layout.
+static inline tiled_dequant_task_fn_t hmx_get_dequant_packed_fn(int weight_type) {
+    switch (weight_type) {
+        case HTP_TYPE_Q4_0:   return dequantize_tiled_weight_to_fp16_task_q4_0_packed;
+        case HTP_TYPE_IQ4_NL: return dequantize_tiled_weight_to_fp16_task_iq4_nl_packed;
+        case HTP_TYPE_Q8_0:   return dequantize_tiled_weight_to_fp16_task_q8_0_packed;
+        default:              return NULL;
+    }
+}
+
 static void dequantize_tiled_weight_chunk_to_fp16_tiles(
         struct htp_context *ctx, __fp16 *vtcm_dst,
         const void *weight_src_ddr,
@@ -2652,7 +2662,8 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
                                   const struct fastdiv_values * k_div,
                                   int tile_size,
                                   int aligned_tile_size,
-                                  int vtcm_size) {
+                                  int vtcm_size,
+                                  int dma_contig) {
     struct htp_thread_trace * tr = &ctx->trace[0];
     htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
 
@@ -2670,6 +2681,12 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
 
     tiled_dequant_task_fn_t dequant_worker_fn = hmx_get_dequant_worker_fn(weight_type, is_tiled);
 
+    // Contiguous weight DMA: tiles land packed at tile_size in VTCM (raw buffers keep the padded size)
+    const tiled_dequant_task_fn_t packed_fn = (dma_contig && is_tiled) ? hmx_get_dequant_packed_fn(weight_type) : NULL;
+    if (packed_fn) {
+        dequant_worker_fn = packed_fn;
+    }
+
     const int n_k_tiles = k / HTP_MM_HMX_TILE_N_COLS;
     const int n_weight_tiles = k / htp_tensor_get_tile_k(weight_type);
     const struct fastdiv_values n_k_tiles_div = init_fastdiv_values(n_k_tiles);
@@ -2677,7 +2694,7 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
     const size_t vec_dot_size = k * sizeof(__fp16);
     const size_t vtcm_budget  = ctx->vtcm_size;
 
-    const uint32_t dma_dst_stride  = is_tiled ? aligned_tile_size : row_stride;
+    const uint32_t dma_dst_stride  = is_tiled ? (packed_fn ? tile_size : aligned_tile_size) : row_stride;
     const uint32_t dma_src_stride  = is_tiled ? tile_size : weight_stride;
     const uint32_t dma_width_bytes = is_tiled ? tile_size : row_stride;
 
@@ -2944,6 +2961,12 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
     tiled_dequant_task_fn_t dequant_worker_fn = hmx_get_dequant_worker_fn(weight_type, is_tiled);
     const size_t vtcm_budget  = ctx->vtcm_size;
 
+    // Contiguous weight DMA: tiles land packed at tile_size in VTCM (raw buffers keep the padded size)
+    const tiled_dequant_task_fn_t packed_fn = (kparams->dma_contig && is_tiled) ? hmx_get_dequant_packed_fn(weight_type) : NULL;
+    if (packed_fn) {
+        dequant_worker_fn = packed_fn;
+    }
+
     const int m_chunk_n_rows  = kparams->m_chunk;
     const int n_chunk_n_cols  = kparams->n_chunk;
     const int pipeline        = kparams->pipeline;
@@ -2952,7 +2975,7 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
     const struct fastdiv_values * act_threads_div = &kparams->div_n_act_threads;
     const struct fastdiv_values * k_div           = &kparams->div_ne00_padded;
 
-    const uint32_t dma_dst_stride  = is_tiled ? aligned_tile_size : row_stride;
+    const uint32_t dma_dst_stride  = is_tiled ? (packed_fn ? tile_size : aligned_tile_size) : row_stride;
     const uint32_t dma_width_bytes = is_tiled ? tile_size : row_stride;
 
     struct htp_mm_hmx_vtcm_layout L;
@@ -3244,7 +3267,7 @@ static int hmx_mm_batched_simple(struct htp_context *ctx,
                                 params->act_stride, params->act_elem_size, params->weight_stride,
                                 params->weight_type, params->k, params->dst_stride, params->bias_stride, params->dst_cols,
                                 m_chunk, n_chunk, pipeline, n_threads, act_threads,
-                                act_threads_div, k_div, params->tile_size, params->aligned_tile_size, vtcm_size);
+                                act_threads_div, k_div, params->tile_size, params->aligned_tile_size, vtcm_size, 0);
         }
     }
     return ret;
@@ -3765,7 +3788,8 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
             kparams->n_act_threads,
             &kparams->div_n_act_threads,
             &kparams->div_ne00_padded,
-            kparams->tile_size, kparams->aligned_tile_size, kparams->vtcm_size
+            kparams->tile_size, kparams->aligned_tile_size, kparams->vtcm_size,
+            (int) kparams->dma_contig
         );
     }
 

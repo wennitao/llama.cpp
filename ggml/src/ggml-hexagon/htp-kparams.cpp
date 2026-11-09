@@ -715,6 +715,10 @@ static bool htp_kparams_solve_hmx_mm(
         return e && strcmp(e, "1") == 0;
     }();
     const bool pipeline       = is_matmul_id ? false : (htp_mm_hmx_pipeline(m_for_solver) || pipe_small);
+    static const bool dma_contig = [] {
+        const char * e = getenv("GGML_HEXAGON_MM_DMA_CONTIG");
+        return e && strcmp(e, "1") == 0;
+    }();
     const bool is_batched_val = is_matmul_id ? false : is_batched;
     const int  group_size     = (ne02 > 0 ? ne12 / ne02 : 1);
 
@@ -761,6 +765,7 @@ static bool htp_kparams_solve_hmx_mm(
     kparams->div_ne00_padded    = init_fastdiv_values(ne00_padded);
     kparams->vtcm_bias_size     = (int32_t) src2_size;
     kparams->kernel_type        = (is_batched && !is_matmul_id) ? HTP_MM_KERNEL_HMX_BATCHED : HTP_MM_KERNEL_HMX_2D;
+    kparams->dma_contig         = (dma_contig && is_tiled) ? 1 : 0;
     return true;
 }
 
