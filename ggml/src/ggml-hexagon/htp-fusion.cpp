@@ -670,3 +670,22 @@ bool htp_fusion_try_fuse(const struct ggml_hexagon_session * sess, struct htp_op
             return false;
     }
 }
+
+// keep this list equal to the cases of htp_fusion_try_fuse
+bool htp_fusion_can_fuse_into_prev(int opcode) {
+    switch (opcode) {
+        case HTP_OP_ADD:
+        case HTP_OP_MUL:
+        case HTP_OP_SUB:
+        case HTP_OP_DIV:
+        case HTP_OP_SCALE:
+        case HTP_OP_UNARY_SILU:
+        case HTP_OP_GET_ROWS:
+        case HTP_OP_CPY:
+        case HTP_OP_MUL_MAT:
+        case HTP_OP_MUL_MAT_ID:
+            return true;
+        default:
+            return false;
+    }
+}

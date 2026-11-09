@@ -275,6 +275,9 @@ static void ggml_hexagon_dump_trace_events(const char * sess_name, const htp_opb
 
 // ** backend sessions
 
+static inline bool ggml_hexagon_op_is_compute(const struct ggml_tensor * node);
+static uint32_t    ggml_hexagon_flush_split();
+
 struct ggml_hexagon_opbatch;
 struct ggml_hexagon_opqueue;
 struct ggml_hexagon_shared_buffer;
@@ -301,6 +304,7 @@ struct ggml_hexagon_event {
     volatile uint32_t *    fence_slot   = nullptr;
     ggml_tensor            fence_tensor = {};
     uint32_t               seq          = 0;
+    uint64_t               u_epoch      = 0;  // unsplit batch epoch at record time (GGML_HEXAGON_FLUSH_SPLIT)
 };
 
 // solved ops of one graph, keyed by graph uid (GGML_HEXAGON_GRAPH_CACHE)
@@ -1234,6 +1238,48 @@ struct ggml_hexagon_opbatch {
     unsigned int n_ops_max;
     size_t       b_vmem_max;
 
+    // GGML_HEXAGON_FLUSH_SPLIT: the accounting of the batch as it is without part flushes ("unsplit"). A part flush
+    // keeps it (u_keep), every other flush clears it. enqueue_op takes fusion and cut decisions from it, so the parts
+    // carry the same ops and fusions as the unsplit batch. The real batch is always a subset of it.
+    bool                         u_on   = false;
+    bool                         u_keep = false;
+    std::unordered_set<uint64_t> u_tens;
+    int                          u_fds[HTP_OP_MAX_BUFS];
+    unsigned int                 u_bufs  = 0;
+    unsigned int                 u_ops   = 0;
+    size_t                       u_vmem  = 0;
+    uint64_t                     u_epoch = 0;  // counts the flushes of the unsplit flow
+
+    void u_clear() {
+        u_tens.clear();
+        u_bufs = 0;
+        u_ops  = 0;
+        u_vmem = 0;
+        u_epoch++;
+    }
+
+    int u_find_buffer(int fd) const {
+        for (unsigned int i = 0; i < u_bufs; i++) {
+            if (u_fds[i] == fd) {
+                return (int) i;
+            }
+        }
+        return -1;
+    }
+
+    void u_add_buffer(ggml_hexagon_shared_buffer * sbuf) {
+        if (u_find_buffer(sbuf->fd()) >= 0) {
+            return;
+        }
+        GGML_ASSERT(u_bufs < HTP_OP_MAX_BUFS);
+        u_fds[u_bufs++] = sbuf->fd();
+        if (!sbuf->extended) {
+            u_vmem += sbuf->size();
+        }
+    }
+
+    bool u_full() const { return u_ops >= n_ops_max; }
+
     void reset() {
         n_bufs = 0;
         n_tens = 0;
@@ -1242,6 +1288,10 @@ struct ggml_hexagon_opbatch {
 
         t_map.clear();
         ops.resize(n_ops_max);
+
+        if (!u_keep) {
+            u_clear();
+        }
     }
 
     ggml_hexagon_opbatch(ggml_hexagon_session *sess, size_t batch_size, size_t max_vmem) {
@@ -1260,6 +1310,11 @@ struct ggml_hexagon_opbatch {
         h_ops.resize(n_ops_max);
 
         t_map.reserve(n_tens_max);
+
+        u_on = ggml_hexagon_flush_split() > 0;
+        if (u_on) {
+            u_tens.reserve(n_tens_max);
+        }
 
         GGML_LOG_INFO("ggml-hex: %s op batching: n-bufs %u n-tensors %u n-ops %u vmem %zu\n",
                 sess->c_name(), n_bufs_max, n_tens_max, n_ops_max, b_vmem_max);
@@ -1284,6 +1339,10 @@ struct ggml_hexagon_opbatch {
         // Lookup by fd
         int bi = find_buffer(sbuf->fd());
         if (bi >= 0) { return bi; }
+
+        if (u_on) {
+            u_add_buffer(sbuf);
+        }
 
         // Add new buffer to the batch
         GGML_ASSERT(n_bufs < HTP_OP_MAX_BUFS);
@@ -1372,6 +1431,10 @@ struct ggml_hexagon_opbatch {
             return it->second;
         }
 
+        if (u_on) {
+            u_tens.insert(hash);
+        }
+
         auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context);
 
         // Add new tensor to the batch
@@ -1446,6 +1509,58 @@ struct ggml_hexagon_opbatch {
         return true;
     }
 
+    // fit_tensors evaluated on the unsplit accounting (same rules, same order); the real batch is a subset of the
+    // unsplit batch, so this true implies fit_tensors true
+    bool u_fit_tensors(const htp_opnode & node) const {
+        size_t extra_bufs = 0;
+        size_t extra_vmem = 0;
+        size_t extra_tens = 0;
+
+        const bool check_tens = (u_tens.size() + node.inputs.size() + node.outputs.size()) > n_tens_max;
+
+        int seen_bufs[HTP_OP_MAX_BUFS];
+        int n_seen_bufs = 0;
+
+        auto fit_tensor = [&](const ggml_tensor * t) {
+            if (!t) return;
+
+            if (check_tens) {
+                htp_tensor shape {};
+                init_tensor_shape(shape, t);
+                if (u_tens.count(hash_tensor(t, shape))) return;
+                extra_tens++;
+            }
+
+            auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context);
+            int fd = sbuf->fd();
+            if (u_find_buffer(fd) < 0) {
+                for (int i = 0; i < n_seen_bufs; i++) {
+                    if (seen_bufs[i] == fd) return;
+                }
+                if (n_seen_bufs < HTP_OP_MAX_BUFS) {
+                    seen_bufs[n_seen_bufs++] = fd;
+                }
+                if (!sbuf->extended) {
+                    extra_vmem += sbuf->size();
+                }
+                extra_bufs += 1;
+            }
+        };
+
+        for (const auto * src : node.get_inputs()) {
+            fit_tensor(src);
+        }
+        for (const auto * output : node.get_outputs()) {
+            fit_tensor(output);
+        }
+
+        if ((extra_bufs + u_bufs) > n_bufs_max) return false;
+        if (check_tens && (extra_tens + u_tens.size()) > n_tens_max) return false;
+        if ((extra_vmem + u_vmem) > b_vmem_max) return false;
+
+        return true;
+    }
+
     void sync_op_desc(unsigned int n) {
         const htp_opnode & node = ops[n];
         htp_op_desc & o = h_ops[n];
@@ -1469,6 +1584,9 @@ struct ggml_hexagon_opbatch {
     void add_op(const htp_opnode & node) {
         unsigned int n = n_ops++;
         GGML_ASSERT(n_ops <= n_ops_max);
+        if (u_on) {
+            u_ops++;
+        }
 
         ops[n] = node;
         h_ops[n].flags = 0;
@@ -1528,6 +1646,8 @@ struct ggml_hexagon_opbatch {
         if (!htp_fusion_try_fuse(sess, last_node, node)) {
             return false;
         }
+        // GGML_HEXAGON_FLUSH_SPLIT cuts a batch only before ops outside this list
+        GGML_ASSERT(htp_fusion_can_fuse_into_prev(node.opcode));
 
         sync_op_desc(n_ops - 1);
         HEX_VERBOSE("ggml-hex: %s fused %s (N=%zu, #%u)\n",
@@ -1789,7 +1909,13 @@ void ggml_hexagon_session::start_batch() {
 }
 
 void ggml_hexagon_session::flush_batch(size_t min_ops) {
-    if (op_batch->n_ops < min_ops) { return; }
+    if (op_batch->n_ops < min_ops) {
+        // an empty batch after a part flush still holds unsplit ops; a flush that is not a part flush ends them
+        if (op_batch->n_ops == 0 && !op_batch->u_keep) {
+            op_batch->u_clear();
+        }
+        return;
+    }
 
     op_batch->sort_buffers();
 
@@ -1854,12 +1980,13 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node, bool fuse) {
         clone_tensor_buffer(t);
     }
 
-    const bool fits_tensors = op_batch->fit_tensors(node);
+    // with part flushes, fusion and cuts follow the unsplit accounting (u_fit_tensors true implies fit_tensors true)
+    const bool fits_tensors = op_batch->u_on ? op_batch->u_fit_tensors(node) : op_batch->fit_tensors(node);
     if (fuse && opt_opfusion && fits_tensors && op_batch->try_fuse(node)) {
         return;
     }
 
-    if (op_batch->full() || !fits_tensors) {
+    if ((op_batch->u_on ? op_batch->u_full() : op_batch->full()) || !fits_tensors) {
         flush_async();
     }
 
@@ -2564,6 +2691,30 @@ static ggml_status ggml_hexagon_graph_compute_done(ggml_hexagon_session * sess) 
     return GGML_STATUS_SUCCESS;
 }
 
+// GGML_HEXAGON_FLUSH_SPLIT=<n>: send the open batch before an op when the batch holds at least n ops and the op can
+// not fuse into the previous op. The DSP then starts on the first parts while the host solves and enqueues the rest.
+// While parts are sent, enqueue_op takes fusion and cut decisions from the unsplit accounting of the batch (u_*), so
+// the ops, their fusions and their order do not change. A batch boundary adds only cache maintenance on the DSP.
+// Single device only; the GGML_HEXAGON_GRAPH_CACHE path does not split.
+static uint32_t ggml_hexagon_flush_split() {
+    static const uint32_t n = [] {
+        const char * e = getenv("GGML_HEXAGON_FLUSH_SPLIT");
+        return e ? (uint32_t) std::max(0, atoi(e)) : 0u;
+    }();
+    return n;
+}
+
+static void ggml_hexagon_enqueue_part(ggml_hexagon_session * sess, const htp_opnode & node, uint32_t min_ops) {
+    // no part flush while the session has peers: flush_async also flushes them, which would move their batch cuts
+    if (min_ops > 0 && sess->op_batch->n_ops >= min_ops && !htp_fusion_can_fuse_into_prev(node.opcode) &&
+        sess->virt_peers.empty() && sess->phys_peers.empty()) {
+        sess->op_batch->u_keep = true;
+        sess->flush_async();
+        sess->op_batch->u_keep = false;
+    }
+    sess->enqueue_op(node);
+}
+
 static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
 
@@ -2572,6 +2723,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     }
 
     HEX_VERBOSE("ggml-hex: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
+
+    const uint32_t flush_split = (sess->mdev.count <= 1 && sess->op_batch->u_on) ? ggml_hexagon_flush_split() : 0;
 
     static const size_t graph_cache_size = [] {
         const char * e = getenv("GGML_HEXAGON_GRAPH_CACHE");
@@ -2586,6 +2739,31 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     std::vector<htp_opnode> computed_nodes;
 
     bool cache_hit = (graph->uid != 0 && sess->cached_uid == graph->uid);
+    if (!cache_hit && flush_split > 0) {
+        // solve and enqueue node by node, so that the first parts go out before the whole graph is solved
+        ggml_hexagon_graph_repack(graph, sess);
+        htp_fusion_tag_graph(graph);
+        computed_nodes.reserve(graph->n_nodes);
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            ggml_tensor * n = graph->nodes[i];
+            if (!ggml_hexagon_op_is_compute(n)) {
+                continue;
+            }
+            const htp_op_code opcode = htp_op_remap(n);
+            if (opcode == HTP_OP_INVALID) {
+                GGML_ABORT("\nggml-hex: graph-compute %s is not supported\n", ggml_op_desc(n));
+            }
+            htp_opnode node(opcode, n);
+            GGML_ASSERT(htp_kparams_solve(sess, node));
+            ggml_hexagon_enqueue_part(sess, node, flush_split);
+            computed_nodes.push_back(std::move(node));
+        }
+        if (graph->uid != 0) {
+            sess->cached_uid   = graph->uid;
+            sess->cached_nodes = std::move(computed_nodes);
+        }
+        return ggml_hexagon_graph_compute_done(sess);
+    }
     if (cache_hit) {
         nodes_ptr = &sess->cached_nodes;
     } else {
@@ -2601,7 +2779,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     }
 
     for (const auto & node : *nodes_ptr) {
-        sess->enqueue_op(node);
+        ggml_hexagon_enqueue_part(sess, node, flush_split);
     }
 
     return ggml_hexagon_graph_compute_done(sess);
@@ -2938,7 +3116,9 @@ static void ggml_hexagon_event_synchronize(ggml_backend_dev_t dev, ggml_hexagon_
 
     auto * fence = reinterpret_cast<const volatile std::atomic<uint32_t> *>(hex_event->fence_slot);
 
-    if ((int32_t)(fence[0].load(std::memory_order_relaxed) - hex_event->seq) < 0) {
+    // a part flush can send the FENCE early; while the unsplit batch still holds it, the unsplit flow flushes here
+    const bool unsplit_open = hex_event->sess->op_batch->u_on && hex_event->u_epoch == hex_event->sess->op_batch->u_epoch;
+    if (unsplit_open || (int32_t)(fence[0].load(std::memory_order_relaxed) - hex_event->seq) < 0) {
         hex_event->sess->flush_async();
     }
 
@@ -2977,6 +3157,7 @@ static void ggml_backend_hexagon_event_record(ggml_backend_t backend, ggml_backe
     hex_event->seq  = sess->next_fence_seq();
 
     sess->enqueue_fence(&hex_event->fence_tensor, hex_event->seq, /* wait = */ false);
+    hex_event->u_epoch = sess->op_batch->u_epoch;
 
     HEX_VERBOSE("ggml-hex: %s event-record : event %p seq 0x%x fence %p\n",
                 sess->c_name(), (void *)hex_event, hex_event->seq, (void *)hex_event->fence_slot);

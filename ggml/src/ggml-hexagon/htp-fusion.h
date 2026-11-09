@@ -31,4 +31,7 @@ int  htp_fusion_max(const struct ggml_cgraph * graph, int idx);
 void htp_fusion_tag_graph(struct ggml_cgraph * graph);
 bool htp_fusion_try_fuse(const struct ggml_hexagon_session * sess, struct htp_opnode & prev, const struct htp_opnode & cur);
 
+// true when htp_fusion_try_fuse can merge an op with this opcode into the previous op
+bool htp_fusion_can_fuse_into_prev(int opcode);
+
 #endif // HTP_FUSION_H
