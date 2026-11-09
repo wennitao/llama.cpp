@@ -434,7 +434,17 @@ static bool htp_kparams_solve_flash_attn(
         const uint32_t DK_pad = hex_round_up(DK, 64);
         const uint32_t DV_pad = hex_round_up(DV, 64);
         size_t Br = 0, Bc = 0;
-        int ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK_pad, DV_pad, neq1, nek1, vtcm_size, n_threads, (q->type == GGML_TYPE_F32), sinks != nullptr, n_head, fa_team_size);
+        const char * fixed_tiles = getenv("GGML_HEXAGON_FA_FIXED");
+        int ret;
+        if (fixed_tiles && strcmp(fixed_tiles, "1") == 0 && G > 0 && 32 % G == 0) {
+            Br = 32 / G;
+            Bc = 256;
+            const bool pipeline = nek1 > 2 * Bc && n_threads >= 2;
+            const size_t bytes = hmx_fa_compute_vtcm_usage(G, DK_pad, DV_pad, Br, Bc, pipeline ? n_threads : 1, pipeline, q->type == GGML_TYPE_F32, sinks != nullptr, n_head);
+            ret = bytes <= vtcm_size ? 0 : -1;
+        } else {
+            ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK_pad, DV_pad, neq1, nek1, vtcm_size, n_threads, (q->type == GGML_TYPE_F32), sinks != nullptr, n_head, fa_team_size);
+        }
         if (ret == 0) {
             kparams->kernel_type = HTP_FA_KERNEL_HMX;
             if (logit_softcap == 0.0f) {
