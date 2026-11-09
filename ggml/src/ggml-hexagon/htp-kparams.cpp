@@ -702,7 +702,11 @@ static bool htp_kparams_solve_hmx_mm(
             m_for_solver_padded = hex_round_up(std::max(m_for_solver, 32), 32);
         }
     }
-    const bool pipeline       = is_matmul_id ? false : htp_mm_hmx_pipeline(m_for_solver);
+    static const bool pipe_small = [] {
+        const char * e = getenv("GGML_HEXAGON_MM_HMX_PIPE_SMALL");
+        return e && strcmp(e, "1") == 0;
+    }();
+    const bool pipeline       = is_matmul_id ? false : (htp_mm_hmx_pipeline(m_for_solver) || pipe_small);
     const bool is_batched_val = is_matmul_id ? false : is_batched;
     const int  group_size     = (ne02 > 0 ? ne12 / ne02 : 1);
 
