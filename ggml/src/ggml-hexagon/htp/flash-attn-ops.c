@@ -2048,6 +2048,322 @@ static inline void fa_prefetch_block(dma_queue * dma_q, const struct htp_tensor 
 }
 
 // ============================================================================
+// Dual q tile (HTP_FA_FLAG_DUALTILE): 2 q tiles share each K/V block
+// ============================================================================
+
+// Constants of one hmx_flash_attn_ext call. fx[1] is a copy of fx[0] with its own per-tile VTCM regions.
+typedef struct {
+    struct hmx_fa_context *             fx[2];
+    const struct htp_fa_kernel_params * kparams;
+    const struct htp_tensor *           q;
+    const struct htp_tensor *           k;
+    const struct htp_tensor *           v;
+    const struct htp_tensor *           mask;
+    const struct htp_tensor *           dst;
+    uint16_t *                          active_blocks[2];
+    uint32_t                            q_start0;  // tile 1 starts at q_start0 + Br
+    uint32_t                            kv_head_min;
+    uint32_t                            kv_head_max;
+    size_t                              size_k_row;
+    size_t                              size_k_row_padded;
+    size_t                              size_v_row;
+    size_t                              size_v_row_padded;
+    size_t                              m_line_bytes;
+    bool                                zmask;
+} fa_dual_args_t;
+
+// Same job fields as the per-tile loop; K/V tile pointers are the same in both contexts.
+static inline void fa_dual_push_qk(hmx_queue_t hmx_q, hmx_fa_qk_job_t * job, const struct hmx_fa_context * fx, size_t buf,
+                                   size_t n_row_tiles, uint32_t kv_rows) {
+    job->q_tiles        = fx->vtcm_q_tiles;
+    job->k_tiles        = fx->vtcm_k_tiles[buf];
+    job->s_tiles        = fx->vtcm_s_tiles[buf];
+    job->n_row_tiles    = n_row_tiles;
+    job->n_col_tiles    = hmx_ceil_div(kv_rows, HMX_FP16_TILE_N_COLS);
+    job->n_dot_tiles    = fx->DK_pad / 32;
+    job->n_tiles_per_bc = fx->Bc / HMX_FP16_TILE_N_COLS;
+    job->hmx_scales     = fx->vtcm_hmx_scales_qk;
+    hmx_queue_push(hmx_q, hmx_queue_make_desc(hmx_fa_qk_dot_worker, job));
+}
+
+static inline void fa_dual_push_ou(hmx_queue_t hmx_q, hmx_fa_o_update_job_t * job, const struct hmx_fa_context * fx, size_t buf,
+                                   __fp16 * o_curr, const __fp16 * o_prev, size_t n_row_tiles, uint32_t kv_rows) {
+    job->o_curr           = o_curr;
+    job->o_prev           = o_prev;
+    job->p_tiles          = fx->vtcm_p_tiles[buf];
+    job->v_tiles          = fx->vtcm_v_tiles[buf];
+    job->d_tiles          = fx->vtcm_d_tiles[buf];
+    job->hmx_scales       = fx->vtcm_hmx_scales_id;
+    job->n_row_tiles      = n_row_tiles;
+    job->n_col_tiles      = hmx_ceil_div(kv_rows, HMX_FP16_TILE_N_COLS);
+    job->n_row_tiles_g_br = fx->g_br / HMX_FP16_TILE_N_ROWS;
+    job->n_tiles_per_bc   = fx->Bc / HMX_FP16_TILE_N_COLS;
+    job->DV               = fx->DV_pad;
+    hmx_queue_push(hmx_q, hmx_queue_make_desc(hmx_fa_o_update_worker, job));
+}
+
+// Q of both tiles into their own Q DMA buffers (same descriptors as the per-tile loop).
+static void fa_dual_push_q(const fa_dual_args_t * a, uint32_t kv_head, uint32_t ib3) {
+    const struct hmx_fa_context * f  = a->fx[0];
+    const struct htp_tensor *     q  = a->q;
+    dma_queue * const             dq = f->octx->ctx->dma[0];
+
+    const bool   q_transposed = q->nb[1] < q->nb[2];
+    const size_t q_src_stride = q_transposed ? q->nb[2] : q->nb[1];
+    const size_t qo_el_size   = f->is_q_fp32 ? sizeof(float) : sizeof(__fp16);
+
+    for (uint32_t t = 0; t < 2; ++t) {
+        const uint32_t   q_start     = a->q_start0 + t * f->Br;
+        const uint32_t   n_rows_q    = hex_smin(f->Br, f->neq1 - q_start);
+        const dma_addr_t q_ptr       = q->data + q_start * q->nb[1] + (kv_head * f->G) * q->nb[2] + ib3 * q->nb[3];
+        const size_t     q_row_bytes = q_transposed ? n_rows_q * (f->DK * qo_el_size) : f->G * f->DK * qo_el_size;
+        const size_t     n_rows      = q_transposed ? f->G : n_rows_q;
+        dma_queue_push(dq, dma_make_data(a->fx[t]->vtcm_q_dma, q_ptr), q_row_bytes, hex_smax(q_src_stride, q_row_bytes), q_row_bytes, n_rows);
+    }
+}
+
+// K and V of block b (shared) into staging buffer buf, then the mask rows of tile 0 and tile 1 (own caches).
+static void fa_dual_push_block(const fa_dual_args_t * a, uint32_t b, size_t buf, uint32_t kv_head, uint32_t ik3, uint32_t iv3, uint32_t im3) {
+    struct hmx_fa_context * f0 = a->fx[0];
+    dma_queue * const       dq = f0->octx->ctx->dma[0];
+
+    const uint32_t q_start1 = a->q_start0 + f0->Br;
+    fa_prefetch_block(dq, a->k, a->v, a->mask, b, f0->Bc, a->size_k_row_padded, a->size_k_row, a->size_v_row_padded, a->size_v_row,
+                      kv_head, ik3, kv_head, iv3, a->q_start0, im3, kv_head, f0->G, a->m_line_bytes, hex_smin(f0->Br, f0->neq1 - a->q_start0),
+                      f0->n_kv, buf, f0);
+    if (a->mask) {
+        const uint32_t   start  = b * f0->Bc;
+        const uint32_t   rows   = hex_smin(f0->Bc, f0->n_kv - start);
+        const dma_addr_t ms_src = a->mask->data + q_start1 * a->mask->nb[1] + im3 * a->mask->nb[3] + start * sizeof(__fp16);
+        dma_cache_fa_push(dq, a->fx[1]->m_cache, ms_src, a->m_line_bytes, a->mask->nb[1], rows * sizeof(__fp16),
+                          hex_smin(f0->Br, f0->neq1 - q_start1));
+    }
+}
+
+// Both q tiles of one ib3. Each tile runs the jobs of the pipelined per-tile loop on the same data in the same
+// order; the K/V DMA and interleave of a block is done once for both. Returns false (nothing changed but the
+// scans) when the tiles have different active blocks: the caller then runs the per-tile loop.
+static __attribute__((noinline)) bool hmx_fa_dual_tile(const fa_dual_args_t * a, uint32_t ib3, uint32_t im3) {
+    struct hmx_fa_context * const fx0    = a->fx[0];
+    struct htp_context * const    ctx    = fx0->octx->ctx;
+    struct htp_thread_trace *     tr_hvx = &ctx->trace[0];
+    dma_queue * const             dma_q  = ctx->dma[0];
+    hmx_queue_t                   hmx_q  = ctx->hmx_queue;
+
+    const struct htp_tensor * mask = a->mask;
+    const uint32_t            Bc   = fx0->Bc;
+    const uint32_t            G    = fx0->G;
+    const uint32_t            nek1 = fx0->n_kv;
+
+    const size_t n_row_tiles_g_br = fx0->g_br / HMX_FP16_TILE_N_ROWS;
+    const size_t n_tiles_per_bc   = Bc / HMX_FP16_TILE_N_COLS;
+
+    uint32_t q_start[2], n_rows_q[2], n_active[2];
+    size_t   n_rows_g[2], n_row_tiles[2];
+    for (uint32_t t = 0; t < 2; ++t) {
+        q_start[t]     = a->q_start0 + t * fx0->Br;
+        n_rows_q[t]    = hex_smin(fx0->Br, fx0->neq1 - q_start[t]);
+        n_rows_g[t]    = n_rows_q[t] * G;
+        n_row_tiles[t] = hex_align_up(n_rows_g[t], HMX_FP16_TILE_N_ROWS) / HMX_FP16_TILE_N_ROWS;
+        if (mask && fx0->mask_broadcast && fx0->n_kv_blocks > 1) {
+            n_active[t] = fa_scan_active_blocks(dma_q, mask, q_start[t], n_rows_q[t], 0, im3, nek1, Bc, fx0->n_kv_blocks,
+                                                fx0->vtcm_k_tiles[0], fx0->k_tile_bytes * 2, a->active_blocks[t]);
+        } else {
+            #pragma clang loop vectorize(disable)
+            for (uint32_t b = 0; b < fx0->n_kv_blocks; ++b) {
+                a->active_blocks[t][b] = (uint16_t) b;
+            }
+            n_active[t] = fx0->n_kv_blocks;
+        }
+    }
+    if (n_active[0] != n_active[1] || n_active[0] == 0 ||
+        memcmp(a->active_blocks[0], a->active_blocks[1], n_active[0] * sizeof(uint16_t)) != 0) {
+        return false;
+    }
+
+    const uint16_t * blocks   = a->active_blocks[0];
+    const uint32_t   n_blocks = n_active[0];
+    const uint32_t   b0       = blocks[0];
+    const uint32_t   b0_start = b0 * Bc;
+    const uint32_t   b0_rows  = hex_smin(Bc, nek1 - b0_start);
+
+    const uint32_t ik3          = fastdiv(ib3, &a->kparams->broadcast_rk3);
+    const uint32_t iv3          = fastdiv(ib3, &a->kparams->broadcast_rv3);
+    const size_t   k_src_stride = a->size_k_row_padded / sizeof(__fp16);
+    const size_t   v_src_stride = a->size_v_row_padded / sizeof(__fp16);
+
+    // HMX reads these structs until the job is popped: one per (tile, buffer)
+    hmx_fa_qk_job_t       qk_job[2][2];
+    hmx_fa_o_update_job_t ou_job[2][2];
+    hmx_fa_o_norm_job_t   on_job[2];
+    uint32_t              zmask_bits[2][FA_MAX_KV_BLOCKS / 32];  // per tile, per step
+
+    for (uint32_t kv_head = a->kv_head_min; kv_head < a->kv_head_max; ++kv_head) {
+        if (kv_head == a->kv_head_min) {
+            fa_dual_push_q(a, kv_head, ib3);
+            fa_dual_push_block(a, b0, 0, kv_head, ik3, iv3, im3);
+        }
+
+        // Q of both tiles
+        dma_queue_pop(dma_q);
+        dma_queue_pop(dma_q);
+
+        __fp16 * o_tile_prev[2];
+        __fp16 * o_tile_curr[2];
+        for (uint32_t t = 0; t < 2; ++t) {
+            fa_phase_q_load(a->fx[t], a->q, q_start[t], kv_head, ib3, n_rows_g[t]);
+            o_tile_prev[t] = a->fx[t]->vtcm_o_tiles[0];
+            o_tile_curr[t] = a->fx[t]->vtcm_o_tiles[1];
+
+            htp_trace_event_start(tr_hvx, HTP_TRACE_EVT_HVX_A_PREP, (uint16_t) q_start[t]);
+            fa_compute_slopes(a->fx[t], kv_head, n_rows_g[t]);
+            htp_trace_event_stop(tr_hvx, HTP_TRACE_EVT_HVX_A_PREP, (uint16_t) q_start[t]);
+        }
+
+        size_t buf_idx = 0;
+
+        if (n_blocks > 1) {
+            fa_dual_push_block(a, blocks[1], 1, kv_head, ik3, iv3, im3);
+        }
+
+        void * curr_k0 = (void *) dma_queue_pop(dma_q).dst;
+        fa_phase_k_interleave(fx0, b0_rows, k_src_stride, curr_k0, b0_start, 0);
+        for (uint32_t t = 0; t < 2; ++t) {
+            fa_dual_push_qk(hmx_q, &qk_job[t][0], a->fx[t], 0, n_row_tiles[t], b0_rows);
+        }
+
+        for (uint32_t step = 0; step < n_blocks; ++step) {
+            const uint32_t kv_start    = blocks[step] * Bc;
+            const uint32_t kv_rows     = hex_smin(Bc, nek1 - kv_start);
+            const size_t   n_col_tiles = hmx_ceil_div(kv_rows, HMX_FP16_TILE_N_COLS);
+
+            // 1. V of this block (shared)
+            void * curr_v = (void *) dma_queue_pop(dma_q).dst;
+            fa_phase_v_interleave(fx0, kv_rows, v_src_stride, curr_v, fx0->vtcm_v_tiles[buf_idx], n_tiles_per_bc, kv_start);
+
+            // 2. Mask rows of each tile
+            __fp16 * mask_vtcm[2] = { NULL, NULL };
+            bool     zmask_blk[2];
+            for (uint32_t t = 0; t < 2; ++t) {
+                if (mask) {
+                    mask_vtcm[t] = (__fp16 *) dma_queue_pop(dma_q).dst;
+                }
+                zmask_blk[t] = a->zmask && fa_zmask_step(zmask_bits[t], step, kv_head == a->kv_head_min, mask_vtcm[t],
+                                                         a->fx[t]->mask_buf_row_stride, n_rows_q[t], kv_rows);
+            }
+
+            // 3. O update of the previous block for both tiles, before the next QK-dots (FIFO pop order)
+            if (step > 0) {
+                const size_t   prev_buf  = 1 - buf_idx;
+                const uint32_t prev_rows = hex_smin(Bc, nek1 - blocks[step - 1] * Bc);
+                for (uint32_t t = 0; t < 2; ++t) {
+                    fa_dual_push_ou(hmx_q, &ou_job[t][prev_buf], a->fx[t], prev_buf, o_tile_curr[t], o_tile_prev[t], n_row_tiles[t], prev_rows);
+                }
+            }
+
+            // 4. K of the next block (shared) and its QK-dot for both tiles
+            if (step + 1 < n_blocks) {
+                const uint32_t next_start = blocks[step + 1] * Bc;
+                const uint32_t next_rows  = hex_smin(Bc, nek1 - next_start);
+                const size_t   next_buf   = 1 - buf_idx;
+
+                void * next_k = (void *) dma_queue_pop(dma_q).dst;
+                fa_phase_k_interleave(fx0, next_rows, k_src_stride, next_k, next_start, next_buf);
+                for (uint32_t t = 0; t < 2; ++t) {
+                    fa_dual_push_qk(hmx_q, &qk_job[t][next_buf], a->fx[t], next_buf, n_row_tiles[t], next_rows);
+                }
+            }
+
+            // 5. Per tile: wait for its QK-dot, then softmax + build_D
+            for (uint32_t t = 0; t < 2; ++t) {
+                struct hmx_fa_context * fx = a->fx[t];
+                hmx_queue_pop(hmx_q);
+
+                fa_softmax_args_t sargs;
+                memset(&sargs, 0, sizeof(sargs));
+                sargs.factx                = fx;
+                sargs.buf_idx              = buf_idx;
+                sargs.kv_rows              = kv_rows;
+                sargs.n_rows_g             = n_rows_g[t];
+                sargs.n_col_tiles          = n_col_tiles;
+                sargs.n_tiles_per_bc       = n_tiles_per_bc;
+                sargs.n_row_tiles          = n_row_tiles[t];
+                sargs.n_row_tiles_g_br     = n_row_tiles_g_br;
+                sargs.Bc                   = Bc;
+                sargs.G                    = G;
+                sargs.kv_head              = kv_head;
+                sargs.kv_start             = kv_start;
+                sargs.q_start              = q_start[t];
+                sargs.ib3                  = ib3;
+                sargs.has_alibi            = (fx->max_bias != 0.0f);
+                sargs.mask                 = mask;
+                sargs.mask_vtcm            = mask_vtcm[t];
+                sargs.mask_vtcm_row_stride = fx->mask_buf_row_stride;
+                sargs.slopes               = fx->vtcm_slopes;
+                sargs.zmask                = zmask_blk[t];
+                fa_phase_softmax_and_build_d(fx, &sargs, n_row_tiles[t], n_row_tiles_g_br);
+            }
+
+            // 6. O updates of the previous block are done
+            if (step > 0) {
+                for (uint32_t t = 0; t < 2; ++t) {
+                    hmx_queue_pop(hmx_q);
+                    hex_swap_ptr((void **) &o_tile_curr[t], (void **) &o_tile_prev[t]);
+                }
+            }
+
+            // 7. Prefetch block step + 2
+            if (step + 2 < n_blocks) {
+                fa_dual_push_block(a, blocks[step + 2], buf_idx, kv_head, ik3, iv3, im3);
+            }
+
+            buf_idx = 1 - buf_idx;
+        }
+
+        // Epilogue: last O update of both tiles; diag(1/l) on HVX while HMX runs them
+        {
+            const uint32_t last_rows = hex_smin(Bc, nek1 - blocks[n_blocks - 1] * Bc);
+            for (uint32_t t = 0; t < 2; ++t) {
+                fa_dual_push_ou(hmx_q, &ou_job[t][0], a->fx[t], 1 - buf_idx, o_tile_curr[t], o_tile_prev[t], n_row_tiles[t], last_rows);
+            }
+            for (uint32_t t = 0; t < 2; ++t) {
+                htp_trace_event_start(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) q_start[t]);
+                fa_build_d_diag_inv_l(a->fx[t], n_row_tiles[t], n_row_tiles_g_br, kv_head, n_rows_g[t]);
+                htp_trace_event_stop(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) q_start[t]);
+            }
+            for (uint32_t t = 0; t < 2; ++t) {
+                hmx_queue_pop(hmx_q);
+                hex_swap_ptr((void **) &o_tile_curr[t], (void **) &o_tile_prev[t]);
+            }
+        }
+
+        // DMAs of the next KV head, early so they overlap with the O normalization
+        if (kv_head + 1 < a->kv_head_max) {
+            fa_dual_push_q(a, kv_head + 1, ib3);
+            fa_dual_push_block(a, b0, 0, kv_head + 1, ik3, iv3, im3);
+        }
+
+        // Final normalization and O store of each tile
+        for (uint32_t t = 0; t < 2; ++t) {
+            on_job[t].o_curr           = o_tile_curr[t];
+            on_job[t].o_prev           = o_tile_prev[t];
+            on_job[t].d_tiles          = a->fx[t]->vtcm_d_inv_l;
+            on_job[t].hmx_scales       = a->fx[t]->vtcm_hmx_scales_id;
+            on_job[t].n_row_tiles      = n_row_tiles[t];
+            on_job[t].n_row_tiles_g_br = n_row_tiles_g_br;
+            on_job[t].DV               = fx0->DV_pad;
+            hmx_queue_push(hmx_q, hmx_queue_make_desc(hmx_fa_o_norm_worker, &on_job[t]));
+        }
+        for (uint32_t t = 0; t < 2; ++t) {
+            hmx_queue_pop(hmx_q);
+            fa_phase_o_store(a->fx[t], a->dst, o_tile_curr[t], q_start[t], kv_head, ib3, n_rows_g[t]);
+        }
+    }
+
+    return true;
+}
+
+// ============================================================================
 // Core HMX flash attention algorithm (GQA-merged)
 // ============================================================================
 
@@ -2205,10 +2521,20 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     const size_t size_k_row_padded = hex_round_up(DK_pad * sizeof(__fp16), 128);
     const size_t size_v_row_padded = hex_round_up(DV_pad * sizeof(__fp16), 128);
 
+    // Dual q tile: this core has exactly 2 q tiles; tile 1's active-block list goes to DDR scratch after the slopes.
+    const size_t ddr_dual_off = hex_align_up(sizeof(struct hmx_fa_ddr_spad) + factx.g_br * sizeof(__fp16), 128);
+    bool dual = (kparams->flags & HTP_FA_FLAG_DUALTILE) && pipeline && (!mask || factx.mask_broadcast) &&
+                q_start_max - q_start_min > Br && q_start_max - q_start_min <= 2 * Br && nek1 % Bc == 0 &&
+                ddr_dual_off + FA_MAX_KV_BLOCKS * sizeof(uint16_t) <= ctx->ddr_spad_size;
+
     // Build the VTCM layout once (shared with the host estimator) and place every
     // scratch buffer at its computed offset. Padded head dims size the HMX tiles.
     struct hmx_fa_vtcm_layout L;
-    hmx_fa_vtcm_layout_build(&L, G, DK_pad, DV_pad, Br, Bc, n_threads, pipeline, factx.is_q_fp32, factx.sinks != NULL, factx.n_heads);
+    hmx_fa_vtcm_layout_build(&L, G, DK_pad, DV_pad, Br, Bc, n_threads, pipeline, factx.is_q_fp32, factx.sinks != NULL, factx.n_heads, dual);
+    if (dual && L.total_bytes > ctx->vtcm_size) {
+        dual = false;
+        hmx_fa_vtcm_layout_build(&L, G, DK_pad, DV_pad, Br, Bc, n_threads, pipeline, factx.is_q_fp32, factx.sinks != NULL, factx.n_heads, false);
+    }
 
     if (L.total_bytes > ctx->vtcm_size) {
         return HTP_STATUS_VTCM_TOO_SMALL;
@@ -2315,9 +2641,64 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     const bool zmask = (kparams->flags & HTP_FA_FLAG_ZMASK) && mask && factx.mask_broadcast;
     uint32_t   zmask_bits[FA_MAX_KV_BLOCKS / 32];  // per step of the current q tile
 
+    // ======== Dual q tile: context of the second tile ========
+    struct hmx_fa_context factx1;
+    fa_dual_args_t        dual_args;
+    if (dual) {
+        factx1                 = factx;
+        factx1.vtcm_q_dma      = VTCM_LAYOUT_PTR(__fp16, base, L.off_t1_q_dma);
+        factx1.vtcm_q_tiles    = VTCM_LAYOUT_PTR(__fp16, base, L.off_t1_q_tiles);
+        factx1.vtcm_o_tiles[0] = VTCM_LAYOUT_PTR(__fp16, base, L.off_t1_o_tiles[0]);
+        factx1.vtcm_o_tiles[1] = VTCM_LAYOUT_PTR(__fp16, base, L.off_t1_o_tiles[1]);
+        factx1.vtcm_s_tiles[0] = VTCM_LAYOUT_PTR(__fp16, base, L.off_t1_s_tiles[0]);
+        factx1.vtcm_s_tiles[1] = VTCM_LAYOUT_PTR(__fp16, base, L.off_t1_s_tiles[1]);
+        factx1.vtcm_p_tiles[0] = VTCM_LAYOUT_PTR(__fp16, base, L.off_t1_p_tiles[0]);
+        factx1.vtcm_p_tiles[1] = VTCM_LAYOUT_PTR(__fp16, base, L.off_t1_p_tiles[1]);
+        factx1.vtcm_d_tiles[0] = VTCM_LAYOUT_PTR(__fp16, base, L.off_t1_d_tiles[0]);
+        factx1.vtcm_d_tiles[1] = VTCM_LAYOUT_PTR(__fp16, base, L.off_t1_d_tiles[1]);
+        factx1.vtcm_d_inv_l    = VTCM_LAYOUT_PTR(__fp16, base, L.off_t1_d_inv_l);
+        factx1.vtcm_m_vec      = VTCM_LAYOUT_PTR(HVX_Vector, base, L.off_t1_m_vec);
+        factx1.vtcm_l_vec      = VTCM_LAYOUT_PTR(HVX_Vector, base, L.off_t1_l_vec);
+        factx1.vtcm_row_bufs   = VTCM_LAYOUT_PTR(HVX_Vector, base, L.off_t1_row_bufs);
+        factx1.vtcm_mask_buf   = VTCM_LAYOUT_PTR(__fp16, base, L.off_t1_mask_buf);
+        factx1.vtcm_slopes     = VTCM_LAYOUT_PTR(__fp16, base, L.off_t1_slopes);
+        factx1.m_cache         = &octx->dma_cache_fa[1];
+        dma_cache_fa_init(factx1.m_cache, (uint8_t *) factx1.vtcm_mask_buf, L.m_buf_slot_bytes, HMX_FA_DMA_CACHE_SIZE);
+
+        // Tile 1 P rows past its valid rows are never written but HMX reads them: zeros, not stale VTCM
+        hvx_splat_u8_a((char *) factx1.vtcm_p_tiles[0], 0, L.s_tile_bytes);
+        hvx_splat_u8_a((char *) factx1.vtcm_p_tiles[1], 0, L.s_tile_bytes);
+        if (DK_pad != DK) {
+            hvx_splat_u8_a((char *) factx1.vtcm_q_dma, 0, hex_align_up(factx.g_br * DK * (factx.is_q_fp32 ? sizeof(float) : sizeof(__fp16)), 128));
+        }
+
+        dual_args.fx[0]             = &factx;
+        dual_args.fx[1]             = &factx1;
+        dual_args.kparams           = kparams;
+        dual_args.q                 = q;
+        dual_args.k                 = k;
+        dual_args.v                 = v;
+        dual_args.mask              = mask;
+        dual_args.dst               = dst;
+        dual_args.active_blocks[0]  = ddr->active_blocks;
+        dual_args.active_blocks[1]  = (uint16_t *) ((uint8_t *) ddr + ddr_dual_off);
+        dual_args.q_start0          = q_start_min;
+        dual_args.kv_head_min       = kv_head_min;
+        dual_args.kv_head_max       = kv_head_max;
+        dual_args.size_k_row        = size_k_row;
+        dual_args.size_k_row_padded = size_k_row_padded;
+        dual_args.size_v_row        = size_v_row;
+        dual_args.size_v_row_padded = size_v_row_padded;
+        dual_args.m_line_bytes      = m_line_bytes;
+        dual_args.zmask             = zmask;
+    }
+
     // ======== Main loop ========
     for (uint32_t ib3 = 0; ib3 < neq3; ++ib3) {
         const uint32_t im3 = mask ? fastmodulo(ib3, mask->ne[3], &factx.src3_div3) : 0;
+        if (dual && hmx_fa_dual_tile(&dual_args, ib3, im3)) {
+            continue;
+        }
         for (uint32_t q_start = q_start_min; q_start < q_start_max; q_start += Br) {
             const uint32_t n_rows_q    = hex_smin(Br, neq1 - q_start);
             const size_t   n_rows_g    = n_rows_q * G;

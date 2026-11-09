@@ -36,6 +36,8 @@ enum htp_fa_kernel_type {
 #define HTP_FA_FLAG_TEAM_SPLIT 0x01
 // HMX: skip the mask path for KV blocks whose broadcast mask is all +0.0 (same arithmetic)
 #define HTP_FA_FLAG_ZMASK      0x02
+// HMX: exactly 2 q tiles share one K/V DMA and interleave per (KV head, block) (same arithmetic per tile)
+#define HTP_FA_FLAG_DUALTILE   0x04
 
 static inline void htp_fa_mdev_teams(uint32_t n_kv_heads, uint32_t mdev_count, bool head_split,
                                      uint32_t * n_teams, uint32_t * team_size) {
@@ -132,6 +134,20 @@ struct hmx_fa_vtcm_layout {
     size_t off_slopes;
     size_t off_sinks;
 
+    // Dual q tile only (0 otherwise): the per-tile regions of the second q tile, after all other regions.
+    size_t off_t1_q_tiles;
+    size_t off_t1_o_tiles[2];
+    size_t off_t1_d_tiles[2];
+    size_t off_t1_d_inv_l;
+    size_t off_t1_s_tiles[2];
+    size_t off_t1_p_tiles[2];
+    size_t off_t1_m_vec;
+    size_t off_t1_l_vec;
+    size_t off_t1_row_bufs;
+    size_t off_t1_q_dma;
+    size_t off_t1_mask_buf;
+    size_t off_t1_slopes;
+
     // Region byte sizes reused by the device at runtime (not just for allocation).
     size_t q_tile_bytes;
     size_t o_tile_bytes;
@@ -159,7 +175,7 @@ static inline void hmx_fa_vtcm_layout_build(struct hmx_fa_vtcm_layout * L,
                                             size_t gqa_factor, size_t DK, size_t DV,
                                             size_t Br, size_t Bc, size_t n_threads,
                                             bool pipeline, bool is_q_fp32,
-                                            bool has_sinks, size_t n_heads) {
+                                            bool has_sinks, size_t n_heads, bool dual_tile) {
     const size_t g_br         = hex_align_up(gqa_factor * Br, HMX_FP16_TILE_N_ROWS);
     const size_t q_tile_size  = hex_align_up(g_br * DK   * sizeof(__fp16), HTP_FA_HMX_TILE_SIZE);
     const size_t o_tile_size  = hex_align_up(g_br * DV   * sizeof(__fp16), HTP_FA_HMX_TILE_SIZE);
@@ -234,6 +250,27 @@ static inline void hmx_fa_vtcm_layout_build(struct hmx_fa_vtcm_layout * L,
     VTCM_LAYOUT_ALLOC(off, off_slopes,        slopes_size);
     VTCM_LAYOUT_ALLOC_OPTIONAL(off, off_sinks, sinks_size, has_sinks);
 
+    // Group D (dual q tile): copies of the per-tile regions for the second q tile. Tile 0 offsets do not change.
+    if (dual_tile) {
+        off = hex_align_up(off, HTP_FA_HMX_TILE_SIZE);
+    }
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off, off_t1_q_tiles,    q_tile_size,                  dual_tile);
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off, off_t1_o_tiles[0], o_tile_size,                  dual_tile);
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off, off_t1_o_tiles[1], o_tile_size,                  dual_tile);
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off, off_t1_d_tiles[0], d_tile_size,                  dual_tile);
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off, off_t1_d_tiles[1], d_tile_size,                  dual_tile);
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off, off_t1_d_inv_l,    d_tile_size,                  dual_tile);
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off, off_t1_s_tiles[0], s_tile_size,                  dual_tile);
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off, off_t1_s_tiles[1], s_tile_size,                  dual_tile);
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off, off_t1_p_tiles[0], s_tile_size,                  dual_tile);
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off, off_t1_p_tiles[1], s_tile_size,                  dual_tile);
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off, off_t1_m_vec,      col_vec_size,                 dual_tile);
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off, off_t1_l_vec,      col_vec_size,                 dual_tile);
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off, off_t1_row_bufs,   row_vec_size * 2 * n_threads, dual_tile);
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off, off_t1_q_dma,      q_dma_size,                   dual_tile);
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off, off_t1_mask_buf,   m_buf_size,                   dual_tile);
+    VTCM_LAYOUT_ALLOC_OPTIONAL(off, off_t1_slopes,     slopes_size,                  dual_tile);
+
     L->q_tile_bytes        = q_tile_size;
     L->o_tile_bytes        = o_tile_size;
     L->k_tile_bytes        = k_tile_size;
@@ -253,9 +290,9 @@ static inline void hmx_fa_vtcm_layout_build(struct hmx_fa_vtcm_layout * L,
 }
 
 // Exact VTCM usage for a given (gqa_factor, DK, DV, Br, Bc) configuration.
-static inline size_t hmx_fa_compute_vtcm_usage(size_t gqa_factor, size_t DK, size_t DV, size_t Br, size_t Bc, size_t n_threads, bool pipeline, bool is_q_fp32, bool has_sinks, size_t n_heads) {
+static inline size_t hmx_fa_compute_vtcm_usage(size_t gqa_factor, size_t DK, size_t DV, size_t Br, size_t Bc, size_t n_threads, bool pipeline, bool is_q_fp32, bool has_sinks, size_t n_heads, bool dual_tile) {
     struct hmx_fa_vtcm_layout L;
-    hmx_fa_vtcm_layout_build(&L, gqa_factor, DK, DV, Br, Bc, n_threads, pipeline, is_q_fp32, has_sinks, n_heads);
+    hmx_fa_vtcm_layout_build(&L, gqa_factor, DK, DV, Br, Bc, n_threads, pipeline, is_q_fp32, has_sinks, n_heads, dual_tile);
     return L.total_bytes;
 }
 
@@ -363,7 +400,7 @@ static inline int hmx_fa_find_chunk_size(size_t * Br_out,
     for (size_t Br = Br_max; Br >= br_unit; Br -= br_unit) {
         // Try all Bc candidates from Bc_limit down to bc_unit
         for (size_t Bc = Bc_limit; Bc >= bc_unit; Bc -= bc_unit) {
-            size_t vtcm_needed = hmx_fa_compute_vtcm_usage(gqa_factor, DK, DV, Br, Bc, n_threads, can_pipeline, is_q_fp32, has_sinks, n_heads);
+            size_t vtcm_needed = hmx_fa_compute_vtcm_usage(gqa_factor, DK, DV, Br, Bc, n_threads, can_pipeline, is_q_fp32, has_sinks, n_heads, false);
             if (vtcm_needed <= vtcm_budget) {
                 // This Bc fits for this Br!
                 const size_t q_blocks       = (qo_len + Br - 1) / Br;
