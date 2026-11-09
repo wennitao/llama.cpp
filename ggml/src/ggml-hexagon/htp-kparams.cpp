@@ -650,7 +650,8 @@ static bool htp_matmul_is_hmx_eligible(
     }
 
     const int m = is_matmul_id ? ne12 : ne11;
-    if (m <= HTP_MM_HMX_MIN_NROWS) {
+    const char * all_hmx = getenv("GGML_HEXAGON_MM_HMX_ALL");
+    if (m <= 0 || (m <= HTP_MM_HMX_MIN_NROWS && !(all_hmx && strcmp(all_hmx, "1") == 0))) {
         return false;
     }
 
