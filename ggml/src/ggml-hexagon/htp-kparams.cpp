@@ -1779,9 +1779,20 @@ static bool htp_kparams_solve_set_rows(
 
     kparams->n_threads   = (std::min)(htp_session_n_threads(sess), nr);
     kparams->total_tasks = nr;
+    kparams->packed_channels = 1;
 
     struct htp_set_rows_vtcm_layout vtcm_layout;
-    htp_set_rows_vtcm_layout_build(&vtcm_layout, dst->type, src0->ne[0], kparams->n_threads);
+    const char * pack_channels = getenv("GGML_HEXAGON_SET_ROWS_PACK");
+    if (pack_channels && strcmp(pack_channels, "1") == 0 && htp_session_mdev_count(sess) == 1 &&
+        dst->type == GGML_TYPE_F32 && src0->ne[0] <= 4 && src0->ne[2] > 1 && src0->ne[2] <= 4096 &&
+        src0->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float) &&
+        src1->ne[1] == 1 && src1->ne[2] == 1 && dst->nb[2] == src0->ne[0] * sizeof(float)) {
+        htp_set_rows_vtcm_layout_build(&vtcm_layout, dst->type, src0->ne[0] * src0->ne[2], kparams->n_threads);
+        if (vtcm_layout.total_bytes <= htp_session_vtcm_size(sess)) {
+            kparams->packed_channels = src0->ne[2];
+        }
+    }
+    htp_set_rows_vtcm_layout_build(&vtcm_layout, dst->type, src0->ne[0] * kparams->packed_channels, kparams->n_threads);
     kparams->vtcm_size = vtcm_layout.total_bytes;
 
     return vtcm_layout.total_bytes <= htp_session_vtcm_size(sess);

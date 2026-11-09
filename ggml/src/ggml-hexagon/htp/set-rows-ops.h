@@ -8,6 +8,7 @@
 struct htp_set_rows_kernel_params {
     uint32_t n_threads;
     uint32_t total_tasks;
+    uint32_t packed_channels;
     uint32_t vtcm_size;
 };
 

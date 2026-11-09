@@ -83,10 +83,12 @@ static void set_rows_thread_dma_##TYPE_NAME##_##IDX_TYPE(unsigned int nth, unsig
                           ith * vtcm_layout->src0_bytes_per_thread;                                              \
     uint8_t * vtcm_dst  = VTCM_LAYOUT_PTR(uint8_t, srctx->vtcm_base, vtcm_layout->off_dst) +                     \
                           ith * vtcm_layout->dst_bytes_per_thread;                                               \
-    const uint32_t src0_row_size = ne00 * sizeof(float);                                                         \
-    const uint32_t dst_row_size  = htp_tensor_get_row_size(octx->dst->type, ne00);                               \
+    const uint32_t packed_channels = kparams->packed_channels;                                                     \
+    const uint32_t copy_ne00 = ne00 * packed_channels;                                                          \
+    const uint32_t channel_groups = ne02 / packed_channels;                                                    \
+    const uint32_t dst_row_size  = htp_tensor_get_row_size(octx->dst->type, copy_ne00);                               \
     const uint32_t nrows_per_thread = ir1 - ir0;                                                                 \
-    const uint32_t total_steps = ne03 * ne02 * nrows_per_thread;                                                 \
+    const uint32_t total_steps = ne03 * channel_groups * nrows_per_thread;                                                 \
     uint32_t pi_step = 0;                                                                                        \
     uint32_t pi02 = 0;                                                                                           \
     uint32_t pi03 = 0;                                                                                           \
@@ -100,12 +102,12 @@ static void set_rows_thread_dma_##TYPE_NAME##_##IDX_TYPE(unsigned int nth, unsig
         dma_queue_push(dma_q,                                                                                    \
                        dma_make_data(vtcm_src0 + spad_idx * vtcm_layout->src0_spad_half_size,                    \
                                      src0_data),                                                                 \
-                       vtcm_layout->src0_spad_half_size, src0_row_size, src0_row_size, 1);                       \
+                       ne00 * sizeof(float), nb02, ne00 * sizeof(float), packed_channels);                       \
         pi_step++;                                                                                               \
         if (pi_step == nrows_per_thread) {                                                                       \
             pi_step = 0;                                                                                         \
             pi02++;                                                                                              \
-            if (pi02 == ne02) {                                                                                  \
+            if (pi02 == channel_groups) {                                                                                  \
                 pi02 = 0;                                                                                        \
                 pi03++;                                                                                          \
             }                                                                                                    \
@@ -145,12 +147,12 @@ static void set_rows_thread_dma_##TYPE_NAME##_##IDX_TYPE(unsigned int nth, unsig
             const dma_addr_t psrc0_data = octx->src[0]->data + ni*nb01 + pi02*nb02 + pi03*nb03;                  \
             dma_queue_push(dma_q,                                                                                \
                            dma_make_data(src_spad, psrc0_data),                                                  \
-                           vtcm_layout->src0_spad_half_size, src0_row_size, src0_row_size, 1);                   \
+                           ne00 * sizeof(float), nb02, ne00 * sizeof(float), packed_channels);                   \
             pi_step++;                                                                                           \
             if (pi_step == nrows_per_thread) {                                                                   \
                 pi_step = 0;                                                                                     \
                 pi02++;                                                                                          \
-                if (pi02 == ne02) {                                                                              \
+                if (pi02 == channel_groups) {                                                                              \
                     pi02 = 0;                                                                                    \
                     pi03++;                                                                                      \
                 }                                                                                                \
@@ -164,7 +166,7 @@ static void set_rows_thread_dma_##TYPE_NAME##_##IDX_TYPE(unsigned int nth, unsig
             if (ci11_base == ne11) {                                                                             \
                 ci11_base = 0;                                                                                   \
             }                                                                                                    \
-            if (ci02 == ne02) {                                                                                  \
+            if (ci02 == channel_groups) {                                                                                  \
                 ci02 = 0;                                                                                        \
                 ci03++;                                                                                          \
                 ci12_base++;                                                                                     \
@@ -177,14 +179,14 @@ static void set_rows_thread_dma_##TYPE_NAME##_##IDX_TYPE(unsigned int nth, unsig
     dma_queue_flush(dma_q);                                                                                      \
 }
 
-SET_ROWS_THREAD_DMA_FN(f32,  int32_t, { hvx_copy_f32_uu((uint8_t *)dst_spad, (const uint8_t *)src_spad, ne00); })
-SET_ROWS_THREAD_DMA_FN(f32,  int64_t, { hvx_copy_f32_uu((uint8_t *)dst_spad, (const uint8_t *)src_spad, ne00); })
+SET_ROWS_THREAD_DMA_FN(f32,  int32_t, { hvx_copy_f32_uu((uint8_t *)dst_spad, (const uint8_t *)src_spad, copy_ne00); })
+SET_ROWS_THREAD_DMA_FN(f32,  int64_t, { hvx_copy_f32_uu((uint8_t *)dst_spad, (const uint8_t *)src_spad, copy_ne00); })
 
-SET_ROWS_THREAD_DMA_FN(f16,  int32_t, { hvx_copy_f16_f32_uu((uint8_t *)dst_spad, (const uint8_t *)src_spad, ne00); })
-SET_ROWS_THREAD_DMA_FN(f16,  int64_t, { hvx_copy_f16_f32_uu((uint8_t *)dst_spad, (const uint8_t *)src_spad, ne00); })
+SET_ROWS_THREAD_DMA_FN(f16,  int32_t, { hvx_copy_f16_f32_uu((uint8_t *)dst_spad, (const uint8_t *)src_spad, copy_ne00); })
+SET_ROWS_THREAD_DMA_FN(f16,  int64_t, { hvx_copy_f16_f32_uu((uint8_t *)dst_spad, (const uint8_t *)src_spad, copy_ne00); })
 
-SET_ROWS_THREAD_DMA_FN(q8_0, int32_t, { hvx_quantize_row_q8_0_f32(dst_spad, (const float *)src_spad, ne00); })
-SET_ROWS_THREAD_DMA_FN(q8_0, int64_t, { hvx_quantize_row_q8_0_f32(dst_spad, (const float *)src_spad, ne00); })
+SET_ROWS_THREAD_DMA_FN(q8_0, int32_t, { hvx_quantize_row_q8_0_f32(dst_spad, (const float *)src_spad, copy_ne00); })
+SET_ROWS_THREAD_DMA_FN(q8_0, int64_t, { hvx_quantize_row_q8_0_f32(dst_spad, (const float *)src_spad, copy_ne00); })
 
 int op_set_rows(struct htp_ops_context * octx) {
     const struct htp_set_rows_kernel_params * kparams = (const struct htp_set_rows_kernel_params *)octx->kernel_params;
@@ -227,7 +229,7 @@ int op_set_rows(struct htp_ops_context * octx) {
     srctx.tasks = tasks;
     srctx.tasks_per_thread = fastdiv(tasks + n_threads - 1, &octx->n_threads_div);
 
-    htp_set_rows_vtcm_layout_build(&srctx.vtcm_layout, octx->dst->type, ne00, n_threads);
+    htp_set_rows_vtcm_layout_build(&srctx.vtcm_layout, octx->dst->type, ne00 * kparams->packed_channels, n_threads);
     srctx.vtcm_base = (uint8_t *)octx->ctx->vtcm_base;
 
     work_queue_func_t q_func = NULL;
